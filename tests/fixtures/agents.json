@@ -1,0 +1,17 @@
+{
+  "builder": { "permissions": [
+    { "action": "shell", "resource": "*", "effect": "allow" },
+    { "action": "edit", "resource": "*", "effect": "allow" },
+    { "action": "subagent", "resource": "*", "effect": "deny" }
+  ] },
+  "scout": { "permissions": [
+    { "action": "shell", "resource": "*", "effect": "deny" },
+    { "action": "edit", "resource": "*", "effect": "deny" },
+    { "action": "subagent", "resource": "*", "effect": "deny" }
+  ] },
+  "coordinator": { "permissions": [
+    { "action": "shell", "resource": "*", "effect": "deny" },
+    { "action": "edit", "resource": "*", "effect": "deny" },
+    { "action": "subagent", "resource": "named-worker", "effect": "allow" }
+  ] }
+}

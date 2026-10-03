@@ -1,0 +1,499 @@
+--- a/packages/core/src/plugin/hooks.ts
++++ b/packages/core/src/plugin/hooks.ts
+@@ -40,6 +40,9 @@
+ }
+ 
+ export interface Interface {
++  readonly requiredPlugins: readonly string[]
++  readonly setRequiredPluginCheck: (check: Effect.Effect<void>) => Effect.Effect<void>
++  readonly assertRequiredPlugins: Effect.Effect<void>
+   readonly has: <Domain extends keyof Domains>(
+     domain: Domain,
+     name: keyof Domains[Domain] & keyof Failures[Domain],
+@@ -63,6 +66,11 @@
+ const layer = Layer.effect(
+   Service,
+   Effect.gen(function* () {
++    const requiredPlugins = (process.env.OPENCODE_REQUIRED_PLUGINS ?? "")
++      .split(",")
++      .map((id) => id.trim())
++      .filter(Boolean)
++    let requiredPluginCheck: Effect.Effect<void> | undefined
+     const callbacks = new Map<string, Entry[]>()
+     const key = (domain: keyof Domains, name: PropertyKey) => `${domain}.${String(name)}`
+ 
+@@ -101,7 +109,19 @@
+         ),
+       )
+ 
+-    return Service.of({ has, register, trigger })
++    const setRequiredPluginCheck: Interface["setRequiredPluginCheck"] = (check) =>
++      Effect.sync(() => {
++        requiredPluginCheck = check
++      })
++    const assertRequiredPlugins: Interface["assertRequiredPlugins"] = Effect.suspend(() => {
++      if (requiredPlugins.length === 0) return Effect.void
++      if (requiredPluginCheck) return requiredPluginCheck
++      return Effect.sync(() => {
++        throw new Error("Required plugin enforcement is unavailable")
++      })
++    })
++
++    return Service.of({ requiredPlugins, setRequiredPluginCheck, assertRequiredPlugins, has, register, trigger })
+   }),
+ )
+ 
+--- a/packages/core/src/plugin.ts
++++ b/packages/core/src/plugin.ts
+@@ -9,6 +9,7 @@
+ import { Bus } from "./bus.js"
+ import { KV } from "./kv.js"
+ import { PluginHost } from "./plugin/host.js"
++import { PluginHooks } from "./plugin/hooks.js"
+ import { type Failure, type Generation, Service } from "./plugin/service.js"
+ import { State } from "./state.js"
+ 
+@@ -19,6 +20,7 @@
+   Effect.gen(function* () {
+     const bus = yield* Bus.Service
+     const kv = yield* KV.Service
++    const hooks = yield* PluginHooks.Service
+     const scope = yield* Scope.make()
+     // One slot per requested definition in activation order, including ones whose setup failed, so
+     // the prefix diff below stays index-aligned and a failed revision is not retried until it changes.
+@@ -27,6 +29,17 @@
+     const ready = yield* Latch.make(true)
+     const pending = new Set<object>()
+     let closed = false
++    yield* hooks.setRequiredPluginCheck(
++      Effect.sync(() => {
++        if (closed) throw new Error("Required plugin enforcement is unavailable")
++        if (pending.size > 0) throw new Error("Required plugins are still activating")
++        for (const id of hooks.requiredPlugins) {
++          const slot = active.get(Plugin.ID.make(id))
++          if (!slot || !slot.activation || slot.error || slot.activation.failure)
++            throw new Error(`Required plugin is unavailable: ${id}`)
++        }
++      }),
++    )
+     const holdUnsafe = () => {
+       if (closed) return Effect.void
+       const token = {}
+--- a/packages/core/src/session/model-request.ts
++++ b/packages/core/src/session/model-request.ts
+@@ -259,6 +259,7 @@
+       })
+ 
+       const baseURL = base.model.route.endpoint.baseURL
++      yield* hooks.assertRequiredPlugins
+       const modelHook = yield* hooks.trigger("session", "model.request", {
+         ...scope,
+         baseURL: typeof baseURL === "string" ? baseURL : undefined,
+@@ -293,11 +294,13 @@
+         )
+ 
+       const hasHttpHooks =
++        hooks.requiredPlugins.length > 0 ||
+         (yield* hooks.has("session", "http.request", model.ref.providerID)) ||
+         (yield* hooks.has("session", "http.response", model.ref.providerID))
+       const http: StreamOptions["http"] = hasHttpHooks
+         ? (req, handler) =>
+             Effect.gen(function* () {
++              yield* hooks.assertRequiredPlugins
+               const before = yield* hooks.trigger("session", "http.request", {
+                 ...scope,
+                 request: yield* HttpClientRequest.toWeb(req),
+@@ -309,6 +312,7 @@
+                   new Uint8Array(yield* Effect.promise(() => before.request.clone().arrayBuffer())),
+                   before.request.headers.get("content-type") ?? undefined,
+                 )
++              yield* hooks.assertRequiredPlugins
+               const res = yield* handler(sent)
+               const after = yield* hooks.trigger("session", "http.response", {
+                 ...scope,
+@@ -329,17 +333,21 @@
+               session.id,
+               {
+                 handshake: (connect) =>
+-                  hooks
+-                    .trigger("session", "experimental.ws.handshake", {
++                  Effect.gen(function* () {
++                    yield* hooks.assertRequiredPlugins
++                    const event = yield* hooks.trigger("session", "experimental.ws.handshake", {
+                       ...scope,
+                       url: connect.url,
+                       headers: connect.headers,
+                     })
+-                    .pipe(Effect.map((event) => ({ url: event.url, headers: event.headers }))),
++                    yield* hooks.assertRequiredPlugins
++                    return { url: event.url, headers: event.headers }
++                  }),
+                 send: (frame) =>
+-                  hooks
+-                    .trigger("session", "experimental.ws.send", { ...scope, frame })
+-                    .pipe(Effect.map((event) => event.frame)),
++                  hooks.trigger("session", "experimental.ws.send", { ...scope, frame }).pipe(
++                    Effect.tap(() => hooks.assertRequiredPlugins),
++                    Effect.map((event) => event.frame),
++                  ),
+                 receive: (frame) =>
+                   hooks
+                     .trigger("session", "experimental.ws.receive", { ...scope, frame })
+--- a/packages/core/src/generate.ts
++++ b/packages/core/src/generate.ts
+@@ -1,13 +1,18 @@
+ export * as Generate from "./generate.js"
+ 
+-import { LLM, LLMClient, AIError } from "@opencode/ai"
++import { LLM, LLMClient, AIError, Message } from "@opencode/ai"
+ import { Context, Effect, Layer, Schema } from "effect"
+ import { makeLocationNode } from "@opencode/util/effect/app-node"
+ import { llmClient } from "./effect/app-node-platform.js"
+ import { ModelResolver } from "./model-resolver.js"
+ import { Model } from "./model.js"
++import { Agent } from "@opencode/schema/agent"
++import { SessionSchema } from "./session/schema.js"
++import { SessionStore } from "./session/store.js"
++import { SessionModelRequest } from "./session/model-request.js"
+ 
+ export interface TextInput {
++  readonly sessionID?: SessionSchema.ID
+   readonly prompt: string
+   readonly model?: Model.Ref
+ }
+@@ -34,9 +39,18 @@
+   Effect.gen(function* () {
+     const llm = yield* LLMClient.Service
+     const resolver = yield* ModelResolver.Service
++    const sessions = yield* SessionStore.Service
++    const requests = yield* SessionModelRequest.Service
+ 
+     const runText = Effect.fn("Generate.text")(function* (input: TextInput) {
+-      const resolved = yield* resolver.resolve(input.model).pipe(
++      if (process.env.OPENCODE_REQUIRED_PLUGINS?.trim() && !input.sessionID)
++        return yield* new UnavailableError({
++          message: "Guarded generation requires a session",
++        })
++      const session = input.sessionID ? yield* sessions.get(input.sessionID) : undefined
++      if (input.sessionID && !session)
++        return yield* new ModelSelectionError({ message: "Generation session does not exist" })
++      const resolved = yield* resolver.resolve(input.model ?? session?.model).pipe(
+         Effect.catchTag(
+           [
+             "SessionRunnerModel.VariantUnavailableError",
+@@ -60,7 +74,19 @@
+             ? `Model unavailable: ${input.model.providerID}/${input.model.id}`
+             : "No model specified and no supported model is available",
+         })
+-      const response = yield* llm.generate(LLM.request({ model: resolved.model, prompt: input.prompt })).pipe(
++      const prepared = session
++        ? yield* requests.generate({
++            session,
++            agent: session.agent ?? Agent.ID.make("router"),
++            model: resolved,
++            system: [],
++            messages: [Message.user(input.prompt)],
++          })
++        : undefined
++      const response = yield* llm.generate(
++        prepared?.request ?? LLM.request({ model: resolved.model, prompt: input.prompt }),
++        prepared?.options,
++      ).pipe(
+         Effect.mapError(
+           (error: AIError) =>
+             new UnavailableError({
+@@ -90,5 +116,5 @@
+ export const node = makeLocationNode({
+   service: Service,
+   layer,
+-  deps: [ModelResolver.node, llmClient],
++  deps: [ModelResolver.node, SessionStore.node, SessionModelRequest.node, llmClient],
+ })
+--- a/packages/core/test/session-model-request-hooks.test.ts
++++ b/packages/core/test/session-model-request-hooks.test.ts
+@@ -40,6 +40,56 @@
+ })
+ 
+ describe("SessionModelRequest HTTP hooks", () => {
++  it.effect("requires plugins before preparing or sending a guarded request", () =>
++    Effect.gen(function* () {
++      const hooks = yield* PluginHooks.Service
++      let unavailable = true
++      const requiredHooks: PluginHooks.Interface = {
++        ...hooks,
++        requiredPlugins: ["subscription.guard"],
++        assertRequiredPlugins: Effect.sync(() => {
++          if (unavailable) throw new Error("Required plugin is unavailable: subscription.guard")
++        }),
++      }
++      const requests = yield* SessionModelRequest.Service.pipe(
++        Effect.provide(SessionModelRequest.layer),
++        Effect.provideService(PluginHooks.Service, requiredHooks),
++      )
++      const input = {
++        session,
++        agent: Agent.ID.make("build"),
++        model,
++        system: [],
++        messages: [],
++      }
++      const missing = yield* requests.primary(input).pipe(Effect.exit)
++      expect(missing._tag).toBe("Failure")
++
++      unavailable = false
++      const prepared = yield* requests.primary(input)
++      expect(prepared.options.http).toBeDefined()
++      unavailable = true
++      let sent = false
++      const failed = yield* prepared.options.http!(HttpClientRequest.post("https://example.test"), () =>
++        Effect.sync(() => {
++          sent = true
++          return HttpClientResponse.fromWeb(HttpClientRequest.post("https://example.test"), new Response())
++        }),
++      ).pipe(Effect.exit)
++      expect(failed._tag).toBe("Failure")
++      expect(sent).toBe(false)
++
++      unavailable = false
++      yield* prepared.options.http!(HttpClientRequest.post("https://example.test"), (request) =>
++        Effect.sync(() => {
++          sent = true
++          return HttpClientResponse.fromWeb(request, new Response())
++        }),
++      )
++      expect(sent).toBe(true)
++    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
++  )
++
+   it.effect("tags every Session request kind on http.request and http.response", () =>
+     Effect.gen(function* () {
+       const hooks = yield* PluginHooks.Service
+--- a/packages/core/test/generate.test.ts
++++ b/packages/core/test/generate.test.ts
+@@ -10,6 +10,9 @@
+ import { Provider } from "@opencode/core/provider"
+ import { Npm } from "@opencode/util/npm"
+ import { Effect, Layer } from "effect"
++import { SessionStore } from "@opencode/core/session/store"
++import { SessionModelRequest } from "@opencode/core/session/model-request"
++import { SessionSchema } from "@opencode/core/session/schema"
+ import { testEffect } from "./lib/effect"
+ 
+ const selected = Info.make({
+@@ -60,7 +63,10 @@
+ const client = TestLLM.testLayer({ fallback: TestLLM.text("OK", "generate") })
+ 
+ const resolver = ModelResolver.layer.pipe(Layer.provide(Layer.mergeAll(providers, models, integrations, npm, aisdk)))
+-const it = testEffect(Generate.layer.pipe(Layer.provide(Layer.merge(resolver, client))))
++const it = testEffect(Generate.layer.pipe(Layer.provide(Layer.mergeAll(resolver, client,
++  Layer.mock(SessionStore.Service, { get: () => Effect.undefined }),
++  Layer.mock(SessionModelRequest.Service, { generate: () => Effect.die("must not generate without a session") }),
++))))
+ const resolverIt = testEffect(resolver)
+ 
+ it.effect("loads dynamic AI SDK models", () =>
+@@ -89,3 +95,11 @@
+     })
+   }),
+ )
++
++ it.effect("rejects unknown generation sessions before provider access", () =>
++  Effect.gen(function* () {
++    const generate = yield* Generate.Service
++    const result = yield* generate.text({ prompt: "hello", sessionID: SessionSchema.ID.make("ses_missing") }).pipe(Effect.flip)
++    expect(result.message).toBe("Generation session does not exist")
++  }),
++)
+--- a/packages/server/src/handlers/generate.ts
++++ b/packages/server/src/handlers/generate.ts
+@@ -1,10 +1,14 @@
+ import { Generate } from "@opencode/core/generate"
++import { Plugin } from "@opencode/core/plugin/service"
++import { Session } from "@opencode/core/session"
++import { SessionSchema } from "@opencode/core/session/schema"
+ import { Location } from "@opencode/core/location"
+ import { LocationServiceMap } from "@opencode/core/location-services"
+ import { AbsolutePath } from "@opencode/core/schema"
+ import { InvalidRequestError, ServiceUnavailableError } from "@opencode/protocol/errors"
+ import { Global } from "@opencode/util/global"
+ import { Effect } from "effect"
++import { HttpServerRequest } from "effect/unstable/http"
+ import { HttpApiBuilder } from "effect/unstable/httpapi"
+ import { Api } from "../api"
+ 
+@@ -12,22 +16,31 @@
+   Effect.gen(function* () {
+     const global = yield* Global.Service
+     const locations = yield* LocationServiceMap.Service
+-    const services = locations.get(Location.Ref.make({ directory: AbsolutePath.make(global.config) }))
++    const sessions = yield* Session.Service
+     return handlers.handle(
+       "generate.text",
+       Effect.fn("server.generate.text")(function* (request) {
+-        const generate = yield* Generate.Service
+-        const text = yield* generate
+-          .text(request.payload)
+-          .pipe(
+-            Effect.mapError((error) =>
+-              error._tag === "Generate.ModelSelectionError"
+-                ? new InvalidRequestError({ message: error.message })
+-                : new ServiceUnavailableError({ message: error.message, service: error.service }),
+-            ),
+-          )
++        const http = yield* HttpServerRequest.HttpServerRequest
++        const header = http.headers["x-opencode-session-id"]
++        const sessionID = header ? SessionSchema.ID.make(header) : undefined
++        const session = sessionID ? yield* sessions.get(sessionID).pipe(Effect.catchTag("Session.NotFoundError", () => new InvalidRequestError({ message: "Generation session does not exist" }))) : undefined
++        if (sessionID && !session)
++          return yield* new InvalidRequestError({ message: "Generation session does not exist" })
++        const services = locations.get(session?.location ?? Location.Ref.make({ directory: AbsolutePath.make(global.config) }))
++        const text = yield* Effect.gen(function* () {
++          yield* Plugin.awaitActivation
++          const generate = yield* Generate.Service
++          return yield* generate.text({ ...request.payload, ...(sessionID ? { sessionID } : {}) })
++        }).pipe(
++          Effect.provide(services),
++          Effect.mapError((error) =>
++            error._tag === "Generate.ModelSelectionError"
++              ? new InvalidRequestError({ message: error.message })
++              : new ServiceUnavailableError({ message: error.message, service: error.service }),
++          ),
++        )
+         return { data: { text } }
+-      }, Effect.provide(services)),
++      }),
+     )
+   }),
+ )
+--- a/packages/server/test/generate.test.ts
++++ b/packages/server/test/generate.test.ts
+@@ -57,6 +57,15 @@
+       model: { providerID: "base", model: "default" },
+     })
+ 
++    const created = yield* Effect.promise(async () => {
++      const url = new URL("http://opencode.local/api/session")
++      url.searchParams.set("location[directory]", project)
++      const response = await handler(new Request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "Associated project", location: { directory: project } }) }))
++      expect(response.status).toBe(200)
++      return await response.json() as { data: { id: string } }
++    })
++    expect(yield* request(handler, new URL("http://opencode.local/api/experimental/generate"), created.data.id)).toEqual({ model: { providerID: "project", model: "default" } })
++
+     const legacy = new URL("http://opencode.local/api/experimental/generate")
+     legacy.searchParams.set("location[directory]", project)
+     expect(yield* request(handler, legacy)).toEqual({
+@@ -65,12 +74,12 @@
+   }),
+ )
+ 
+-function request(handler: (request: Request) => Promise<Response>, url: URL) {
++function request(handler: (request: Request) => Promise<Response>, url: URL, sessionID?: string) {
+   return Effect.promise(() =>
+     handler(
+       new Request(url, {
+         method: "POST",
+-        headers: { "content-type": "application/json" },
++        headers: { "content-type": "application/json", ...(sessionID ? { "x-opencode-session-id": sessionID } : {}) },
+         body: JSON.stringify({ prompt: "hello" }),
+       }),
+     ).then(async (response) => {
+--- a/packages/core/src/location-activity.ts
++++ b/packages/core/src/location-activity.ts
+@@ -58,19 +58,10 @@
+               const owners = active.flatMap((session) =>
+                 session && key(session.location) === key(entry.ref) ? [session] : [],
+               )
+-              // Invalidation only detaches the cache entry; borrowers retain the old
+-              // graph. Stop its executions and settle tool cleanup before detaching it.
+-              yield* Effect.forEach(
+-                owners,
+-                (session) => execution.interrupt(session.id, { reason: "inactivity", awaitSettlement: true }),
+-                {
+-                  discard: true,
+-                  concurrency: "unbounded",
+-                },
+-              )
+-              const remaining = yield* Effect.forEach(yield* execution.active, (sessionID) => sessions.get(sessionID))
+-              // New work admitted during cleanup may now own the cached graph.
+-              if (remaining.some((session) => session && key(session.location) === key(entry.ref))) {
++              // Active executions own the location graph. Inactivity only evicts
++              // an idle graph; it must never interrupt a running turn or discard
++              // pending questions/forms beneath it.
++              if (owners.length > 0) {
+                 yield* touch(entry.ref)
+                 return
+               }
+--- a/packages/core/test/location-activity.test.ts
++++ b/packages/core/test/location-activity.test.ts
+@@ -105,11 +105,10 @@
+     [1, "none"],
+     [2, "none"],
+     [1, "other"],
+-    [1, "same"],
+   ] as const) {
+     const newWork = admission !== "none"
+     it.effect(
+-      `interrupts ${count} waiting executions before eviction (${admission} session admitted during cleanup)`,
++      `preserves ${count} waiting executions past expiry (${admission} session admitted during cleanup)`,
+       () =>
+         Effect.gen(function* () {
+           const db = (yield* Database.Service).db
+@@ -120,7 +119,7 @@
+           const sessionIDs = Array.from({ length: count }, (_, index) =>
+             Session.ID.make(`ses_waiting_question_${index}`),
+           )
+-          const newcomer = admission === "same" ? sessionIDs[0] : Session.ID.make("ses_new_question")
++          const newcomer = Session.ID.make("ses_new_question")
+           const ref = LocationServiceMap.canonical({ directory: AbsolutePath.make("/project") })
+           const idle = Location.Ref.make({ directory: ref.directory, workspaceID: Workspace.ID.make("wrk_idle") })
+           yield* db
+@@ -176,11 +175,11 @@
+           // Human input produces no durable activity while the question is pending.
+           yield* TestClock.adjust("1 minute")
+           yield* TestClock.adjust("62 minutes")
+-          // Interruption has cancelled each question, but slow cleanup still owns the graph.
++          // Expiry must preserve active executions and their pending forms.
+           expect(Array.from(yield* execution.active).toSorted()).toEqual(sessionIDs.toSorted())
+           expect(Array.from(yield* RcMap.keys(map.rcMap))).toEqual([ref])
+-          expect(yield* forms.list()).toEqual([])
+-          for (const form of pending) expect(yield* forms.state(form.id)).toEqual({ status: "cancelled" })
++          expect((yield* forms.list()).map((form) => form.id)).toEqual(pending.map((form) => form.id))
++          for (const form of pending) expect(yield* forms.state(form.id)).toEqual({ status: "pending" })
+ 
+           if (newWork) {
+             yield* execution.wake(newcomer)
+@@ -188,26 +187,20 @@
+           }
+           yield* TestClock.adjust("5 minutes")
+           if (newWork) yield* Deferred.await(newCreated)
++          // An explicit interrupt settles the waiting turns; only then may the
++          // next expiry evict the now-idle graph.
++          yield* Effect.forEach(sessionIDs, (sessionID) => execution.interrupt(sessionID, { reason: "user" }), { discard: true })
++          yield* TestClock.adjust("5 minutes")
+           const results = yield* Effect.forEach(running, Fiber.join)
+           expect(results.every((exit) => exit._tag === "Failure")).toBe(true)
+           expect(Array.from(yield* execution.active)).toEqual(newWork ? [newcomer] : [])
+           expect(yield* store.listSuspended()).toEqual(newWork ? [newcomer] : [])
+           expect(interrupted.toSorted((a, b) => a.sessionID.localeCompare(b.sessionID))).toEqual(
+-            sessionIDs.map((sessionID) => ({ sessionID, reason: "inactivity" })),
+-          )
+-          expect(Array.from(yield* RcMap.keys(map.rcMap))).toEqual(newWork ? [ref] : [])
++            sessionIDs.map((sessionID) => ({ sessionID, reason: "user" })),
++          )
++          expect(Array.from(yield* RcMap.keys(map.rcMap))).toEqual([ref])
+           if (newWork) {
+             expect(yield* forms.list({ sessionID: newcomer })).toEqual([pending[count]])
+-            if (admission === "same") {
+-              const later = LocationServiceMap.canonical({ directory: AbsolutePath.make("/later") })
+-              yield* Location.Service.pipe(Effect.provide(map.get(later)), Effect.scoped)
+-              yield* TestClock.adjust("30 minutes")
+-              // Keep fresh work active while a different graph reaches its own deadline.
+-              yield* bus.publish(SessionEvent.Execution.Started, { sessionID: newcomer }, { location: ref })
+-              yield* TestClock.adjust("32 minutes")
+-              expect(Array.from(yield* execution.active)).toEqual([newcomer])
+-              expect(Array.from(yield* RcMap.keys(map.rcMap))).toEqual([ref])
+-            }
+             yield* execution.interrupt(newcomer)
+             yield* TestClock.adjust("5 minutes")
+             yield* execution.awaitIdle(newcomer)

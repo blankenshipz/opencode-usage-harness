@@ -1,0 +1,10 @@
+{
+  "upstream": "https://github.com/anomalyco/opencode",
+  "version": "2.0.18",
+  "source_url": "https://github.com/anomalyco/opencode/archive/refs/tags/v2.0.18.tar.gz",
+  "source_sha256": "dc775ac36cf78afa58b72cbb3e5bacbb9e05347c51f160076d5896f281bd8aa8",
+  "patch": "opencode-2.0.18-required-plugins.patch",
+  "patch_sha256": "525bd7807a75118cf279a267ef307a6937eb6f346cfb5cf23941be1f2e8d1701",
+  "bun_version": "1.4.2",
+  "status": "experimental; compiled integration historically verified on macOS x64 only"
+}

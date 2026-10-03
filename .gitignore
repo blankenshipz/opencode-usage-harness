@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+node_modules/
+.env
+.env.*
+*.db
+*.sqlite*
+*.log
+*.jsonl
+state/
+runtime/
+backups/
+auth.json
+financial-verification.json
+dist/
+.DS_Store
