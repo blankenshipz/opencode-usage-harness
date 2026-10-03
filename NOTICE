@@ -3,3 +3,10 @@ OpenCode Usage Harness is an independent project, not affiliated with OpenAI, Op
 The compatibility patch modifies OpenCode (MIT), Copyright (c) 2025 opencode.
 The complete upstream license is included in compat/LICENSE.opencode.
 Upstream software and downloaded dependencies retain their own licenses.
+
+Design inspiration for large-file context controls: Spotify Engineering,
+"Portal by Spotify cut my Claude Code token usage by 90%", and Spotify's Shunt
+plugin in spotify/portal-ai-plugins:
+https://engineering.atspotify.com/2026/9/portal-by-spotify-cut-my-claude-code-token-usage-by-90
+https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt
+This acknowledgment credits the approach and does not imply Spotify endorsement.
