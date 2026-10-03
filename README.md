@@ -4,6 +4,15 @@ An experimental, subscription-aware OpenCode harness for task delegation, bounde
 
 This is a source release extracted from a working private installation. It is **not a drop-in replacement for OpenCode or OpenChamber**. The offline installer and utilities are independently usable; agent integration targets OpenCode **2.0.18 with the supplied required-plugin patch**. Stock OpenCode, newer versions, Windows, and a fresh end-to-end public installation are not yet certified. See [compatibility](docs/COMPATIBILITY.md).
 
+## Multiple subscriptions
+
+The architecture separates provider/model routes from shared subscription allowances,
+so independent pools can eventually run useful work in parallel without counting
+one allowance twice. A provider-neutral offline planner is included; **live routing
+still supports Codex only**. Claude and other subscription adapters, atomic runtime
+reservations, and cross-provider dispatch remain integration work. See
+[subscription-pool architecture](docs/SUBSCRIPTION-POOLS.md).
+
 ## What is included
 
 - OpenAI ChatGPT OAuth policy checks, quota-window telemetry, and reset-relative pacing.

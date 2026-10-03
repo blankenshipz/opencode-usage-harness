@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 — unreleased
+
+- Provider-neutral offline subscription-pool planning with shared allowance groups, per-window pacing, capability tiers, freshness checks, and parallel slot accounting.
+- Documented adapter boundaries and remaining runtime reservation/dispatch work; live profile remains Codex-only.
+- Credit Spotify’s blog and Shunt project for large-file context-control inspiration.
+
 ## 0.1.0 — experimental source release
 
 - Portable extraction of subscription checks, quota telemetry/pacing, model status, bounded reads, task intent/ownership, and outcome recording.
