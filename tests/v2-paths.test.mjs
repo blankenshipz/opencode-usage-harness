@@ -17,7 +17,7 @@ test('portable plugin paths use the configured state root and module package roo
   const paths = JSON.parse(stdout);
   assert.equal(paths.stateRoot, state);
   assert.equal(paths.managedConfigRoot, `${state}/config`);
-  assert.match(paths.packageRoot, /opencode-subscription-harness$/);
+  assert.match(paths.packageRoot, /opencode-usage-harness$/);
 });
 
 test('default task outcome persistence writes below the configured state root', async () => {

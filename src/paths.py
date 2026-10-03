@@ -8,7 +8,7 @@ from pathlib import Path
 
 def state_dir() -> Path:
     configured = os.environ.get("HARNESS_STATE_DIR")
-    return Path(configured).expanduser() if configured else Path.home() / ".local" / "state" / "opencode-subscription-harness"
+    return Path(configured).expanduser() if configured else Path.home() / ".local" / "state" / "opencode-usage-harness"
 
 
 def quota_cache_path() -> Path:

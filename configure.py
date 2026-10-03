@@ -52,7 +52,7 @@ def profile(models, package_root=ROOT):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--models',type=Path,required=True,help='JSON FAST/BALANCED/STRONG/MAXIMUM references from your actual catalog')
-    p.add_argument('--state-dir',type=Path,default=Path(os.environ.get('HARNESS_STATE_DIR',str(Path.home()/'.local/state/opencode-subscription-harness'))))
+    p.add_argument('--state-dir',type=Path,default=Path(os.environ.get('HARNESS_STATE_DIR',str(Path.home()/'.local/state/opencode-usage-harness'))))
     p.add_argument('--replace',action='store_true',help='Back up and replace this generated profile explicitly')
     a=p.parse_args(); result=profile(json.loads(a.models.read_text()))
     directory=a.state_dir.expanduser().resolve()/'config';target=directory/'opencode.json'

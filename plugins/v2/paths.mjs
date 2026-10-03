@@ -4,7 +4,7 @@ import os from 'node:os';
 
 // Resolve the install once from this module, never from the caller's cwd.
 export const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-export const stateRoot = path.resolve(process.env.HARNESS_STATE_DIR || path.join(os.homedir(), '.local/state/opencode-subscription-harness'));
+export const stateRoot = path.resolve(process.env.HARNESS_STATE_DIR || path.join(os.homedir(), '.local/state/opencode-usage-harness'));
 export const managedConfigRoot = path.join(stateRoot, 'config');
 export const statePath = (...parts) => path.join(stateRoot, ...parts);
 export const configuredPython = process.env.HARNESS_PYTHON || 'python3';

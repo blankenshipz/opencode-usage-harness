@@ -23,7 +23,7 @@ def main():
     if a.tag!='v'+version or json.loads(git('show',ref+':package.json'))['version']!=version:p.error('tag, VERSION and package.json disagree')
     subprocess.run(['python3',str(ROOT/'scripts/audit_public.py')],check=True,cwd=ROOT)
     out=a.output_dir.expanduser().resolve();out.mkdir(parents=True,exist_ok=True)
-    name=f'opencode-subscription-harness-{version}'
+    name=f'opencode-usage-harness-{version}'
     archive=out/(name+'.tar.gz');sums=out/'SHA256SUMS'
     if archive.exists() or sums.exists():p.error('refusing to overwrite release artifacts')
     subprocess.run(['git','archive','--format=tar.gz','--prefix='+name+'/', '--output='+str(archive),ref],cwd=ROOT,check=True)

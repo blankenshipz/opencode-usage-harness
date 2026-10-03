@@ -7,8 +7,8 @@ Do not run this against an existing production profile without reviewing the dif
 3. Prepare the separate harness profile from the installed release:
 
 ```sh
-export HARNESS_STATE_DIR="$HOME/.local/state/opencode-subscription-harness"
-python3 "$HOME/.local/share/opencode-subscription-harness/current/configure.py" \
+export HARNESS_STATE_DIR="$HOME/.local/state/opencode-usage-harness"
+python3 "$HOME/.local/share/opencode-usage-harness/current/configure.py" \
   --models /absolute/path/to/your-models.json
 ```
 

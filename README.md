@@ -1,4 +1,4 @@
-# OpenCode Subscription Harness
+# OpenCode Usage Harness
 
 An experimental, subscription-aware OpenCode harness for task delegation, bounded file reads, quota pacing, and evidence-aware completion.
 
@@ -27,10 +27,10 @@ python3 scripts/audit_public.py
 python3 install.py install --source "$PWD"
 ```
 
-Default installation: `~/.local/share/opencode-subscription-harness`. The installer prints the installed version; it never edits shell startup files or starts a service. Add its bin directory yourself if desired:
+Default installation: `~/.local/share/opencode-usage-harness`. The installer prints the installed version; it never edits shell startup files or starts a service. Add its bin directory yourself if desired:
 
 ```sh
-export PATH="$HOME/.local/share/opencode-subscription-harness/bin:$PATH"
+export PATH="$HOME/.local/share/opencode-usage-harness/bin:$PATH"
 harness-manage status
 codex-quota --json
 ```
@@ -72,7 +72,7 @@ Agent profiles refer to the release from which they were generated. Updating too
 
 | Setting | Meaning |
 |---|---|
-| `HARNESS_STATE_DIR` | Mutable state; default `~/.local/state/opencode-subscription-harness` |
+| `HARNESS_STATE_DIR` | Mutable state; default `~/.local/state/opencode-usage-harness` |
 | `HARNESS_OPENCODE_DB` | Required explicit compatible OpenCode SQLite database |
 | `HARNESS_CODEX_BIN` | Optional Codex CLI executable |
 | `HARNESS_PYTHON` | Optional Python executable for plugin helpers |

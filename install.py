@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 
-PROGRAM = "opencode-subscription-harness"
+PROGRAM = "opencode-usage-harness"
 DEFAULT_PREFIX = Path.home() / ".local" / "share" / PROGRAM
 DEFAULT_STATE = Path.home() / ".local" / "state" / PROGRAM
 # This is intentionally a release payload allowlist.  The documentation files
