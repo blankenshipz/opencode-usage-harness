@@ -1,27 +1,108 @@
 # OpenCode Usage Harness
 
-An experimental, subscription-aware OpenCode harness for task delegation, bounded file reads, quota pacing, and evidence-aware completion.
+**Put your coding subscription to work where it matters.** Give routine exploration
+to a smaller model, reserve deeper reasoning for difficult problems, and pace work
+against your actual quota resets—all from OpenCode.
 
-This is a source release extracted from a working private installation. It is **not a drop-in replacement for OpenCode or OpenChamber**. The offline installer and utilities are independently usable; agent integration targets OpenCode **2.0.18 with the supplied required-plugin patch**. Stock OpenCode, newer versions, Windows, and a fresh end-to-end public installation are not yet certified. See [compatibility](docs/COMPATIBILITY.md).
+OpenCode Usage Harness adds task routing, context controls, and usage visibility to
+your coding workflow. The goal is more useful, verified work from the capacity you
+already pay for. Stronger models and additional review belong where they improve
+the result; unused quota alone is no reason to manufacture work.
+
+**Start with [quota visibility](#install-the-toolkit), then
+[enable the agent workflow](#enable-agent-integration-separately).** Interested in
+combining several subscriptions? Explore the [pool planner and architecture](docs/SUBSCRIPTION-POOLS.md)
+and [help build the next integrations](#contributing).
+
+## What you get
+
+| For your workflow | What the harness provides |
+|---|---|
+| Choose the right level of reasoning | Specialist roles for exploration, implementation, debugging, architecture, and review, mapped to models and efforts you select from your actual catalog. |
+| See whether capacity is running out or going unused | Codex quota telemetry and pacing based on reported allowance windows and reset times. |
+| Keep large files from crowding the main agent's context | A 350-line broad-read threshold, focused worker summaries, targeted reads, and reasoned one-use exceptions. |
+| Keep delegated work connected to the task | Shared task intent, scoped worker ownership, resumption, and recorded acceptance evidence. |
+| Understand what your agents accomplished | Workload metrics for usage, retries, tool results, and reported completion, with unknowns called out. |
+| Keep subscription-only inference explicit | ChatGPT OAuth checks, account matching, financial admission checks, and no automatic API-key/provider fallback in the supported profile. |
+| Adopt changes incrementally | An isolated toolkit installer, versioned updates, integrity checks, and code rollback. |
+
+A typical workflow is: **check quota → scout the relevant code → delegate to an
+appropriate specialist → run targeted verification → repair or escalate when the
+evidence warrants it**. The full workflow requires the compatible agent integration;
+installing the standalone tools does not activate it automatically.
+
+## What works today
+
+This is an **experimental project** extracted from a working private installation.
+The standalone installer and utilities are independently usable. Live agent
+integration currently supports **Codex through ChatGPT OAuth** and targets
+**OpenCode 2.0.18 with the supplied required-plugin patch**.
+
+A fresh end-to-end public installation, stock/newer OpenCode versions, and Windows
+are not yet certified. OpenChamber installation and remote pairing are not included.
+Read [compatibility](docs/COMPATIBILITY.md) before changing your agent setup.
+
+The harness does not promise a percentage saving or a hard billing guarantee.
+Provider-side subscription eligibility and spend controls still matter. See
+[security and limitations](SECURITY.md). This project is independent of OpenAI,
+OpenCode, OpenChamber, and Spotify.
 
 ## Multiple subscriptions
 
-The architecture separates provider/model routes from shared subscription allowances,
-so independent pools can eventually run useful work in parallel without counting
-one allowance twice. A provider-neutral offline planner is included; **live routing
-still supports Codex only**. Claude and other subscription adapters, atomic runtime
-reservations, and cross-provider dispatch remain integration work. See
-[subscription-pool architecture](docs/SUBSCRIPTION-POOLS.md).
+The longer-term goal is to put **Codex, Claude, and other eligible subscriptions to
+work in parallel**, choosing tasks and model/effort combinations for each pool's
+capabilities and remaining allowance.
 
-## What is included
+The current development branch includes a provider-neutral **offline planner** for
+independent pools, shared quota groups, per-window pacing, and concurrency slots.
+It avoids treating two routes to one allowance as extra capacity. It does not
+launch cross-provider agents. **Live routing remains Codex-only**; other adapters
+must verify subscription access, quota identity, and financial controls first.
 
-- OpenAI ChatGPT OAuth policy checks, quota-window telemetry, and reset-relative pacing.
-- Role-specific routing, revisioned task intent, scoped worker ownership, and resumption.
-- Bounded reads (350 lines), targeted scout summaries, and one-use direct-read exceptions.
-- Root-workload metrics that distinguish successful tools from complete tasks.
-- An offline installer, versioned updates, integrity manifests, rollback, and fixture-based tests.
+See the [architecture and runnable fixture example](docs/SUBSCRIPTION-POOLS.md).
+This planning foundation is scheduled for 0.2.0 and is not in the v0.1.0 release.
 
-This is an independent project. It is not affiliated with OpenAI, OpenCode, or OpenChamber. Subscription capacity and eligibility are controlled by the provider. No benchmark-backed savings claim is made.
+## Remaining work and next steps
+
+The next milestones are:
+
+- **Make the first installation repeatable.** Validate a fresh public setup end to
+  end, automate compatible runtime builds, and document verified platform coverage.
+- **Connect the planner to safe parallel execution.** Add atomic reservations,
+  crash recovery, task idempotency, and ownership checks before runtime dispatch
+  across pools. Advisory slot counts alone are insufficient.
+- **Add subscription adapters one at a time.** Verify supported authentication,
+  model/effort discovery, quota telemetry, and no metered fallback for each provider.
+  Claude and other subscriptions are candidates, not currently supported adapters.
+- **Measure useful outcomes across pools.** Attribute task results, retries,
+  elapsed time, and quota changes without equating token counts to subscription
+  dollars. Evaluate independent-provider review where it adds value.
+- **Improve distribution and remote setup.** Add signed releases, compatible
+  binaries where practical, and documented OpenChamber setup and pairing.
+
+**For users:** try the released quota tools first, check compatibility, and report
+installation or workflow gaps with a sanitized reproduction. **For contributors:**
+pick a bounded milestone above and propose how to validate it. The [changelog](CHANGELOG.md)
+separates released functionality from development work; these milestones are not
+promises of a release date.
+
+## Contributing
+
+Help make subscription-aware coding practical across more setups. Useful
+contributions include first-install reports, regression tests, clearer onboarding,
+provider adapter designs, and fixes for task routing or context handling.
+
+1. [Open an issue](https://github.com/blankenshipz/opencode-usage-harness/issues) with
+   the problem, expected behavior, and a small sanitized reproduction. Discuss new
+   adapters or runtime changes before building a large integration.
+2. Make a focused change with fixture-based tests. Keep credentials, account data,
+   chat histories, and runtime state out of the repository.
+3. Run the offline checks below and open a pull request explaining the behavior
+   change, validation, and remaining limitations.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for test and release requirements and
+[SECURITY.md](SECURITY.md) for the current safety boundaries. Automated tests should
+not consume a real subscription or incur inference charges.
 
 ## Install the toolkit
 
