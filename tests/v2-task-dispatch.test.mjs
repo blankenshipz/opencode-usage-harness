@@ -10,6 +10,7 @@ import { installTaskDispatch, hasCapability } from '../plugins/v2/task-dispatch.
 import { createV2TaskOutcomes } from '../plugins/v2/task-outcomes.mjs';
 import { setIntent } from '../plugins/v2/task-intent.mjs';
 import { createRegistry } from '../plugins/v2/dispatch-registry.mjs';
+import { createWorkerProgress } from '../plugins/v2/worker-progress.mjs';
 const agents = JSON.parse(fs.readFileSync(new URL('./fixtures/agents.json', import.meta.url)));
 const intent = {outcome:'Working release',target:'Local backend',nonGoals:[],authorizedEffects:['Local changes'],assumptions:[],checks:[{id:'backend',description:'Actual backend check',mode:'local'}],sourceMessageIDs:['msg_user']};
 const base = { intentRevision:1,checkIds:['backend'],taskId:'release',workKey:'backend',operation:'implement',agent:'builder',description:'Fix backend',prompt:'Implement requested backend checks',requiredCapabilities:['edit','shell'],writePaths:['backend'] };
@@ -33,6 +34,16 @@ async function harness(t, custom) {
 test('configured roles retain capability ceilings',()=>{
  assert.equal(hasCapability(agents.coordinator,'shell'),false);assert.equal(hasCapability(agents.coordinator,'delegate'),true);
  assert.equal(hasCapability(agents.builder,'shell'),true);assert.equal(hasCapability(agents.builder,'edit'),true);assert.equal(hasCapability(agents.builder,'delegate'),false);assert.equal(hasCapability(agents.scout,'shell'),false);
+});
+test('worker progress publishes only a bounded live snapshot and disconnects cleanly', async () => {
+ let begin, release; const started = new Promise(resolve => { begin = resolve; });
+ const stream = { async *[Symbol.asyncIterator]() { begin(); await new Promise(resolve => { release = resolve; }); yield { type:'session.tool.input.started', data:{sessionID:'ses_leaf',id:'tool_1',name:'shell',input:'SECRET=never-forward'} }; await new Promise(() => {}); } };
+ const updates=[]; const tracker=createWorkerProgress({event:{subscribe:()=>stream}},{loadSessions:async()=>[{id:'ses_child'},{id:'ses_leaf',parentID:'ses_child'}],minInterval:30});
+ const handle=tracker.attach(async update=>updates.push(update)); await handle.native({sessionID:'ses_child',status:'running',output:'SECRET=never-forward'});
+ await started; release(); await new Promise(resolve=>setTimeout(resolve,10)); assert.equal(updates.length,1); await new Promise(resolve=>setTimeout(resolve,35));
+ const latest=updates.at(-1); assert.deepEqual(latest,{sessionID:'ses_child',status:'running',toolCalls:[{tool:'shell',status:'running'}],summary:[{id:'worker:ses_child',tool:'shell',state:{status:'running',title:'Active'}}],workerProgress:{state:'working',tool:'shell',updatedAt:latest.workerProgress.updatedAt}});
+ assert.equal(JSON.stringify(updates).includes('SECRET'),false);
+ handle.close(); tracker.dispose(); assert.equal(updates.length,2);
 });
 test('native and wrapper both reject incapable Git history routing before native execution',async t=>{
  const h=await harness(t);for(const tool of ['task_dispatch','subagent']) {

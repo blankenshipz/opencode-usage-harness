@@ -135,7 +135,7 @@ harness-metrics --days 7
 harness-metrics --days 7 --json
 ```
 
-The database is opened read-only. The public repository includes no database. Historical permission-blocked minutes are unknown, and artifact freshness is not independently verified by the metrics tool. Completed checks are self-reported evidence, not proof of real-world correctness. Tokens are not subscription-dollar prices.
+The database is opened read-only. The public repository includes no database. Historical permission-blocked minutes are unknown, and artifact freshness is not independently verified by the metrics tool. Completed checks are self-reported evidence, not proof of real-world correctness. Tokens are not subscription-dollar prices. For deduplicated completion counts and token totals across legacy logs and the new ledger, see [completion telemetry](docs/TELEMETRY.md).
 
 ## Enable agent integration separately
 

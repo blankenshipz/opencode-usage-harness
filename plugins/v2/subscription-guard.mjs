@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { validateFinancial } from '../../config/guard-validation.mjs';
 import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
+import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
 
 const quotaEnvironment = env => Object.fromEntries([
   'HOME', 'PATH', 'LANG', 'HARNESS_STATE_DIR', 'CODEX_HOME', 'HARNESS_CODEX_BIN', 'HARNESS_PYTHON',
@@ -80,7 +81,9 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     const telemetry = statePath('telemetry');
     mkdirSync(telemetry, { recursive: true, mode: 0o700 });
     appendFileSync(path.join(telemetry, `${file}.jsonl`), JSON.stringify(value) + '\n', { mode: 0o600 });
-  }, env = process.env, now = () => new Date().toISOString() } = {}) {
+  }, env = process.env, now = () => new Date().toISOString(), recordCompletion = value => persistCompletion({
+    database: statePath('telemetry', 'completions.sqlite3'), value, python: env.HARNESS_PYTHON || 'python3', env,
+  }) } = {}) {
   async function quota(operation) {
     const started = performance.now();
     try {
@@ -178,9 +181,20 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
             const key = `${data.sessionID}\u0000${data.assistantMessageID}`;
             const step = steps.get(key); steps.delete(key);
             if (!step) continue;
-            append('completions', { recorded_at: now(), message_id: data.assistantMessageID, session_id: data.sessionID,
+            // The durable ledger owns completion identity.  Do not append these
+            // to the legacy JSONL stream: it cannot make an across-process
+            // uniqueness claim atomically.
+            const completion = { recorded_at: now(), message_id: data.assistantMessageID, session_id: data.sessionID,
               model: step.model.id, provider: step.model.providerID, agent: step.agent,
-              tokens: data.tokens, completed_at: event.created });
+              tokens: data.tokens, completed_at: event.created };
+            try { await recordCompletion(completion); }
+            catch {
+              // A failed transaction makes no durable identity claim. Retry once
+              // for a transient lock/process failure without terminating the
+              // subscription that can record later completions.
+              try { await recordCompletion(completion); }
+              catch { console.error('subscription completion telemetry write failed'); }
+            }
           }
         } catch (error) { if (!controller.signal.aborted) console.error('subscription telemetry stopped', error); }
       })();

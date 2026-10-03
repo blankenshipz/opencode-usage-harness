@@ -2,6 +2,9 @@
 
 ## 0.2.0 — unreleased
 
+- Foreground worker activity on parent OpenChamber tool cards without extra model calls.
+- Idempotent completion telemetry ledger and deduplicated historical usage reporting.
+
 - Provider-neutral offline subscription-pool planning with shared allowance groups, per-window pacing, capability tiers, freshness checks, and parallel slot accounting.
 - Documented adapter boundaries and remaining runtime reservation/dispatch work; live profile remains Codex-only.
 - Credit Spotify’s blog and Shunt project for large-file context-control inspiration.

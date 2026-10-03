@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { createRegistry, runtimeSessions, runtimeIntentSources, lineage, descendant, overlaps } from './dispatch-registry.mjs';
 import { intentSchema, getIntent, setIntent, bindIntent, renderIntent } from './task-intent.mjs';
 import { packageRoot } from './paths.mjs';
+import { createWorkerProgress } from './worker-progress.mjs';
 // Eligibility is not a permission grant: the native executor still owns authorization and depth.
 export function hasCapability(agent, capability) {
   const rules = agent.permissions ?? [], action = capability === 'delegate' ? 'subagent' : capability;
@@ -38,6 +39,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
 const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
 export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources } = {}) {
   if (!ctx.agent?.list) return;
+  const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
   const paths = (input, agent) => {
     if (input.operation === 'deploy') return ['.'];
@@ -132,11 +134,12 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       if (admission.existing) return { content:`Existing child ${admission.existing} is still running. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
       const update = async patch => registry(workspace,async(state,save)=> { const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly'); Object.assign(r,patch,{updatedAt:Date.now()});await save(); });
       let observed = admission.childID;
+      const visible = workerProgress.attach(context.progress ?? (async () => {}));
       try {
         const result = await rawExecute({ agent:input.agent,description:input.description,prompt:(admission.intent ? `${renderIntent(admission.intent,input.checkIds)}\n\nWorker assignment:\n${input.prompt}` : input.prompt),...(admission.childID?{sessionID:admission.childID}:{}),...(input.model?{model:input.model}:{}),background:input.background??false }, {
           ...context, progress: async progress => {
             if(progress.sessionID) { observed=progress.sessionID;await update({childID:observed,state:'running'}); }
-            return context.progress?.(progress);
+            return visible.native(progress);
           },
         });
         observed = result?.metadata?.sessionID ?? result?.output?.sessionID ?? observed;
@@ -146,7 +149,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         await update({childID:observed,state:observed?'paused':'not_started',inFlight:null});
         // Preserve original permission/guard error; never retry, change provider, or replace the child here.
         throw error;
-      }
+      } finally { visible.close(); }
     };
     if (typeof editor.update !== 'function') throw new Error('task-dispatch: native tool transformation unavailable');
     editor.update('subagent',tool=>{tool.input=schema;tool.description+=`\nOwnership and capability checks apply to this native path too. ${guidance}`;tool.execute=dispatch;});
@@ -175,7 +178,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       return {content:JSON.stringify({owners,existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
     })});
   });
-  return { outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
+  return { dispose: () => workerProgress.dispose(), outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
     const sessions=await loadSessions(),rootID=lineage(sessions,call.sessionID),current=getIntent(state,rootID,args.taskId);
     if (!current) return run(null);
     if (args.intentRevision!==current.revision) throw new Error('task-intent: outcome requires the current intentRevision; stale results cannot complete a corrected objective');

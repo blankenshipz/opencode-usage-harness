@@ -29,12 +29,12 @@ const event = (providerID = 'openai', kind = 'primary') => ({
 });
 const good = { auth_mode: 'chatgpt', tokens: { account_id: 'same-account' } };
 function guard({ codex = good, financial = { auto_top_up_off: true, automatic_reload_off: true, purchased_credit_balance_ui: 0, verified_at: '2026-09-08' },
-  env = {}, quota = () => 'ok' } = {}) {
+  env = {}, quota = () => 'ok', recordCompletion } = {}) {
   const writes = [], runs = [], reads = [];
   const plugin = createV2Guard({ readJSON: file => {
     reads.push(file); return file.includes('.codex/auth.json') ? codex : financial;
   }, env, runQuota: (args, options) => { runs.push({ args, options }); return quota(args, options); },
-  append: (name, value) => writes.push({ name, value }) });
+  append: (name, value) => writes.push({ name, value }), recordCompletion: recordCompletion ?? (value => writes.push({ name: 'completions', value })) });
   return { plugin, writes, runs, reads };
 }
 
@@ -310,4 +310,17 @@ test('V2 event envelope records completion and links actual actor by the exact s
   assert.equal(rows[0].attribution.recordingActor.model, 'openai/gpt-6-sol');
   assert.equal(rows[0].attribution.recordingActor.effort, 'high');
   outcomes.cleanup();
+});
+
+test('V2 completion telemetry retries once and a failed record does not stop later events', async () => {
+  const step = message => ({ type: 'session.step.started', data: { sessionID: 's1', assistantMessageID: message, agent: 'builder', model: { providerID: 'openai', id: 'gpt-6-sol' } } });
+  const ended = message => ({ type: 'session.step.ended', data: { sessionID: 's1', assistantMessageID: message, tokens: {} } });
+  const calls = [], g = guard({ recordCompletion: async value => {
+    calls.push(value.message_id); if (value.message_id === 'm1') throw new Error('private failure');
+  } });
+  const h = await harness(g.plugin, undefined, undefined, [step('m1'), ended('m1'), step('m2'), ended('m2')]);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ['m1', 'm1', 'm2']);
+  h.cleanup();
 });
