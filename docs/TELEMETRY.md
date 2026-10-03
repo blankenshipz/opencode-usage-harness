@@ -50,3 +50,11 @@ quiet. Background dispatch returns immediately, so its settled parent card does
 not receive this foreground tracker; open the native child session for status.
 Already-running dispatch calls retain their existing code until they settle;
 the new tracker attaches to subsequent calls after plugin reload.
+
+Agent instructions request concise milestones at natural boundaries, aiming for
+45–60 seconds during sustained work, and a heads-up before long blocking calls.
+This is a communication target, not a timer guarantee: a waiting parent cannot
+produce prose until its foreground call returns. Workers' prose remains in their
+own sessions. The parent card also shows observed reasoning/responding phases
+from start/end events; no reasoning content or text deltas are forwarded. There
+is no artificial heartbeat, polling loop, or additional inference for narration.

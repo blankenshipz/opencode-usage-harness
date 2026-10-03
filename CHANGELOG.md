@@ -2,6 +2,8 @@
 
 ## 0.2.0 — unreleased
 
+- Concise progress-update guidance and observed reasoning/responding phases on foreground worker cards.
+
 - Foreground worker activity on parent OpenChamber tool cards without extra model calls.
 - Idempotent completion telemetry ledger and deduplicated historical usage reporting.
 

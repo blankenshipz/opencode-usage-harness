@@ -187,3 +187,19 @@ test('real outcome tool uses shared acceptance instead of an independent child c
  await assert.rejects(execute({taskId:'release',intentRevision:1,scope:'task',status:'completed',results:[{id:'backend',mode:'local',status:'passed',evidence:'Old result'}]}),/current intentRevision/);
  assert.equal(records.length,1);
 });
+
+test('worker reasoning and response phases are visible without forwarding content', async () => {
+ const queue=[];let wake,closed=false;
+ const stream={async *[Symbol.asyncIterator](){while(!closed){if(!queue.length)await new Promise(r=>{wake=r;});while(queue.length)yield queue.shift();}}};
+ const updates=[];const tracker=createWorkerProgress({event:{subscribe:()=>stream}},{minInterval:0});
+ const handle=tracker.attach(async value=>updates.push(value));await handle.native({sessionID:'ses_worker'});
+ async function emit(type,sessionID='ses_worker') {queue.push({type,data:{sessionID,text:'SECRET',delta:'SECRET',id:'part'}});wake?.();await new Promise(r=>setTimeout(r,5));}
+ await emit('session.reasoning.started');assert.equal(updates.at(-1).workerProgress.phase,'reasoning');assert.equal(updates.at(-1).summary[0].state.title,'Reasoning');
+ const count=updates.length;await emit('session.reasoning.delta');await emit('session.text.started','ses_other');assert.equal(updates.length,count);
+ await emit('session.reasoning.ended');assert.equal(updates.at(-1).workerProgress.phase,undefined);
+ await emit('session.text.started');assert.equal(updates.at(-1).toolCalls[0].tool,'responding');
+ await emit('session.text.ended');assert.equal(updates.at(-1).workerProgress.phase,undefined);
+ assert.equal(JSON.stringify(updates).includes('SECRET'),false);
+ handle.close();const before=updates.length;await emit('session.text.started');assert.equal(updates.length,before);
+ tracker.dispose();closed=true;wake?.();
+});

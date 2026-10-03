@@ -1,7 +1,7 @@
 // Parent-tool progress is intentionally closed-set metadata. Event payloads can
 // contain prompts, tool input, output, and provider text, none of which belong
 // in a parent-visible status update.
-const ACTIVITY_EVENTS = new Set(['session.tool.input.started', 'session.tool.success', 'session.tool.failed',
+const ACTIVITY_EVENTS = new Set(['session.reasoning.started', 'session.reasoning.ended', 'session.text.started', 'session.text.ended', 'session.tool.input.started', 'session.tool.success', 'session.tool.failed',
   'permission.asked', 'permission.replied', 'form.created', 'form.replied', 'form.cancelled',
   'session.execution.failed', 'session.execution.interrupted']);
 const TOOL = /^[a-z][a-z0-9_.-]{0,47}$/i;
@@ -38,14 +38,14 @@ export function createWorkerProgress(ctx, { loadSessions, now = () => Date.now()
   };
   const publish = async entry => {
     if (entry.closed || !entry.childID) return;
-    const activity = entry.state === 'blocked' ? 'Blocked' : 'Active';
+    const activity = entry.state === 'blocked' ? 'Blocked' : entry.phase === 'reasoning' ? 'Reasoning' : entry.phase === 'responding' ? 'Responding' : 'Active';
     // OpenChamber v2.0.3 consumes `summary` on a running `subagent` call and
     // renders its closed-set tool row in the parent card.
-    const visibleTool = entry.tool ?? 'subagent';
+    const visibleTool = entry.tool ?? entry.phase ?? 'subagent';
     // Code Mode calls plugin tools through an outer `execute` call. Its
     // supported live surface is `toolCalls`, so mirror the same sanitized row
     // there; direct subagent calls use `summary` below.
-    const next = { sessionID: entry.childID, status: 'running', ...(entry.background ? { background: true } : {}), toolCalls: [{ tool: visibleTool, status: entry.state === 'blocked' ? 'error' : 'running' }], summary: [{ id: `worker:${entry.childID}`, tool: visibleTool, state: { status: entry.state === 'blocked' ? 'error' : 'running', title: activity } }], workerProgress: { state: entry.state, ...(entry.tool ? { tool: entry.tool } : {}), updatedAt: now() } };
+    const next = { sessionID: entry.childID, status: 'running', ...(entry.background ? { background: true } : {}), toolCalls: [{ tool: visibleTool, status: entry.state === 'blocked' ? 'error' : 'running' }], summary: [{ id: `worker:${entry.childID}`, tool: visibleTool, state: { status: entry.state === 'blocked' ? 'error' : 'running', title: activity } }], workerProgress: { state: entry.state, ...(entry.phase ? { phase: entry.phase } : {}), ...(entry.tool ? { tool: entry.tool } : {}), updatedAt: now() } };
     if (JSON.stringify(next) === entry.signature && !entry.pending) return;
     entry.pending = next;
     const delay = Math.max(0, minInterval - (now() - entry.publishedAt));
@@ -65,7 +65,13 @@ export function createWorkerProgress(ctx, { loadSessions, now = () => Date.now()
     const matches = await Promise.all([...entries].map(async entry => ({ entry, match: await related(entry.childID, current) })));
     for (const { entry, match } of matches) {
       if (!match || entry.closed) continue;
-      if (event.type === 'session.tool.input.started') { entry.state = 'working'; entry.tool = names.get(`${current}\0${data.id}`); }
+      entry.phase = undefined;
+      if (event.type === 'session.reasoning.started' || event.type === 'session.text.started') {
+        entry.state = 'working'; entry.tool = undefined;
+        entry.phase = event.type === 'session.reasoning.started' ? 'reasoning' : 'responding';
+      }
+      else if (event.type === 'session.reasoning.ended' || event.type === 'session.text.ended') { entry.state = 'working'; entry.tool = undefined; }
+      else if (event.type === 'session.tool.input.started') { entry.state = 'working'; entry.tool = names.get(`${current}\0${data.id}`); }
       else if (event.type === 'session.tool.success' || event.type === 'session.tool.failed') { if (entry.tool && current === entry.childID) entry.tool = undefined; entry.state = 'working'; }
       else if (event.type === 'permission.asked' || event.type === 'form.created') { entry.state = 'blocked'; entry.tool = undefined; }
       else if (event.type === 'permission.replied' || event.type === 'form.replied' || event.type === 'form.cancelled') entry.state = 'working';
