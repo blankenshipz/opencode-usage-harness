@@ -1,7 +1,7 @@
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRegistry, runtimeSessions, runtimeIntentSources, lineage, descendant, overlaps } from './dispatch-registry.mjs';
-import { intentSchema, getIntent, setIntent, bindIntent, renderIntent } from './task-intent.mjs';
+import { intentSchema, getIntent, setIntent, bindIntent, renderIntent, renderIntentReference } from './task-intent.mjs';
 import { packageRoot } from './paths.mjs';
 import { createWorkerProgress } from './worker-progress.mjs';
 // Eligibility is not a permission grant: the native executor still owns authorization and depth.
@@ -34,9 +34,10 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   agent: { type: 'string', minLength: 1 }, description: { type: 'string', minLength: 1 }, prompt: { type: 'string', minLength: 1 },
   requiredCapabilities: { type: 'array', uniqueItems: true, items: { type: 'string', enum: ['shell','edit','delegate'] } },
   writePaths: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1 } },
-  sessionID: { type: 'string', minLength: 1 }, model: { type: 'string' }, background: { type: 'boolean' },
+  sessionID: { type: 'string', minLength: 1 }, model: { type: 'string' }, background: { type: 'boolean' }, refreshIntent: { type: 'boolean' },
 }, required: ['taskId','workKey','operation','agent','description','prompt','requiredCapabilities'] };
-const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
+const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
+const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
 export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
@@ -128,22 +129,30 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           if (legacy) throw new Error(`task-dispatch: existing untracked worker ${legacy.id} may own workspace edits; finish or coordinate through its parent before starting another writer. Recovery: ${JSON.stringify(recovery(sessions,legacy.id,context.sessionID,state.records))}`);
         }
         if (!record) { record = { key,rootID,parentID:context.sessionID,taskId:input.taskId,workKey:input.workKey }; state.records.push(record); }
+        const fullIntent = !!intent && (!requested || record.deliveredIntentRevision !== intent.revision || !sameChecks(record.deliveredCheckIds,input.checkIds) || input.refreshIntent === true);
+        // Assignment binding starts at admission so an accepted child can record checkpoints while
+        // its native call is still running. Delivery acknowledgement is tracked separately below.
         Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now() });
-        await save(); return { key,childID:requested,intent };
+        await save(); return { key,childID:requested,intent,fullIntent };
       });
       if (admission.existing) return { content:`Existing child ${admission.existing} is still running. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
       const update = async patch => registry(workspace,async(state,save)=> { const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly'); Object.assign(r,patch,{updatedAt:Date.now()});await save(); });
       let observed = admission.childID;
       const visible = workerProgress.attach(context.progress ?? (async () => {}));
       try {
-        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:(admission.intent ? `${renderIntent(admission.intent,input.checkIds)}\n\nWorker assignment:\n${input.prompt}` : input.prompt),...(admission.childID?{sessionID:admission.childID}:{}),...(input.model?{model:input.model}:{}),background:input.background??false }, {
+        const handoff = !admission.intent ? input.prompt : admission.fullIntent
+          ? `${renderIntent(admission.intent,input.checkIds)}\n\nWorker assignment:\n${input.prompt}`
+          : `${renderIntentReference(admission.intent,input.checkIds)}\n\nNext action:\n${input.prompt}`;
+        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:handoff,...(admission.childID?{sessionID:admission.childID}:{}),...(input.model?{model:input.model}:{}),background:input.background??false }, {
           ...context, progress: async progress => {
             if(progress.sessionID) { observed=progress.sessionID;await update({childID:observed,state:'running'}); }
             return visible.native(progress);
           },
         });
         observed = result?.metadata?.sessionID ?? result?.output?.sessionID ?? observed;
-        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',inFlight:null});
+        // A native return is the first durable evidence that it accepted this delivery. Until then,
+        // retries deliberately resend the full intent rather than treating a progress event as an acknowledgement.
+        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null});
         return result;
       } catch(error) {
         await update({childID:observed,state:observed?'paused':'not_started',inFlight:null});

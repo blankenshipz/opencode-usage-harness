@@ -2,6 +2,11 @@
 
 ## 0.2.0 — unreleased
 
+- Persist sanitized worker progress with an opt-in OpenChamber 2.0.3 reconnect adapter.
+- Compact acknowledged same-child continuations; preserve full intent for new/revised/refreshed assignments.
+- Guard repeated deterministic patch failures and clarify path/context recovery.
+- Require explicit journey/evidence/owner planning before broad parallel implementation.
+
 - Concise progress-update guidance and observed reasoning/responding phases on foreground worker cards.
 
 - Foreground worker activity on parent OpenChamber tool cards without extra model calls.

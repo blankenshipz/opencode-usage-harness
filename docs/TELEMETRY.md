@@ -58,3 +58,55 @@ produce prose until its foreground call returns. Workers' prose remains in their
 own sessions. The parent card also shows observed reasoning/responding phases
 from start/end events; no reasoning content or text deltas are forwarded. There
 is no artificial heartbeat, polling loop, or additional inference for narration.
+
+## Reconnecting to a running worker
+
+The task-outcomes plugin now saves sanitized progress snapshots under
+`HARNESS_STATE_DIR/progress-snapshots`. Each snapshot binds an exact parent session,
+message, and tool call to its child, including reused older children. It retains
+observed activity, reasoning/responding phase, blocked state, and observation time;
+it never stores raw tool input/output, assistant prose, or reasoning content.
+Terminal events close snapshots. A restored snapshot is **last observed**, not a
+heartbeat or proof that the worker is still alive. Checkpoints and the next action
+remain in shared task evidence and compact continuation assignments, not inferred
+from a tool label.
+
+OpenChamber 2.0.3 needs the optional adapter to restore those snapshots when loading
+messages. Install it against your existing authenticated OpenChamber instance:
+
+```sh
+python3 integrations/openchamber/install-progress.py \
+  --web-root /path/to/node_modules/@openchamber/web \
+  --snapshot-dir "$HARNESS_STATE_DIR/progress-snapshots"
+```
+
+This backs up the proxy file and adds an authorized message-response overlay. It
+does not change authentication, listen addresses, providers, or model requests.
+Restart only the OpenChamber web process to load the adapter; preserve the attached
+OpenCode service. Other OpenChamber versions fail the installer compatibility check.
+Restore the printed proxy backup to remove the adapter. Reapply after an upstream
+OpenChamber update only after validating compatibility. The adapter imports this
+harness checkout, so keep it in place until uninstalling/reapplying the adapter.
+Existing foreground calls can populate snapshots on their next progress event;
+a call with no observed event has no reconstructed status. Corrupt/missing snapshots
+leave ordinary message rendering unchanged. No periodic model calls are added.
+
+## Handoffs and edit recovery
+
+A new child, changed intent revision/check assignment, or `refreshIntent: true`
+receives full intent. An acknowledged same-child continuation receives a compact
+reference plus the parent's next action. After context loss, workers must read
+`task_intent`; explicit refresh is available when needed. Failed delivery is not
+acknowledged. Assignment authority remains revision checked throughout execution.
+
+The edit-recovery wrapper blocks identical deterministic patch failures within a
+session. Changed patch text or changed target metadata permits a new native attempt;
+malformed patch syntax requires corrected text. Permission/network/timeouts remain
+native errors, not cached denials. The bounded memory-only cache stores hashes and
+file metadata, not raw patch bodies. This is an efficiency aid, not authorization.
+Agent guidance also requires path discovery and refreshed context after mismatches.
+
+Broad fan-out uses a user-facing acceptance table linked to existing intent checks,
+with journey, components, owner, evidence, and prerequisites. Scope changes identify
+affected rows/workers and preserve valid earlier results. This planning behavior is
+instruction guided; it is not a new permission or approval gate.

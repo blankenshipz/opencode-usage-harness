@@ -62,8 +62,27 @@ test('same work resumes child after transient failure and preserves selected rol
  return {content:'recovered',metadata:{sessionID:id,status:'completed'},output:{sessionID:id,status:'completed',output:'recovered'}};
  });
  await assert.rejects(h.call(base),/quota telemetry unavailable/);
+ await h.registry('/project',async state=>{assert.equal(state.records[0].intentRevision,1);assert.equal(state.records[0].deliveredIntentRevision,undefined);});
  const result=await h.call({...base,model:'openai/gpt-6-sol#medium'});assert.equal(result.content,'recovered');assert.equal(result.output,undefined);assert.equal(h.calls[1].sessionID,'ses_paused');assert.equal(h.calls[1].model,'openai/gpt-6-sol#medium');
+ assert.match(h.calls[0].prompt,/Shared user intent/);assert.match(h.calls[1].prompt,/Shared user intent/);assert.equal(h.calls[1].prompt.includes('compact continuation'),false);
  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);assert.equal(status.owners.length,1);assert.equal(status.owners[0].state,'completed');
+});
+test('same child uses compact intent reference only after accepted matching delivery, and refresh resends context',async t=>{
+ const h=await harness(t);const first=await h.call({...base,background:true});const id=first.metadata.sessionID;
+ await h.call({...base,background:true,sessionID:id});
+ assert.match(h.calls[1].prompt,/compact continuation/);assert.match(h.calls[1].prompt,/"taskId":"release"/);assert.match(h.calls[1].prompt,/Next action/);assert.equal(h.calls[1].prompt.includes('Working release'),false);
+ await h.call({...base,background:true,sessionID:id,refreshIntent:true});
+ assert.match(h.calls[2].prompt,/Shared user intent/);assert.match(h.calls[2].prompt,/Working release/);assert.equal(h.calls[2].prompt.includes('compact continuation'),false);
+});
+test('child can record an assigned checkpoint before its native call returns',async t=>{
+ let h;h=await harness(t,async(input,context,sessions)=>{
+  const id=input.sessionID??'ses_checkpoint';if(!sessions.some(s=>s.id===id))sessions.push({id,parentID:'root',agent:'builder',directory:'/project',active:true});
+  await context.progress({sessionID:id,status:'running'});
+  await h.runtime.outcome({taskId:'release',intentRevision:1,scope:'checkpoint',status:'completed',results:[{id:'backend',status:'passed',mode:'local',evidence:'Checkpoint completed before return'}]},{sessionID:id},async()=> 'recorded');
+  return {content:'done',metadata:{sessionID:id,status:'completed'},output:{sessionID:id,status:'completed'}};
+ });
+ await h.call(base);const current=JSON.parse((await h.call({action:'get',taskId:'release'},'task_intent')).content);
+ assert.equal(current.evidence.checks.backend.sessionID,'ses_checkpoint');
 });
 test('background duplicate is retained, explicit sessionID steers same child',async t=>{
  const h=await harness(t);const first=await h.call({...base,background:true});const id=first.metadata.sessionID;
@@ -156,6 +175,13 @@ test('root correction parks old child and explicit same-child continuation rebin
  await assert.rejects(h.call({...base,intentRevision:2}),/explicitly resume/);
  await h.call({...base,intentRevision:2,sessionID:id,background:true});
  await h.hooks.get('model.request')({sessionID:id});assert.equal(h.calls[1].sessionID,id);assert.match(h.calls[1].prompt,/Physical phone/);
+});
+test('changed checks resend full intent to the same child',async t=>{
+ const h=await harness(t);const id=(await h.call({...base,background:true})).metadata.sessionID;
+ await h.call({...base,background:true,sessionID:id,checkIds:['backend']});assert.match(h.calls[1].prompt,/compact continuation/);
+ await h.call({action:'set',taskId:'release',expectedRevision:1,intent:{...intent,checks:[...intent.checks,{id:'review',description:'Review the diff',mode:'synthetic'}],sourceMessageIDs:['msg_correction']}},'task_intent');
+ await h.call({...base,intentRevision:2,checkIds:['review'],background:true,sessionID:id});
+ assert.match(h.calls[2].prompt,/Shared user intent/);assert.match(h.calls[2].prompt,/"id":"review"/);assert.equal(h.calls[2].prompt.includes('compact continuation'),false);
 });
 test('source attribution rejects foreign or outdated user IDs; status exposes shared evidence',async t=>{
  const h=await harness(t);

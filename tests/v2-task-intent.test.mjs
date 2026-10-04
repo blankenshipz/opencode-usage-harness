@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { bindIntent, getIntent, intentSchema, renderIntent, setIntent } from '../plugins/v2/task-intent.mjs';
+import { bindIntent, getIntent, intentSchema, renderIntent, renderIntentReference, setIntent } from '../plugins/v2/task-intent.mjs';
 
 const makeIntent = () => ({ outcome: 'Ship the bounded change', target: 'plugins/v2/task-intent.mjs', nonGoals: [], authorizedEffects: ['edit the assigned files'], assumptions: ['dispatch registry provides serialization'], checks: [{ id: 'unit', description: 'Run the focused unit test', mode: 'local' }, { id: 'review', description: 'Review the resulting diff', mode: 'synthetic' }], sourceMessageIDs: ['msg_root_1'] });
 
@@ -66,4 +66,15 @@ test('renderIntent emits bounded data context with only relevant checks', () => 
   assert.deepEqual(context.relevantChecks.map(check => check.id), ['review']);
   assert.deepEqual(context.sourceIDs, ['msg_root_1']);
   assert.throws(() => renderIntent(entry, ['missing']), /unknown/);
+});
+
+test('renderIntentReference keeps a compact continuation bounded to durable identity', () => {
+  const entry = setIntent({}, { rootID: 'root', taskId: 'task', intent: makeIntent(), expectedRevision: 0, actorSessionID: 's' });
+  const rendered = renderIntentReference(entry, ['unit']);
+  assert.match(rendered, /compact continuation/);
+  assert.match(rendered, /re-read task_intent/);
+  assert.equal(rendered.includes('Ship the bounded change'), false);
+  const reference = JSON.parse(rendered.slice(rendered.indexOf('{'), rendered.indexOf('}.') + 1));
+  assert.deepEqual(reference, { taskId: 'task', revision: 1, checkIds: ['unit'] });
+  assert.throws(() => renderIntentReference(entry, ['missing']), /unknown/);
 });

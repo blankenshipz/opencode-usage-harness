@@ -131,3 +131,12 @@ export function renderIntent(entry, checkIds) {
   const context = { taskId: entry.taskId, revision: entry.revision, outcome: entry.intent.outcome, target: entry.intent.target, nonGoals: entry.intent.nonGoals, authorizedEffects: entry.intent.authorizedEffects, assumptions: entry.intent.assumptions, relevantChecks, sourceIDs: entry.intent.sourceMessageIDs };
   return `${PREFIX}: ${JSON.stringify(context)}`;
 }
+
+export function renderIntentReference(entry, checkIds) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('task-intent: invalid entry');
+  if (!Array.isArray(entry.intent?.checks)) throw new Error('task-intent: invalid entry intent');
+  if (!Array.isArray(checkIds) || checkIds.length < 1 || new Set(checkIds).size !== checkIds.length) throw new Error('task-intent: invalid checkIds');
+  const known = new Set(entry.intent.checks.map(check => check.id));
+  if (checkIds.some(checkID => typeof checkID !== 'string' || !known.has(checkID))) throw new Error('task-intent: unknown check id');
+  return `Shared user intent reference: ${JSON.stringify({ taskId: entry.taskId, revision: entry.revision, checkIds })}. This is a compact continuation. If context was compacted or lost, re-read task_intent for this task before proceeding.`;
+}
