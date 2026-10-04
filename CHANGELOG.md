@@ -2,6 +2,8 @@
 
 ## 0.2.0 — unreleased
 
+- Coalesce meaningful worker checkpoints into occasional UI-only OpenChamber notices; no extra inference or model-context injection. Includes an opt-in 2.0.3 UI patch; native mobile clients need a matching rebuild.
+
 - Persist sanitized worker progress with an opt-in OpenChamber 2.0.3 reconnect adapter.
 - Compact acknowledged same-child continuations; preserve full intent for new/revised/refreshed assignments.
 - Guard repeated deterministic patch failures and clarify path/context recovery.

@@ -1,0 +1,325 @@
+diff --git a/packages/ui/src/components/chat/MessageList.tsx b/packages/ui/src/components/chat/MessageList.tsx
+index 7a44dd3..713a082 100644
+--- a/packages/ui/src/components/chat/MessageList.tsx
++++ b/packages/ui/src/components/chat/MessageList.tsx
+@@ -4,7 +4,7 @@ import { LegendList, type LegendListRef } from '@legendapp/list/react';
+ import ChatMessage from './ChatMessage';
+ import { TimelineNotice } from './message/TimelineNotice';
+ import { useRunningSubagentRuns, withRunningSubagentRuns } from './lib/runningSubagentRuns';
+-import { isSkippedTimelineMessage, isSubagentRunEntry, isTimelineNoticeRole } from './lib/timelineRoles';
++import { isHarnessMilestoneMessage, isSkippedTimelineMessage, isSubagentRunEntry, isTimelineNoticeRole } from './lib/timelineRoles';
+ import { filterVisibleParts, isEmptyTextPart } from './message/partUtils';
+ import { areOptionalRenderRelevantMessagesEqual, areRelevantTurnGroupingContextsEqual, areRenderRelevantMessagesEqual } from './message/renderCompare';
+ import TurnItem from './components/TurnItem';
+@@ -199,7 +199,7 @@ const MessageRow = React.memo<MessageRowProps>(({
+     // (or as nothing); only user and assistant go through ChatMessage.
+     const role = message.info.role;
+     if (isSkippedTimelineMessage(message.info)) return null;
+-    if (isTimelineNoticeRole(role) || isSubagentRunEntry(message.info)) return <TimelineNotice message={message.info} />;
++    if (isTimelineNoticeRole(role) || isSubagentRunEntry(message.info) || isHarnessMilestoneMessage(message.info)) return <TimelineNotice message={message.info} />;
+ 
+     return (
+         <ChatMessage
+diff --git a/packages/ui/src/components/chat/lib/attachSyntheticContext.test.ts b/packages/ui/src/components/chat/lib/attachSyntheticContext.test.ts
+index c24473a..36d0826 100644
+--- a/packages/ui/src/components/chat/lib/attachSyntheticContext.test.ts
++++ b/packages/ui/src/components/chat/lib/attachSyntheticContext.test.ts
+@@ -77,6 +77,16 @@ const subagentReport = (id: string): ChatMessageEntry => entry({
+     metadata: { source: 'subagent', childID: 'ses_child', agent: 'general', state: 'completed' },
+ });
+ 
++const harnessMilestone = (id: string): ChatMessageEntry => entry({
++    id,
++    sessionID: SESSION,
++    role: 'synthetic',
++    time: { created: 1 },
++    text: 'Finished the focused test pass',
++    description: 'Worker-reported update',
++    metadata: { source: 'harness-milestone', workerID: 'ses_worker', selfReported: true },
++});
++
+ describe('attachSyntheticContext', () => {
+     test('attaches the context run to the user message it was sent with', () => {
+         const user = userMessage('u1', 'fix this');
+@@ -128,6 +138,20 @@ describe('attachSyntheticContext', () => {
+         expect(result[1]).toBe(report);
+     });
+ 
++    test('keeps a harness milestone as its own display-only entry', () => {
++        const milestone = harnessMilestone('msg_milestone');
++        const result = attachSyntheticContext([
++            userMessage('u1', 'hello'),
++            contextMessage('s1'),
++            milestone,
++            roleMessage('a1', 'assistant'),
++        ]);
++
++        expect(result.map((message) => message.info.id)).toEqual(['u1', 'msg_milestone', 'a1']);
++        expect(result[1]).toBe(milestone);
++        expect(result.filter((message) => message.info.role === 'assistant')).toHaveLength(1);
++    });
++
+     test('returns the same array when there is nothing to fold', () => {
+         const messages = [userMessage('u1', 'hello'), roleMessage('a1', 'assistant')];
+         expect(attachSyntheticContext(messages)).toBe(messages);
+diff --git a/packages/ui/src/components/chat/lib/attachSyntheticContext.ts b/packages/ui/src/components/chat/lib/attachSyntheticContext.ts
+index 2a5de03..59c0ad1 100644
+--- a/packages/ui/src/components/chat/lib/attachSyntheticContext.ts
++++ b/packages/ui/src/components/chat/lib/attachSyntheticContext.ts
+@@ -19,7 +19,7 @@
+ import type { Part, TextPart } from '@/lib/opencode/model';
+ import { readContextPart } from '@/lib/messages/contextParts';
+ 
+-import { isSkippedTimelineRole, isSubagentRunEntry } from './timelineRoles';
++import { isHarnessMilestoneMessage, isSkippedTimelineRole, isSubagentRunEntry } from './timelineRoles';
+ import type { ChatMessageEntry } from './turns/types';
+ 
+ const contextPartFromSyntheticMessage = (message: ChatMessageEntry): TextPart => {
+@@ -78,6 +78,12 @@ export const attachSyntheticContext = (messages: ChatMessageEntry[]): ChatMessag
+             continue;
+         }
+ 
++        if (isHarnessMilestoneMessage(message.info)) {
++            pendingContext = [];
++            result.push(message);
++            continue;
++        }
++
+         if (role === 'synthetic') {
+             if (readContextPart({ type: 'text', metadata: message.info.metadata })) {
+                 let part = contextPartBySyntheticEntry.get(message);
+diff --git a/packages/ui/src/components/chat/lib/timelineRoles.ts b/packages/ui/src/components/chat/lib/timelineRoles.ts
+index 76ca3b3..302ef3a 100644
+--- a/packages/ui/src/components/chat/lib/timelineRoles.ts
++++ b/packages/ui/src/components/chat/lib/timelineRoles.ts
+@@ -36,6 +36,13 @@ export const isSkippedTimelineRole = (role: Message['role']): boolean => SKIPPED
+  */
+ export const isSubagentRunEntry = (message: Message): boolean => readSubagentRun(message) !== undefined;
+ 
++/** A display-only progress update emitted by the local usage harness. */
++export const isHarnessMilestoneMessage = (message: Message): boolean =>
++    message.role === 'synthetic'
++    && message.metadata?.source === 'harness-milestone'
++    && typeof message.metadata.workerID === 'string'
++    && message.metadata.selfReported === true;
++
+ /** Whether the timeline renders nothing for this message. */
+ export const isSkippedTimelineMessage = (message: Message): boolean =>
+-    isSkippedTimelineRole(message.role) && !isSubagentRunEntry(message);
++    isSkippedTimelineRole(message.role) && !isSubagentRunEntry(message) && !isHarnessMilestoneMessage(message);
+diff --git a/packages/ui/src/components/chat/message/TimelineNotice.tsx b/packages/ui/src/components/chat/message/TimelineNotice.tsx
+index c71bab6..b3d8f87 100644
+--- a/packages/ui/src/components/chat/message/TimelineNotice.tsx
++++ b/packages/ui/src/components/chat/message/TimelineNotice.tsx
+@@ -25,6 +25,7 @@ import { useSession } from '@/sync/sync-context';
+ import { useI18n } from '@/lib/i18n';
+ import type { Message, ToolPart as ToolPartType } from '@/lib/opencode/model';
+ import { cn } from '@/lib/utils';
++import { isHarnessMilestoneMessage } from '../lib/timelineRoles';
+ 
+ /** The shared frame every notice row sits in, so they line up with messages. */
+ const NoticeRow: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+@@ -242,6 +243,19 @@ const SubagentNotice: React.FC<{ message: SyntheticMessage }> = ({ message }) =>
+     return run ? <SubagentRunNotice message={message} run={run} /> : null;
+ };
+ 
++/** A harness milestone is an informational row, never a model or subagent result. */
++const HarnessMilestoneNotice: React.FC<{ message: SyntheticMessage }> = ({ message }) => (
++    <NoticeRow>
++        <div className="flex items-start gap-1.5 py-1.5 pl-px typography-meta" style={{ color: 'var(--tools-title)' }}>
++            <Icon name="information" className="mt-0.5 h-3.5 w-3.5 shrink-0" style={{ color: 'var(--tools-icon)' }} />
++            <div className="min-w-0 break-words">
++                <span className="font-medium">{message.description}</span>
++                <span className="ml-1.5">{message.text}</span>
++            </div>
++        </div>
++    </NoticeRow>
++);
++
+ /**
+  * The timeline row for a message, or `null` when the caller should render the
+  * message itself.
+@@ -249,7 +263,7 @@ const SubagentNotice: React.FC<{ message: SyntheticMessage }> = ({ message }) =>
+ export const TimelineNotice: React.FC<{ message: Message }> = ({ message }) => {
+     switch (message.role) {
+         case 'synthetic':
+-            return <SubagentNotice message={message} />;
++            return isHarnessMilestoneMessage(message) ? <HarnessMilestoneNotice message={message} /> : <SubagentNotice message={message} />;
+         case 'compaction':
+             return <CompactionNotice message={message} />;
+         case 'shell':
+diff --git a/packages/ui/src/sync/event-pipeline.test.ts b/packages/ui/src/sync/event-pipeline.test.ts
+index 77ef11d..3aff306 100644
+--- a/packages/ui/src/sync/event-pipeline.test.ts
++++ b/packages/ui/src/sync/event-pipeline.test.ts
+@@ -33,7 +33,25 @@ function statusEvent(type: "busy" | "retry"): OpenCodeEvent {
+ }
+ 
+ /** A raw stream payload: wire events, or OpenChamber's own bridge events. */
+-type StreamPayload = OpenCodeEvent | { type: string; properties: Record<string, string> }
++type HarnessMilestonePayload = {
++  id: string
++  created: number
++  location: { directory: string }
++  type: "harness.milestone"
++  data: {
++    sessionID: string
++    message: {
++      id: string
++      type: "synthetic"
++      metadata: { source: "harness-milestone"; workerID: string; selfReported: true; detail: { pass: number } }
++      text: string
++      description: string
++      time: { created: number }
++    }
++  }
++}
++
++type StreamPayload = OpenCodeEvent | HarnessMilestonePayload | { directory: string; payload: HarnessMilestonePayload } | { type: string; properties: Record<string, string> }
+ 
+ /** `keepalives` counts SSE comments sent before the events. They are activity without an event. */
+ function createSdk(events: StreamPayload[], streamFinished: () => void, keepalives = 0): OpenCodeClient {
+@@ -174,6 +192,43 @@ describe("createEventPipeline", () => {
+     expect(events[1]).toEqual({ type: "openchamber.permission-auto-accept", properties: { sessions: { ses_1: true }, modes: { ses_1: "safety" }, revision: 3 } })
+   })
+ 
++  test("adapts a harness milestone into a display-only synthetic message", async () => {
++    const { directory, events } = await collect([{
++      directory: "/repo",
++      payload: {
++        ...base,
++        type: "harness.milestone",
++        data: {
++          sessionID: "ses_1",
++          message: {
++            id: "msg_milestone",
++            type: "synthetic",
++            metadata: { source: "harness-milestone", workerID: "ses_worker", selfReported: true, detail: { pass: 1 } },
++            text: "Finished the focused test pass",
++            description: "Worker-reported update",
++            time: { created: 1001 },
++          },
++        },
++      },
++    }], 1)
++
++    expect(directory).toBe("/repo")
++    expect(events).toEqual([{
++      type: "message.updated",
++      properties: {
++        info: {
++          id: "msg_milestone",
++          sessionID: "ses_1",
++          role: "synthetic",
++          metadata: { source: "harness-milestone", workerID: "ses_worker", selfReported: true, detail: { pass: 1 } },
++          text: "Finished the focused test pass",
++          description: "Worker-reported update",
++          time: { created: 1001 },
++        },
++      },
++    }])
++  })
++
+   test("ignores payloads that are neither wire events nor bridge events", async () => {
+     const { events } = await collect([{ type: "something.else", properties: {} }, textEnded("x")], 1)
+     expect(events.map(describeEvent)).toEqual(["updated:x"])
+diff --git a/packages/ui/src/sync/event-pipeline.ts b/packages/ui/src/sync/event-pipeline.ts
+index 9e58da9..3354bce 100644
+--- a/packages/ui/src/sync/event-pipeline.ts
++++ b/packages/ui/src/sync/event-pipeline.ts
+@@ -18,7 +18,7 @@ import type { OpenCodeClient, OpenCodeEvent } from "@opencode/client"
+ import { z } from "zod"
+ import { opencodeClient } from "@/lib/opencode/client"
+ import { GLOBAL_EVENT_DIRECTORY, routeWireEvent, syncEventSessionID, type SyncEvent } from "@/lib/opencode/events"
+-import type { Metadata } from "@/lib/opencode/model"
++import type { JsonValue, Metadata } from "@/lib/opencode/model"
+ import { getRuntimeUrlResolver } from "@/lib/runtime-url"
+ import { clearRuntimeUrlAuthToken, refreshRuntimeUrlAuthToken } from "@/lib/runtime-auth"
+ import { type RelayTunnelWebSocket } from "@/lib/relay/tunnel-client"
+@@ -28,6 +28,10 @@ import { spaceCreationStepSchema } from "@/lib/spaces/spaces-api"
+ import { syncDebug } from "./debug"
+ import { countSyncPerformance } from "./performance-diagnostics"
+ 
++const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
++  z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(jsonValueSchema), z.record(z.string(), jsonValueSchema)]),
++)
++
+ // Paces a sustained event stream only: the first event after a quiet spell is
+ // flushed at once, so a lone permission or status event is not delayed. Every
+ // flush publishes the directory store and re-renders the streaming message,
+@@ -148,6 +152,30 @@ const openchamberNotificationSchema = z.object({
+     .partial(),
+ })
+ 
++const harnessMilestoneSchema = z.object({
++  type: z.literal("harness.milestone"),
++  data: z.object({
++    sessionID: z.string().min(1),
++    message: z.object({
++      id: z.string().min(1),
++      type: z.literal("synthetic"),
++      metadata: z.object({
++        source: z.literal("harness-milestone"),
++        workerID: z.string().min(1),
++        selfReported: z.literal(true),
++      }).catchall(jsonValueSchema),
++      text: z.string(),
++      description: z.string().min(1),
++      time: z.object({ created: z.number().finite() }),
++    }),
++  }),
++})
++
++const harnessMilestoneFrameSchema = z.object({
++  directory: z.string().min(1).optional(),
++  payload: harnessMilestoneSchema,
++})
++
+ // The host's announcement of an isolated space's event connection. It is not an event of any
+ // session, so it never enters a directory queue; the pipeline hands it to its owner.
+ const openchamberSpaceStreamSchema = z.object({
+@@ -227,12 +255,44 @@ function translateOpenchamberStatus(payload: unknown): SyncEvent | null {
+   return { type: "session.status", properties: { sessionID: id, status: { type: status } } }
+ }
+ 
++function translatedHarnessMilestone(message: z.infer<typeof harnessMilestoneSchema>["data"]["message"], sessionID: string): SyncEvent {
++  return {
++    type: "message.updated",
++    properties: {
++      info: {
++        id: message.id,
++        sessionID,
++        role: "synthetic",
++        metadata: message.metadata,
++        text: message.text,
++        description: message.description,
++        time: message.time,
++      },
++    },
++  }
++}
++
++function translateHarnessMilestone(payload: unknown): { directory?: string; event: SyncEvent } | null {
++  const direct = harnessMilestoneSchema.safeParse(payload)
++  if (direct.success) {
++    return { event: translatedHarnessMilestone(direct.data.data.message, direct.data.data.sessionID) }
++  }
++  const framed = harnessMilestoneFrameSchema.safeParse(payload)
++  if (!framed.success) return null
++  return {
++    directory: framed.data.directory,
++    event: translatedHarnessMilestone(framed.data.payload.data.message, framed.data.payload.data.sessionID),
++  }
++}
++
+ /**
+  * Turns one raw stream payload into routed sync events. `frameDirectory` is
+  * the directory the server bridge attached, used when the event itself does
+  * not name a location.
+  */
+ function translatePayload(payload: unknown, frameDirectory: string | undefined): Array<{ directory: string; event: SyncEvent }> {
++  const milestone = translateHarnessMilestone(payload)
++  if (milestone) return [{ directory: milestone.directory ?? frameDirectory ?? GLOBAL_EVENT_DIRECTORY, event: milestone.event }]
+   const bridged = translateOpenchamberStatus(payload) ?? translateOpenchamberArchived(payload) ?? translateOpenchamberNative(payload)
+   if (bridged) return [{ directory: frameDirectory ?? GLOBAL_EVENT_DIRECTORY, event: bridged }]
+   if (!wireEventSchema.safeParse(payload).success) return []

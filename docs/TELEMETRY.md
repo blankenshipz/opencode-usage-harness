@@ -52,7 +52,8 @@ Already-running dispatch calls retain their existing code until they settle;
 the new tracker attaches to subsequent calls after plugin reload.
 
 Agent instructions request concise milestones at natural boundaries, aiming for
-45–60 seconds during sustained work, and a heads-up before long blocking calls.
+roughly five minutes when meaningful progress occurs, with blockers/questions sooner,
+and a heads-up before long blocking calls.
 This is a communication target, not a timer guarantee: a waiting parent cannot
 produce prose until its foreground call returns. Workers' prose remains in their
 own sessions. The parent card also shows observed reasoning/responding phases
@@ -110,3 +111,44 @@ Broad fan-out uses a user-facing acceptance table linked to existing intent chec
 with journey, components, owner, evidence, and prerequisites. Scope changes identify
 affected rows/workers and preserve valid earlier results. This planning behavior is
 instruction guided; it is not a new permission or approval gate.
+
+## Occasional worker milestone notices
+
+The task-outcomes plugin saves a separate, bounded milestone store. Valid child
+checkpoints become compact **Worker-reported update** notices in the root chat.
+Routine changes are combined within a five-minute window; blockers and requests
+for input can surface sooner, with a one-minute limit against bursts. Identical
+reports are suppressed. The first meaningful checkpoint can appear immediately.
+No checkpoint means no invented heartbeat. These are self-reported checks, not
+independent verification or proof that the overall task is complete.
+
+Only check identifiers/statuses and a closed set of role/blocker labels are
+included. Raw evidence, prompts, tool output and reasoning are excluded. Notices
+are delivered through the authenticated OpenChamber message overlay and SSE stream,
+never inserted into OpenCode history, the model context, or a worker inbox. Reading
+the store and delivering notices uses no additional model inference. Reconnects
+restore recent notices; native pagination cursors remain unchanged.
+
+The server adapter and matching UI patch are both required for timeline display.
+For an existing v1 server adapter, use the installation command above with
+`--upgrade`. Unknown adapter versions are rejected. Back up the UI assets before
+installing a build from the exact OpenChamber 2.0.3 source tag:
+
+```sh
+git apply /path/to/opencode-usage-harness/integrations/openchamber/milestone-ui.patch
+bun install --frozen-lockfile --ignore-scripts
+bun run --cwd packages/sdk build
+bun run --cwd packages/ui type-check
+bun run --cwd packages/web build
+```
+
+Use the upstream-supported build toolchain and deploy `packages/web/dist` to the
+web package's `dist`, preserving old hashed assets for already-open browser tabs.
+Restart the web service and refresh the browser. Rollback requires restoring both
+proxy and UI backups. An upstream update requires compatibility review and a new
+build; this is an opt-in integration, not an automatic upstream patch.
+
+Hosted mobile browsers use the same web UI. An already-installed native iOS app
+bundles its own UI and requires a matching mobile build/update to show these new
+notices. Updating server assets alone does not update that app. Existing worker
+activity cards remain available independently of the new timeline notices.
