@@ -152,3 +152,46 @@ Hosted mobile browsers use the same web UI. An already-installed native iOS app
 bundles its own UI and requires a matching mobile build/update to show these new
 notices. Updating server assets alone does not update that app. Existing worker
 activity cards remain available independently of the new timeline notices.
+
+## Dependency and recovery reporting
+
+`task_outcome` optionally accepts `progressState`: `working`, `waiting_dependency`,
+or `needs_user_action`. Working and waiting require `status: in_progress`; waiting
+also requires 1–8 distinct `dependencySessionIDs` excluding the recording session.
+These are self-reported dependency references, not independently verified liveness.
+User action requires `status: blocked` with the existing blocker evidence/next action.
+Completion still requires the original check receipts; no status label bypasses it.
+Legacy callers remain compatible. Waiting updates and implementation-gap reports
+use the routine five-minute digest; explicit user action can surface sooner.
+
+Journal guidance batches updates at meaningful check, dependency, scope and handoff
+changes. One canonical blocker entry avoids repeatedly rewriting several documents.
+After a patch mismatch, refresh the exact section before a smaller corrected patch.
+This is guidance, not a new write restriction or a ban on requested documentation.
+
+### Scoped denial receipts
+
+Dispatch records explicit native subagent permission denials and the observed
+`misalignment_policy_violation` provider failure under the existing root/task/work
+identity. The receipt persists only category, fingerprints and observation time.
+`task_dispatch_status` exposes a safe category and recovery action. Ordinary child
+prose, test failures, network errors and unavailable quota telemetry are not denial
+signals. Receipts start with newly observed failures; historical chats are not
+reclassified automatically.
+
+An unchanged denied assignment is not sent again merely because its prompt, model
+or time changed. A distinct authorized assignment remains eligible. A retry may
+supply `recovery` with `kind` (`scope_changed`, `inputs_changed` or
+`authorization_changed`), `scope`, `inputs` (a short list), `authorization`,
+`explanation`, and a non-secret `reference` to the new evidence. A repeated
+recovery fingerprint is suppressed; changing only its explanation is insufficient.
+The evidence is a caller declaration, not independently verified approval. It
+permits another native evaluation and never overrides native permissions, provider
+policy, ownership, quota admission or financial controls. Do not put secrets in
+these fields: the new receipt hashes them, but ordinary tool-call history still
+contains the caller's arguments. Never rename the work key to retry a denied effect.
+
+A denial of one file/batch is not proof that every edit is forbidden. Capture the
+actual action/resources and available native identifiers once; leave unavailable
+rule/issuer details explicitly unknown. Continue unrelated authorized work through
+normal checks. A known denial must not be evaded using another tool or worker.

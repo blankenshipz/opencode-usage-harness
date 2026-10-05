@@ -4,6 +4,7 @@ import { createRegistry, runtimeSessions, runtimeIntentSources, lineage, descend
 import { intentSchema, getIntent, setIntent, bindIntent, renderIntent, renderIntentReference } from './task-intent.mjs';
 import { packageRoot } from './paths.mjs';
 import { createWorkerProgress } from './worker-progress.mjs';
+import { admissionDenial, denialAdvice, receipt, suppression } from './denial-recovery.mjs';
 // Eligibility is not a permission grant: the native executor still owns authorization and depth.
 export function hasCapability(agent, capability) {
   const rules = agent.permissions ?? [], action = capability === 'delegate' ? 'subagent' : capability;
@@ -35,6 +36,11 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   requiredCapabilities: { type: 'array', uniqueItems: true, items: { type: 'string', enum: ['shell','edit','delegate'] } },
   writePaths: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1 } },
   sessionID: { type: 'string', minLength: 1 }, model: { type: 'string' }, background: { type: 'boolean' }, refreshIntent: { type: 'boolean' },
+  recovery: { type: 'object', additionalProperties: false, properties: {
+    kind: { type: 'string', enum: ['scope_changed','inputs_changed','authorization_changed'] }, scope: { type: 'string', minLength: 1, maxLength: 160 },
+    inputs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 160 } },
+    authorization: { type: 'string', minLength: 1, maxLength: 240 }, explanation: { type: 'string', minLength: 1, maxLength: 240 }, reference: { type: 'string', minLength: 1, maxLength: 240 },
+  }, required: ['kind','scope','inputs','authorization','explanation','reference'] },
 }, required: ['taskId','workKey','operation','agent','description','prompt','requiredCapabilities'] };
 const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
 const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
@@ -111,6 +117,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           }
         }
         if (record?.inFlight) throw new Error(`task-dispatch: admission already in flight for ${input.workKey}; inspect task_dispatch_status`);
+        const denied = suppression(record,input);
+        if (denied) throw new Error(`task-dispatch: admission remains denied (${denied.category}). ${denialAdvice(denied.category)} Inspect task_dispatch_status for the receipt.`);
         // Include pre-upgrade tasks and all descendants, even when a parent failed quota admission.
         const busy = sessions.filter(s => s.active && s.directory === workspace && s.id !== requested && s.id !== context.sessionID && !descendant(sessions,context.sessionID,s.id));
         if (input.agent === 'coordinator' && !requested) {
@@ -152,10 +160,16 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         observed = result?.metadata?.sessionID ?? result?.output?.sessionID ?? observed;
         // A native return is the first durable evidence that it accepted this delivery. Until then,
         // retries deliberately resend the full intent rather than treating a progress event as an acknowledgement.
-        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null});
+        const denied = admissionDenial(result);
+        if (denied) {
+          await update({childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null});
+          return {...result,content:`task-dispatch: native ${denied} recorded. ${denialAdvice(denied)}`,metadata:{...(result?.metadata??{}),denial:{category:denied}}};
+        }
+        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null});
         return result;
       } catch(error) {
-        await update({childID:observed,state:observed?'paused':'not_started',inFlight:null});
+        const denied = admissionDenial(error);
+        await update(denied ? {childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null} : {childID:observed,state:observed?'paused':'not_started',inFlight:null});
         // Preserve original permission/guard error; never retry, change provider, or replace the child here.
         throw error;
       } finally { visible.close(); }
@@ -180,7 +194,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
     })});
     editor.add({name:'task_dispatch_status',description:'Read durable child ownership and current active descendants without launching or resuming work. Use after errors and before replacement.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string'}}},execute:async(input,context)=>registry(workspace,async state=>{
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID);
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>({...r,key:undefined,inFlight:!!r.inFlight,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)}));
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>({...r,key:undefined,inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)}));
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return s.agent !== 'router' && !descendant(sessions,context.sessionID,s.id); }

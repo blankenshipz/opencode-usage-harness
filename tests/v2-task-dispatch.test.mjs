@@ -53,7 +53,42 @@ test('native and wrapper both reject incapable Git history routing before native
  }assert.equal(h.calls.length,0);
 });
 test('native permission errors propagate without retry',async t=>{
- const h=await harness(t,async()=>{throw new Error('native permission denied');});await assert.rejects(h.call(base),/native permission denied/);assert.equal(h.calls.length,1);
+ const h=await harness(t,async()=>{throw new Error('Subagent denied: builder SECRET-native-error');});await assert.rejects(h.call(base),/Subagent denied/);assert.equal(h.calls.length,1);
+ const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);assert.equal(status.owners[0].denial.category,'native_permission');assert.match(status.owners[0].denial.action,/Do not retry unchanged/);
+ await h.registry('/project',async state=>assert.equal(JSON.stringify(state).includes('SECRET-native-error'),false));
+});
+test('same denied work suppresses prompt and model changes until declared recovery, then native decides again',async t=>{
+ let attempts=0;const h=await harness(t,async()=>{
+  attempts++;if(attempts===1)throw new Error('Subagent denied: builder');
+  if(attempts===2)return {output:{error:{code:'misalignment_policy_violation',message:'Provider refusal'}}};
+  return {content:'accepted',metadata:{sessionID:'ses_recovered',status:'completed'},output:{sessionID:'ses_recovered',status:'completed'}};
+ });
+ await assert.rejects(h.call(base),/Subagent denied/);
+ await assert.rejects(h.call({...base,prompt:'totally different wording',model:'provider/other'}),/remains denied \(native_permission\)/);assert.equal(attempts,1);
+ const recovery={kind:'authorization_changed',scope:'subagent:builder',inputs:['agent:builder'],authorization:'A current native permission may now admit this request',explanation:'The owner updated the applicable admission rule',reference:'policy-change-42'};
+ const refused=await h.call({...base,recovery});assert.match(refused.content,/provider_refusal recorded/);assert.equal(refused.metadata.denial.category,'provider_refusal');assert.equal(attempts,2);const receipt=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);assert.equal(receipt.owners[0].denial.category,'provider_refusal');
+ await assert.rejects(h.call({...base,recovery,prompt:'again'}),/remains denied \(provider_refusal\)/);assert.equal(attempts,2);
+ await assert.rejects(h.call({...base,recovery:{...recovery,explanation:'Same referenced evidence, paraphrased explanation'}}),/remains denied \(provider_refusal\)/);assert.equal(attempts,2);
+ const providerRecovery={...recovery,kind:'authorization_changed',authorization:'The provider authorization was refreshed',reference:'provider-change-43'};
+ const accepted=await h.call({...base,recovery:providerRecovery});assert.equal(accepted.content,'accepted');assert.equal(attempts,3);
+});
+test('denial receipts survive reload and unrelated work remains eligible',async t=>{
+ const h=await harness(t,async(input)=>{if(input.description==='Fix backend')throw new Error('Subagent denied: builder');return {content:'other',metadata:{sessionID:'ses_other',status:'completed'},output:{sessionID:'ses_other',status:'completed'}};});
+ await assert.rejects(h.call(base),/Subagent denied/);
+ const recreated=new Map([['subagent',{...h.rawNative}]]);
+ await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
+ await assert.rejects(recreated.get('task_dispatch').execute({...base,prompt:'changed after reload'},{sessionID:'root',agent:'router',progress:async()=>{}}),/remains denied/);
+ const other=await h.call({...base,workKey:'unrelated',description:'Independent task',writePaths:['mobile']});assert.equal(other.content,'other');
+});
+test('only the anchored native failed-run policy code is a provider refusal',async t=>{
+ let calls=0;const h=await harness(t,async()=>{
+  calls++;if(calls===1) throw new Error('Subagent failed (sessionID: ses_policy): {"code":"misalignment_policy_violation"}');
+  return {content:'child quoted misalignment_policy_violation but is ordinary output',metadata:{sessionID:'ses_quote',status:'completed'},output:{sessionID:'ses_quote',status:'completed',output:'misalignment_policy_violation'}};
+ });
+ await assert.rejects(h.call(base),/misalignment_policy_violation/);
+ const recovery={kind:'scope_changed',scope:'narrower read-only scope',inputs:['path:src'],authorization:'Existing authorization remains applicable',explanation:'The requested work is now narrower',reference:'scope-change-1'};
+ await h.call({...base,recovery});assert.equal(calls,2);
+ const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);assert.equal(status.owners[0].denial,undefined);
 });
 test('same work resumes child after transient failure and preserves selected role/model',async t=>{
  const h=await harness(t,async(input,context,sessions,calls)=>{

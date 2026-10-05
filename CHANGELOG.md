@@ -2,6 +2,10 @@
 
 ## 0.2.0 — unreleased
 
+- Persist scoped dispatch-denial receipts and suppress unchanged retries; declared recovery remains subject to native permission and provider checks.
+
+- Distinguish working/dependency waits/user action in checkpoint reporting and batch journal maintenance around meaningful changes.
+
 - Coalesce meaningful worker checkpoints into occasional UI-only OpenChamber notices; no extra inference or model-context injection. Includes an opt-in 2.0.3 UI patch; native mobile clients need a matching rebuild.
 
 - Persist sanitized worker progress with an opt-in OpenChamber 2.0.3 reconnect adapter.

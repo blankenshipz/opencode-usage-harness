@@ -41,3 +41,12 @@ test('native form envelope and permission signals stay sanitized; deletion clear
  await finished;stop();assert.equal(records.length,2);assert.equal(records[0].sessionId,'ses_child');assert.equal(JSON.stringify(records).includes('SECRET'),false);
  await h.store.record(record());await h.store.remove('ses_root');assert.deepEqual(await h.store.list('ses_root'),[]);assert.deepEqual(await h.store.feed(0),[]);
 });
+
+test('dependencies and unfinished implementation are routine, user action is urgent',async t=>{
+ const h=await harness(t);await h.store.record(record());h.tick(60000);
+ const waiting={...record(),status:'in_progress',results:[],progressState:'waiting_dependency',dependencySessionIDs:['ses_dependency']};
+ assert.equal(summarizeCheckpoint(waiting,'builder').urgent,false);await h.store.record(waiting);assert.equal((await h.store.list('ses_root')).length,1);
+ h.tick(240000);const notes=await h.store.list('ses_root');assert.match(notes.at(-1).text,/waiting on assigned worker/);
+ const implementation={...record('blocked'),blocker:{kind:'implementation'}};assert.equal(summarizeCheckpoint(implementation,'builder').urgent,false);
+ assert.equal(summarizeCheckpoint({...implementation,progressState:'needs_user_action'},'builder').urgent,true);
+});

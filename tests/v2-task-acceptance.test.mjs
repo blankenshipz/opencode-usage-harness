@@ -124,3 +124,13 @@ test('task terminal outcomes retain the initial contract and reject blank eviden
   await assert.rejects(tool.execute({ taskId: 'blank', scope: 'checkpoint', status: 'blocked', blocker: { kind: 'environment', evidence: '   ', nextAction: 'retry later' } }, call()), /invalid blocker.evidence/);
   h.cleanup();
 });
+
+test('dependency waits stay in progress and require bounded non-self references', async () => {
+ const rows=[], h=await harness(memoryPlugin(rows)), tool=h.tools.get('task_outcome');
+ const waiting={taskId:'cp',scope:'checkpoint',status:'in_progress',progressState:'waiting_dependency',dependencySessionIDs:['ses_other']};
+ await tool.execute(waiting,call());assert.equal(rows.at(-1).progressState,'waiting_dependency');
+ for(const change of [{dependencySessionIDs:undefined},{dependencySessionIDs:['s1']},{dependencySessionIDs:['ses_other','ses_other']},{status:'completed'},{status:'blocked'}])await assert.rejects(tool.execute({...waiting,...change},call()),/task-outcomes:/);
+ await assert.rejects(tool.execute({...waiting,progressState:'needs_user_action'},call()),/progressState/);
+ await tool.execute({taskId:'cp',scope:'checkpoint',status:'blocked',progressState:'needs_user_action',blocker:{kind:'authorization',evidence:'Operation awaits approval',nextAction:'User must approve operation'}},call());
+ assert.equal(rows.at(-1).progressState,'needs_user_action');h.cleanup();
+});

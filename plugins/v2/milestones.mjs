@@ -11,14 +11,16 @@ const kinds=new Set(['authorization','tool_permission','environment','credential
 export function summarizeCheckpoint(record,actor) {
   if(record.scope!=='checkpoint'||!validID(record.sessionId))return null;
   const checks=(record.results??[]).filter(x=>['passed','failed','blocked'].includes(x.status)).map(x=>({id:label(x.id),status:x.status})).slice(0,12).sort((a,b)=>a.id.localeCompare(b.id));
-  if(!checks.length&&!['completed','blocked','failed'].includes(record.status))return null;
+  if(!checks.length&&!['completed','blocked','failed'].includes(record.status)&&record.progressState!=='waiting_dependency')return null;
   const role=roles.has(actor)?actor:'worker', blocker=kinds.has(record.blocker?.kind)?record.blocker.kind:null;
-  const urgent=record.status==='blocked'||record.status==='failed'||!!blocker;
+  const urgent=record.progressState==='needs_user_action'||record.status==='failed'||(record.status==='blocked'&&blocker!=='implementation');
   const status=['completed','blocked','failed','in_progress'].includes(record.status)?record.status:'in_progress';
+  const activity=record.progressState==='waiting_dependency'?'waiting on assigned worker':record.progressState==='needs_user_action'?'needs user action':record.status==='in_progress'?'working':null;
   const parts=checks.slice(0,4).map(x=>`${x.id}: ${x.status}`);
   if(checks.length>4)parts.push(`${checks.length-4} more checks reported`);
+  if(activity)parts.unshift(activity);
   if(blocker)parts.push(`blocker: ${blocker.replace('_',' ')}`);
-  return {workerID:record.sessionId,task:label(record.taskId),urgent,signature:digest([record.sessionId,record.taskId,status,checks,blocker,record.notificationKey??null,(record.results??[]).map(x=>x.artifact??null)]),text:`${role} — ${parts.join('; ')||`checkpoint ${status}`}.`};
+  return {workerID:record.sessionId,task:label(record.taskId),urgent,signature:digest([record.sessionId,record.taskId,status,record.progressState,record.dependencySessionIDs,checks,blocker,record.notificationKey??null,(record.results??[]).map(x=>x.artifact??null)]),text:`${role} — ${parts.join('; ')||`checkpoint ${status}`}.`};
 }
 export function createMilestoneStore({directory=statePath('milestones'),loadSessions=runtimeSessions,now=()=>Date.now(),interval=300000,urgentInterval=60000}={}) {
  const registry=createRegistry(directory);
@@ -85,7 +87,7 @@ export function installMilestoneSignals(ctx,store) {
   try {
    if(event.type==='session.deleted')await store.remove(event.data.sessionID);
    if(event.type==='permission.asked'||event.type==='form.created')await store.record({
-    scope:'checkpoint',sessionId:event.type==='form.created'?event.data.form?.sessionID:event.data.sessionID,taskId:'input-request',status:'blocked',notificationKey:event.id,
+    scope:'checkpoint',sessionId:event.type==='form.created'?event.data.form?.sessionID:event.data.sessionID,taskId:'input-request',status:'blocked',progressState:'needs_user_action',notificationKey:event.id,
     blocker:{kind:event.type==='permission.asked'?'tool_permission':'authorization'},results:[],
    });
   }catch{/* No event contents logged or reflected. */}
