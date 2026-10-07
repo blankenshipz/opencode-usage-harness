@@ -253,6 +253,7 @@ def wrappers(prefix: Path) -> None:
     bin_dir.mkdir(exist_ok=True)
     mapping = {
         "codex-quota": 'exec "$base/current/bin/codex-quota" "$@"',
+        "harness-check": 'exec "$base/current/bin/harness-check" "$@"',
         "harness-metrics": 'exec "$base/current/bin/harness-metrics" "$@"',
         # Python is used explicitly so a source checkout need not mark install.py
         # executable; this still executes the installed current/install.py.

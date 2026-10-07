@@ -195,3 +195,45 @@ A denial of one file/batch is not proof that every edit is forbidden. Capture th
 actual action/resources and available native identifiers once; leave unavailable
 rule/issuer details explicitly unknown. Continue unrelated authorized work through
 normal checks. A known denial must not be evaded using another tool or worker.
+
+## Release gates and durable diagnostics
+
+The agent guidance targets one concrete end-to-end journey, assigns infrastructure
+work to named blockers, and distinguishes component/package checks from deployed
+acceptance. It does not drop remaining user requirements or relax safety gates.
+Before release validation, finish required shipped documentation, coordinate package
+writers, then freeze an explicit input inventory and candidate digest. Write ongoing
+progress and gate receipts outside that inventory where the project's packaging
+contract permits. A changed artifact requires fresh affected evidence; a previous
+passing receipt must never be relabelled to match a new digest.
+
+For expensive local tests/builds, use the opt-in `harness-check` utility or an
+existing project runner with equivalent persistence:
+
+```sh
+harness-check --label unit-tests --revision SOURCE_OR_CANDIDATE_DIGEST -- python3 -m pytest tests
+```
+
+The command executes once. Its stdout/stderr are retained under
+`HARNESS_STATE_DIR/check-receipts` (default: `~/.local/state/opencode-usage-harness`)
+with a unique run directory and JSON receipt. Files are private, not automatically
+committed, uploaded, deleted, or inserted into model context. The receipt does not
+store argv or environment values. **Child output may contain secrets:** inspect
+bounded relevant excerpts locally and redact anything copied elsewhere. Do not put
+secrets into the label or revision. The revision is caller-supplied provenance,
+not an independently measured working-tree hash.
+
+This utility does not grant permissions or replace native shell approval. Never
+wrap a denied operation to evade its guard. It inherits the calling environment;
+use the existing clean launcher and financial admission for any inference workflow.
+It is intended for local tests/builds, not a new model-provider execution path.
+Retain the original failing receipt through repair and keep later receipts separate.
+Use an explicit retention decision for cleanup; there is no automatic deletion.
+
+The runner announces its receipt path before launching and writes an initial
+`running` record, then atomically replaces it on completion. SIGINT/SIGTERM are
+forwarded to the owned child process group on macOS/Linux. This is best-effort
+cancellation, not a process supervisor: a child that ignores signals can keep
+running, and killing the wrapper with SIGKILL or losing power can leave a stale
+`running` receipt. Inspect the actual process before assuming it is still active.
+Raw child return codes are retained separately from conventional shell signal exits.

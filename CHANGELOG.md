@@ -2,6 +2,9 @@
 
 ## 0.2.0 — unreleased
 
+- Add opt-in private check receipts and release-freeze guidance to preserve failure diagnostics and reduce validation churn.
+- Prioritize a concrete end-to-end acceptance journey when assigning supporting infrastructure.
+
 - Persist scoped dispatch-denial receipts and suppress unchanged retries; declared recovery remains subject to native permission and provider checks.
 
 - Distinguish working/dependency waits/user action in checkpoint reporting and batch journal maintenance around meaningful changes.
