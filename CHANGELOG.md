@@ -2,6 +2,9 @@
 
 ## 0.2.0 — unreleased
 
+- Preflight build/test disk capacity, expose check preparation and read-only receipt/session health tools, and preserve unknown ownership instead of assuming liveness.
+- Distinguish unmeasured outcome counters from zero and fresh/reused/unrun evidence; guide selective phase handoffs and cheap pre-freeze checks.
+
 - Add opt-in private check receipts and release-freeze guidance to preserve failure diagnostics and reduce validation churn.
 - Prioritize a concrete end-to-end acceptance journey when assigning supporting infrastructure.
 

@@ -13,8 +13,8 @@ async function harness(plugin) {
 const call = (sessionID = 's1') => ({ sessionID, messageID: 'm1', agent: 'builder' });
 const contract = { goal: 'prove the result', authorization: 'user authorized this task', checks: [{ id: 'network', description: 'reach controlled endpoint', mode: 'live' }, { id: 'unit', description: 'run unit test', mode: 'local' }] };
 const results = [{ id: 'network', status: 'passed', mode: 'live', evidence: 'HTTP 200 from controlled endpoint' }, { id: 'unit', status: 'passed', mode: 'local', evidence: 'node --test passed' }];
-function memoryPlugin(rows = [], store = new Map(), artifactStore = new Map(), append = async row => rows.push(row)) {
-  return createV2TaskOutcomes({ append, loadContract: async (sessionID, taskID) => store.get(`${sessionID}\0${taskID}`), saveContract: async (sessionID, taskID, value) => { const key = `${sessionID}\0${taskID}`; if (store.has(key)) return false; store.set(key, value); return true; }, loadArtifacts: async (sessionID, taskID) => ({ ...(artifactStore.get(`${sessionID}\0${taskID}`) ?? {}) }), mutateArtifacts: async (sessionID, taskID, mutation) => { const key = `${sessionID}\0${taskID}`, result = await mutation({ ...(artifactStore.get(key) ?? {}) }); if (result.artifacts) artifactStore.set(key, result.artifacts); return result.value; } });
+function memoryPlugin(rows = [], store = new Map(), artifactStore = new Map(), append = async row => rows.push(row), now) {
+  return createV2TaskOutcomes({ append, now, loadContract: async (sessionID, taskID) => store.get(`${sessionID}\0${taskID}`), saveContract: async (sessionID, taskID, value) => { const key = `${sessionID}\0${taskID}`; if (store.has(key)) return false; store.set(key, value); return true; }, loadArtifacts: async (sessionID, taskID) => ({ ...(artifactStore.get(`${sessionID}\0${taskID}`) ?? {}) }), mutateArtifacts: async (sessionID, taskID, mutation) => { const key = `${sessionID}\0${taskID}`, result = await mutation({ ...(artifactStore.get(key) ?? {}) }); if (result.artifacts) artifactStore.set(key, result.artifacts); return result.value; } });
 }
 async function start(tool, taskId = 't1', sessionID = 's1') { await tool.execute({ taskId, scope: 'task', status: 'in_progress', contract }, call(sessionID)); }
 
@@ -112,6 +112,30 @@ test('checkpoints remain distinct and blocked outcomes require useful evidence',
   await assert.rejects(tool.execute({ taskId: 'blocked', scope: 'checkpoint', status: 'blocked' }, call()), /require blocker/);
   await tool.execute({ taskId: 'blocked', scope: 'checkpoint', status: 'blocked', blocker: { kind: 'tool_permission', evidence: 'tool denied operation', nextAction: 'request permission' } }, call());
   assert.equal(rows.at(-1).blocker.kind, 'tool_permission'); h.cleanup();
+});
+
+test('outcomes preserve unknown measurements and explicit zeroes', async () => {
+  const rows = [], times = [1000, 1000], h = await harness(memoryPlugin(rows, new Map(), new Map(), async row => rows.push(row), () => times.shift())); const tool = h.tools.get('task_outcome');
+  await tool.execute({ taskId: 'measurements', scope: 'checkpoint', status: 'completed' }, call());
+  assert.equal(rows[0].scope, 'checkpoint'); assert.equal(rows[0].elapsedScope, 'process_observation'); assert.equal(rows[0].elapsedMs, undefined); assert.equal(rows[0].repairs, undefined); assert.equal(rows[0].userCorrections, undefined);
+  await tool.execute({ taskId: 'measurements', scope: 'checkpoint', status: 'completed', repairs: 0, userCorrections: 0 }, call());
+  assert.equal(rows[1].elapsedMs, 0); assert.equal(rows[1].repairs, 0); assert.equal(rows[1].userCorrections, 0); h.cleanup();
+});
+
+test('result freshness records legacy unknown and validates reused receipt references', async () => {
+  const rows = [], h = await harness(memoryPlugin(rows)); const tool = h.tools.get('task_outcome');
+  const legacy = { id: 'legacy', status: 'passed', mode: 'local', evidence: 'existing legacy result' };
+  await tool.execute({ taskId: 'freshness', scope: 'checkpoint', status: 'completed', results: [legacy] }, call());
+  assert.equal(rows.at(-1).results[0].freshness, 'unknown');
+  const reused = { id: 'reused', status: 'passed', mode: 'local', evidence: 'prior check passed', freshness: 'reused', sourceReceipt: 'check-receipts/authorization-tests/receipt.json' };
+  await tool.execute({ taskId: 'freshness', scope: 'checkpoint', status: 'completed', results: [reused] }, call());
+  assert.equal(rows.at(-1).results[0].sourceReceipt, reused.sourceReceipt);
+  await tool.execute({ taskId: 'freshness', scope: 'checkpoint', status: 'completed', results: [{ ...legacy, id: 'skipped', status: 'not_run', freshness: 'unrun' }] }, call());
+  assert.equal(rows.at(-1).results[0].freshness, 'unrun');
+  await assert.rejects(tool.execute({ taskId: 'freshness', scope: 'checkpoint', status: 'completed', results: [{ ...reused, id: 'missing', sourceReceipt: undefined }] }, call()), /sourceReceipt/);
+  await assert.rejects(tool.execute({ taskId: 'freshness', scope: 'checkpoint', status: 'completed', results: [{ ...legacy, id: 'not-run', status: 'not_run', freshness: 'fresh' }] }, call()), /freshness/);
+  await assert.rejects(tool.execute({ taskId: 'freshness', scope: 'checkpoint', status: 'completed', results: [{ ...reused, id: 'secret', sourceReceipt: 'https://user:password@example.test/receipt?token=value' }] }, call()), /sourceReceipt/);
+  h.cleanup();
 });
 
 test('task terminal outcomes retain the initial contract and reject blank evidence', async () => {

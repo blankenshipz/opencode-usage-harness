@@ -237,3 +237,60 @@ cancellation, not a process supervisor: a child that ignores signals can keep
 running, and killing the wrapper with SIGKILL or losing power can leave a stale
 `running` receipt. Inspect the actual process before assuming it is still active.
 Raw child return codes are retained separately from conventional shell signal exits.
+
+
+## Capacity, check tools, and stalled execution
+
+`check_prepare` accepts a label, optional artifact revision, and command argv. It
+returns a quoted command for the normal shell tool; it does **not** execute code
+or grant approval. Agents can also call `harness-check` directly. This avoids an
+alternate command-execution authority and keeps complete diagnostics out of prompts.
+
+Before launching, the runner checks free space on both the working-directory and
+receipt filesystems. The default 2 GiB reserve is a minimum, not an estimate of
+build size. Increase it for known artifact growth with `--reserve-bytes` or
+`HARNESS_MIN_FREE_BYTES`. Low or unavailable capacity produces exit 125 without
+launching the command. A receipt is written when storage permits; otherwise a
+small structured failure is printed. No files are automatically deleted.
+
+`check_status` (or `harness-check --status RECEIPT`) reports `completed`, `running`,
+`owner_missing`, or `unknown`. Versioned receipts retain child PID, process birth
+identity, and heartbeat metadata. Only a matching identity establishes the owner;
+age alone does not. Legacy/unverifiable receipts remain unknown. Linux uses boot ID plus process start
+time; macOS does not expose a sufficiently precise identity through this portable
+implementation, so a present PID is conservatively unknown. A missing PID can
+still identify an absent leader. Heartbeats are
+best effort, not a process supervisor, useful-progress measurement, or promise
+that an entire descendant process group is gone when the leader exits.
+
+`harness_health` compares the caller's session (or one of its descendants) with
+native `/api/session/active` ownership and the saved database claim. It requires
+`HARNESS_OPENCODE_DB` and either `HARNESS_OPENCODE_SERVICE_FILE` pointing to the
+local native service registration, or `OPENCODE_SERVER_URL` and
+`OPENCODE_SERVER_PASSWORD`. The service password authenticates local management;
+it is not a provider API key. Only literal loopback HTTP endpoints are accepted;
+redirects/proxies are disabled and credentials are never returned. Public setups
+must supply this optional native-service binding; missing or malformed evidence
+reports `unknown`, never idle.
+
+A `claim_without_owner` finding is a diagnostic snapshot requiring reconciliation,
+not authority to mutate the database or retry work. These tools are checked on
+request at meaningful boundaries; they are not a background watchdog. Report the
+finding once, preserve ownership and receipts, and use native stop/recovery with
+appropriate authorization. There is no automatic restart, replacement, or retry.
+
+## Phase completion and measurement quality
+
+Before expensive release gates, prove the smallest requested user journey and run
+cheap package inventory, required assets, setup/documentation, and capacity checks.
+At completed phase boundaries, selectively compact long conversations around the
+current intent/check IDs, artifact revision, relevant files, receipts, unresolved
+failures and next action. Keep the same worker ownership; do not compact on a timer
+or assume smaller context always means lower subscription usage.
+
+Outcome measurements distinguish missing values from observed zero. Old records
+are not rewritten. Checkpoint and full-task completion remain separate, and all
+agent-submitted outcomes remain self-reported. Optional result `freshness` (`fresh`, `reused`, `unrun`, or legacy `unknown`) marks
+new evidence versus reused or unrun checks; reused evidence retains its source
+`sourceReceipt` reference and still has to satisfy current artifact identity and acceptance rules.
+Unknown metrics must not become zero in downstream reports or success rates.

@@ -14,6 +14,11 @@ the result; unused quota alone is no reason to manufacture work.
 combining several subscriptions? Explore the [pool planner and architecture](docs/SUBSCRIPTION-POOLS.md)
 and [help build the next integrations](#contributing).
 
+Substantial test/build commands can retain private diagnostic receipts and check
+available disk space before starting. Read-only health tools help distinguish
+stalled execution from stale status, without automatically retrying or restarting
+work. See [execution and outcome telemetry](docs/TELEMETRY.md).
+
 ## What you get
 
 | For your workflow | What the harness provides |

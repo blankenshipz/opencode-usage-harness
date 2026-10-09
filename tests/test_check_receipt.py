@@ -6,11 +6,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin" / "harness-check"
+sys.path.insert(0, str(ROOT / "src"))
+import check_receipt
 
 
 class CheckReceiptTest(unittest.TestCase):
@@ -84,6 +87,74 @@ class CheckReceiptTest(unittest.TestCase):
         receipt = json.loads(path.read_text())
         self.assertEqual(receipt["outcome"], "startup_error")
         self.assertEqual(receipt["startup_error"], "FileNotFoundError")
+
+    def test_capacity_preflight_blocks_without_launching_command(self):
+        state = tempfile.mkdtemp()
+        marker = Path(state) / "launched"
+        result, path = self.invoke(
+            "--label", "capacity", "--reserve-bytes", str(10**30), "--",
+            sys.executable, "-c", f"__import__('pathlib').Path({str(marker)!r}).touch()",
+            state_dir=state,
+        )
+        self.assertEqual(result.returncode, 125)
+        self.assertFalse(marker.exists())
+        receipt = json.loads(path.read_text())
+        self.assertEqual(receipt["outcome"], "capacity_blocked")
+        self.assertEqual({item["path"] for item in receipt["capacity"]["checks"]}, {str(Path.cwd()), str(Path(state) / "check-receipts")})
+
+    def test_capacity_checks_cwd_and_receipt_filesystem_separately(self):
+        state = tempfile.mkdtemp()
+        checked = []
+        original = check_receipt._capacity
+
+        def record(path, reserve):
+            checked.append(path)
+            return original(path, reserve)
+
+        with mock.patch.dict(os.environ, {"HARNESS_STATE_DIR": state}), mock.patch.object(check_receipt, "_capacity", side_effect=record):
+            self.assertEqual(check_receipt.run("distinct", None, [sys.executable, "-c", "pass"], 0), 0)
+        self.assertEqual(checked, [Path.cwd(), Path(state) / "check-receipts"])
+
+    def test_status_identity_mismatch_and_legacy_receipt_are_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps({
+                "receipt_version": 2, "outcome": "running", "finished_at": None,
+                "process_pid": os.getpid(), "process_identity": "wrong-birth",
+            }))
+            result = subprocess.run([str(BIN), "--status", str(path)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0)
+            with mock.patch.object(check_receipt, "_process_identity", return_value="different-birth"):
+                self.assertEqual(check_receipt.inspect_receipt(path)["status"], "owner_missing")
+            path.write_text(json.dumps({"outcome": "running", "process_pid": os.getpid()}))
+            result = subprocess.run([str(BIN), "--status", str(path)], text=True, capture_output=True)
+            self.assertEqual(json.loads(result.stdout)["status"], "unknown")
+
+    def test_missing_owner_without_identity_and_imprecise_platform(self):
+        document = {"receipt_version": 2, "outcome": "running", "process_pid": 123, "process_identity": None}
+        with mock.patch.object(check_receipt.os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(check_receipt._health(document), "owner_missing")
+        with mock.patch.object(check_receipt.Path, "exists", return_value=False):
+            self.assertIsNone(check_receipt._process_identity(123))
+
+    def test_status_is_unknown_when_birth_identity_cannot_be_verified(self):
+        document = {
+            "receipt_version": 2, "outcome": "running", "finished_at": None,
+            "process_pid": os.getpid(), "process_identity": "recorded",
+        }
+        with mock.patch.object(check_receipt, "_process_identity", return_value=None):
+            self.assertEqual(check_receipt._health(document), "unknown")
+
+    def test_unavailable_capacity_blocks_with_explicit_receipt(self):
+        state = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"HARNESS_STATE_DIR": state}), mock.patch.object(
+            check_receipt, "_capacity", return_value={"path": "x", "status": "unavailable", "available_bytes": None}
+        ):
+            self.assertEqual(check_receipt.run("unavailable", None, [sys.executable, "-c", "raise SystemExit(3)"], 0), 125)
+        receipts = list((Path(state) / "check-receipts").glob("*/receipt.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual(receipt["outcome"], "capacity_unavailable")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import tempfile
 import time
@@ -22,6 +23,9 @@ except ImportError:  # direct execution via bin/harness-check
 
 _LABEL = re.compile(r"^[a-z0-9-]{1,64}$")
 _SIGNALS = {getattr(signal, name): name for name in ("SIGINT", "SIGTERM") if hasattr(signal, name)}
+_DEFAULT_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
+_RECEIPT_VERSION = 2
+_TERMINAL_OUTCOMES = {"succeeded", "failed", "interrupted", "startup_error", "capacity_blocked", "capacity_unavailable"}
 
 
 def _timestamp() -> str:
@@ -57,10 +61,128 @@ def _forward(child: subprocess.Popen[bytes], signum: int) -> None:
         pass
 
 
-def run(label: str, revision: str | None, command: list[str]) -> int:
+def _process_identity(pid: int) -> str | None:
+    """Return a birth identity when the host exposes one, without inspecting argv/env."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        if proc_stat.exists():
+            text = proc_stat.read_text(encoding="utf-8")
+            after_comm = text.rsplit(")", 1)[1].split()
+            # /proc stat field 22 (starttime), after state is index 19.
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+            return f"proc-starttime:{boot}:{after_comm[19]}" if boot else None
+    except (OSError, IndexError, UnicodeError):
+        pass
+    # macOS ps lstart has only second precision and cannot safely distinguish
+    # rapid PID reuse. No sufficiently precise portable identity is available.
+    return None
+
+
+def _capacity(path: Path, reserve_bytes: int) -> dict[str, Any]:
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        usage = shutil.disk_usage(probe)
+    except (OSError, ValueError):
+        return {"path": str(path), "status": "unavailable", "available_bytes": None}
+    return {
+        "path": str(path),
+        "status": "ok" if usage.free >= reserve_bytes else "blocked",
+        "available_bytes": usage.free,
+    }
+
+
+def _reserve_bytes(value: int | None) -> int:
+    if value is not None:
+        return value
+    configured = os.environ.get("HARNESS_MIN_FREE_BYTES")
+    if configured is not None:
+        try:
+            value = int(configured)
+        except ValueError as error:
+            raise ValueError("HARNESS_MIN_FREE_BYTES must be an integer") from error
+    else:
+        value = _DEFAULT_RESERVE_BYTES
+    if value < 0:
+        raise ValueError("reserve bytes must be nonnegative")
+    return value
+
+
+def _health(document: dict[str, Any]) -> str:
+    if document.get("receipt_version") != _RECEIPT_VERSION:
+        return "unknown"
+    outcome = document.get("outcome")
+    if outcome in _TERMINAL_OUTCOMES and document.get("finished_at"):
+        return "completed"
+    pid = document.get("process_pid")
+    recorded_identity = document.get("process_identity")
+    if outcome != "running":
+        return "unknown"
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return "unknown"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "owner_missing"
+    except PermissionError:
+        return "unknown"
+    except OSError as error:
+        return "owner_missing" if getattr(error, "errno", None) == 3 else "unknown"
+    if not isinstance(recorded_identity, str) or not recorded_identity:
+        return "unknown"
+    current_identity = _process_identity(pid)
+    if current_identity is None:
+        return "unknown"
+    return "running" if current_identity == recorded_identity else "owner_missing"
+
+
+def inspect_receipt(path: Path) -> dict[str, Any]:
+    """Read one receipt without changing it or its owning process."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {"path": str(path), "status": "unknown"}
+    if not isinstance(document, dict):
+        return {"path": str(path), "status": "unknown"}
+    return {"path": str(path), "status": _health(document)}
+
+
+def run(label: str, revision: str | None, command: list[str], reserve_bytes: int | None = None) -> int:
+    reserve = _reserve_bytes(reserve_bytes)
     root = state_dir() / "check-receipts"
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(root, 0o700)
+    capacities = [_capacity(Path.cwd(), reserve), _capacity(root, reserve)]
+    if any(item["status"] != "ok" for item in capacities):
+        capacity_outcome = "capacity_unavailable" if any(item["status"] == "unavailable" for item in capacities) else "capacity_blocked"
+        try:
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(root, 0o700)
+            run_dir = Path(tempfile.mkdtemp(prefix=f"{label}-", dir=root))
+            os.chmod(run_dir, 0o700)
+            receipt_path = run_dir / "receipt.json"
+            _replace_receipt(receipt_path, {
+                "receipt_version": _RECEIPT_VERSION,
+                "started_at": _timestamp(), "finished_at": _timestamp(),
+                "label": label, "revision": revision, "exit_code": 125,
+                "child_returncode": None, "signal": None,
+                "startup_error": "disk_capacity",
+                "outcome": capacity_outcome,
+                "capacity": {"reserve_bytes": reserve, "checks": capacities},
+                "duration_seconds": 0.0, "stdout_file": None, "stderr_file": None,
+                "process_pid": None, "process_identity": None, "heartbeat_at": None,
+            })
+            print(f"{capacity_outcome}: {receipt_path}")
+        except OSError as error:
+            print(json.dumps({"status": "unavailable", "error": type(error).__name__, "capacity": capacities}))
+        return 125
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(root, 0o700)
+    except OSError as error:
+        print(json.dumps({"status": "unavailable", "error": type(error).__name__, "capacity": capacities}))
+        return 125
     run_dir = Path(tempfile.mkdtemp(prefix=f"{label}-", dir=root))
     os.chmod(run_dir, 0o700)
     stdout_path = run_dir / "stdout.log"
@@ -73,6 +195,7 @@ def run(label: str, revision: str | None, command: list[str]) -> int:
     os.chmod(stdout_path, 0o600)
     os.chmod(stderr_path, 0o600)
     _replace_receipt(receipt_path, {
+        "receipt_version": _RECEIPT_VERSION,
         "started_at": started_at,
         "finished_at": None,
         "label": label,
@@ -85,9 +208,14 @@ def run(label: str, revision: str | None, command: list[str]) -> int:
         "duration_seconds": 0.0,
         "stdout_file": stdout_path.name,
         "stderr_file": stderr_path.name,
+        "process_pid": None,
+        "process_identity": None,
+        "heartbeat_at": started_at,
+        "capacity": {"reserve_bytes": reserve, "checks": capacities},
     })
     print(f"running: {receipt_path}", flush=True)
     child: subprocess.Popen[bytes] | None = None
+    process_identity: str | None = None
     interrupted_by: int | None = None
 
     def on_signal(signum: int, _frame: Any) -> None:
@@ -113,13 +241,26 @@ def run(label: str, revision: str | None, command: list[str]) -> int:
                 if os.name == "posix":
                     kwargs["start_new_session"] = True
                 child = subprocess.Popen(command, **kwargs)
+                running_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                running_receipt["process_pid"] = child.pid
+                process_identity = _process_identity(child.pid)
+                running_receipt["process_identity"] = process_identity
+                running_receipt["heartbeat_at"] = _timestamp()
+                _replace_receipt(receipt_path, running_receipt)
                 if interrupted_by is not None:
                     _forward(child, interrupted_by)
             except OSError as error:
                 startup_error = type(error).__name__
                 stderr.write(f"{type(error).__name__}: unable to start requested command\n".encode())
             else:
-                child_returncode = child.wait()
+                while True:
+                    try:
+                        child_returncode = child.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        running_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                        running_receipt["heartbeat_at"] = _timestamp()
+                        _replace_receipt(receipt_path, running_receipt)
                 exit_code = child_returncode
                 if child_returncode < 0:
                     signal_name = _SIGNALS.get(-child_returncode, f"SIG{-child_returncode}")
@@ -143,6 +284,7 @@ def run(label: str, revision: str | None, command: list[str]) -> int:
     else:
         outcome = "failed"
     receipt = {
+        "receipt_version": _RECEIPT_VERSION,
         "started_at": started_at,
         "finished_at": finished_at,
         "label": label,
@@ -155,6 +297,10 @@ def run(label: str, revision: str | None, command: list[str]) -> int:
         "duration_seconds": round(max(0.0, time.monotonic() - started), 6),
         "stdout_file": stdout_path.name,
         "stderr_file": stderr_path.name,
+        "process_pid": child.pid if child is not None else None,
+        "process_identity": process_identity,
+        "heartbeat_at": finished_at,
+        "capacity": {"reserve_bytes": reserve, "checks": capacities},
     }
     _replace_receipt(receipt_path, receipt)
     print(f"{outcome}: {receipt_path}")
@@ -163,12 +309,21 @@ def run(label: str, revision: str | None, command: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one local command and retain a private diagnostic receipt")
-    parser.add_argument("--label", required=True)
+    parser.add_argument("--label")
     parser.add_argument("--revision")
+    parser.add_argument("--reserve-bytes", type=int, help="minimum free bytes required on cwd and receipt filesystems")
+    parser.add_argument("--status", metavar="RECEIPT", help="inspect a receipt without changing it or its process")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    if args.status:
+        print(json.dumps(inspect_receipt(Path(args.status)), sort_keys=True, separators=(",", ":")))
+        return 0
+    if not args.label:
+        parser.error("--label is required when running a command")
     if not _LABEL.fullmatch(args.label):
         parser.error("--label must match [a-z0-9-]{1,64}")
+    if args.reserve_bytes is not None and args.reserve_bytes < 0:
+        parser.error("--reserve-bytes must be nonnegative")
     if args.revision is not None:
         if not args.revision.strip():
             parser.error("--revision must be nonblank")
@@ -179,7 +334,10 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("a command is required after --")
-    return run(args.label, args.revision, command)
+    try:
+        return run(args.label, args.revision, command, args.reserve_bytes)
+    except ValueError as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

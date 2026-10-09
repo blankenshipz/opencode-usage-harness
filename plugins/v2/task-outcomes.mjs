@@ -2,6 +2,7 @@ import { createMilestoneStore, installMilestoneSignals } from './milestones.mjs'
 import { installEditRecovery } from './edit-recovery.mjs';
 import { installProgressSnapshots } from './progress-snapshots.mjs';
 import { installTaskDispatch } from './task-dispatch.mjs';
+import { installCheckTools } from './check-tools.mjs';
 import { createRegistry } from './dispatch-registry.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
@@ -15,10 +16,16 @@ const reasons = ['task_complexity', 'risk', 'verification_failure', 'user_overri
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const checkModes = ['live', 'local', 'synthetic'];
 const resultStatuses = ['passed', 'failed', 'blocked', 'not_run'];
+const resultFreshness = ['fresh', 'reused', 'unrun', 'unknown'];
 const blockerKinds = ['authorization', 'tool_permission', 'environment', 'credential', 'implementation'];
 const text = (value, name, max = 128) => {
   if (typeof value !== 'string' || !value.trim() || value.length > max || /[\r\n]/.test(value)) throw new Error(`task-outcomes: invalid ${name}`);
   return value;
+};
+const receiptReference = (value, name) => {
+  const reference = text(value, name, 500);
+  if (!/^[A-Za-z0-9._:/ -]+$/.test(reference) || reference.includes('://')) throw new Error(`task-outcomes: invalid ${name}`);
+  return reference;
 };
 const contractKey = (sessionID, taskID) => crypto.createHash('sha256').update(`${sessionID}\0${taskID}`).digest('hex');
 const contractPath = (sessionID, taskID) => statePath('task-contracts', `${contractKey(sessionID, taskID)}.json`);
@@ -102,7 +109,12 @@ function normalizeResults(value) {
       if (!Number.isSafeInteger(result.artifact.generation) || result.artifact.generation < 1) throw new Error(`task-outcomes: invalid results[${index}].artifact.generation`);
       artifact = { subject: text(result.artifact.subject, `results[${index}].artifact.subject`), revision: text(result.artifact.revision, `results[${index}].artifact.revision`, 500), generation: result.artifact.generation };
     }
-    const normalized = { id, status: result.status, mode: result.mode, evidence: text(result.evidence, `results[${index}].evidence`, 500) };
+    const freshness = result.freshness ?? 'unknown';
+    if (!resultFreshness.includes(freshness) || (result.status === 'not_run' && freshness === 'fresh') || (freshness === 'unrun' && result.status !== 'not_run')) throw new Error(`task-outcomes: invalid results[${index}].freshness`);
+    const sourceReceipt = result.sourceReceipt === undefined ? undefined : receiptReference(result.sourceReceipt, `results[${index}].sourceReceipt`);
+    if ((freshness === 'reused') !== (sourceReceipt !== undefined)) throw new Error(`task-outcomes: reused results require a sourceReceipt reference`);
+    const normalized = { id, status: result.status, mode: result.mode, evidence: text(result.evidence, `results[${index}].evidence`, 500), freshness };
+    if (sourceReceipt !== undefined) normalized.sourceReceipt = sourceReceipt;
     return artifact ? { ...normalized, artifact } : normalized;
   });
 }
@@ -117,6 +129,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
 }, loadContract = loadStoredContract, saveContract = saveStoredContract, loadArtifacts = loadStoredArtifacts, mutateArtifacts = mutateStoredArtifacts, now = () => Date.now() } = {}) {
   return { id: 'subscription.task-outcomes', async setup(ctx) {
     const shared = await installTaskDispatch(ctx,dispatchOptions);
+    await installCheckTools(ctx);
     const stopSnapshots = installProgressSnapshots(ctx);
     const stopMilestones = installMilestoneSignals(ctx,milestoneStore);
     const stopEditRecovery = await installEditRecovery(ctx);
@@ -133,7 +146,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
       progressState: { type: 'string', enum: progressStates },
       dependencySessionIDs: { type: 'array', minItems: 1, maxItems: 8, uniqueItems: true, items: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,160}$' } },
       contract: { type: 'object', additionalProperties: false, properties: { goal: { type: 'string', minLength: 1, maxLength: 500 }, authorization: { type: 'string', minLength: 1, maxLength: 500 }, checks: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', minLength: 1, maxLength: 128 }, description: { type: 'string', minLength: 1, maxLength: 500 }, mode: { type: 'string', enum: checkModes }, artifact: { type: 'string', minLength: 1, maxLength: 128 } }, required: ['id', 'description', 'mode'] } } }, required: ['goal', 'checks', 'authorization'] },
-      results: { type: 'array', maxItems: 12, items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', minLength: 1, maxLength: 128 }, status: { type: 'string', enum: resultStatuses }, mode: { type: 'string', enum: checkModes }, evidence: { type: 'string', minLength: 1, maxLength: 500 }, artifact: { type: 'object', additionalProperties: false, properties: { subject: { type: 'string', minLength: 1, maxLength: 128 }, revision: { type: 'string', minLength: 1, maxLength: 500 }, generation: { type: 'integer', minimum: 1 } }, required: ['subject', 'revision', 'generation'] } }, required: ['id', 'status', 'mode', 'evidence'] } },
+      results: { type: 'array', maxItems: 12, items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', minLength: 1, maxLength: 128 }, status: { type: 'string', enum: resultStatuses }, mode: { type: 'string', enum: checkModes }, evidence: { type: 'string', minLength: 1, maxLength: 500 }, freshness: { type: 'string', enum: resultFreshness }, sourceReceipt: { type: 'string', minLength: 1, maxLength: 500 }, artifact: { type: 'object', additionalProperties: false, properties: { subject: { type: 'string', minLength: 1, maxLength: 128 }, revision: { type: 'string', minLength: 1, maxLength: 500 }, generation: { type: 'integer', minimum: 1 } }, required: ['subject', 'revision', 'generation'] } }, required: ['id', 'status', 'mode', 'evidence'] } },
       blocker: { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: blockerKinds }, evidence: { type: 'string', minLength: 1, maxLength: 2000 }, nextAction: { type: 'string', minLength: 1, maxLength: 2000 } }, required: ['kind', 'evidence', 'nextAction'] },
       selected: { type: 'object', additionalProperties: false, properties: { agent: { type: 'string', maxLength: 128 }, model: { type: 'string', maxLength: 128 }, effort: { type: 'string', enum: efforts } } }, escalationReason: { type: 'string', enum: reasons }, validationEvidence: { type: 'array', maxItems: 8, items: { type: 'string', maxLength: 500 } }, repairs: { type: 'integer', minimum: 0, maximum: 1000 }, userCorrections: { type: 'integer', minimum: 0, maximum: 1000 }
     }, required: ['taskId', 'scope', 'status'] }, execute: async (args, call) => withIntentOutcome(args,call,async sharedContract => {
@@ -159,7 +172,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
         artifactChecks = new Map(stored?.checks.filter(check => check.artifact).map(check => [check.id, check]) ?? []);
         if (args.status === 'completed') { if (!results) throw new Error('task-outcomes: task completion requires results for every contracted check'); const byID = new Map(results.map(result => [result.id, result])); if (byID.size !== stored.checks.length || stored.checks.some(check => !byID.has(check.id))) throw new Error('task-outcomes: completion results must match every contracted check id'); for (const check of stored.checks) { const result = byID.get(check.id); if (result.status !== 'passed' || result.mode !== check.mode) throw new Error(`task-outcomes: contracted check ${check.id} must pass with mode ${check.mode}`); } }
       }
-      const key = JSON.stringify([sessionID, taskID]), timestamp = now(); if (!tasks.has(key)) { if (tasks.size >= 512) tasks.delete(tasks.keys().next().value); tasks.set(key, timestamp); }
+      const key = JSON.stringify([sessionID, taskID]), timestamp = now(), startedAt = tasks.get(key); if (startedAt === undefined) { if (tasks.size >= 512) tasks.delete(tasks.keys().next().value); tasks.set(key, timestamp); }
       const actor = messages.get(JSON.stringify([sessionID, call.messageID])), selected = args.selected && Object.fromEntries(Object.entries(args.selected).map(([k, v]) => [k, text(v, k)])); if (selected?.effort && !efforts.includes(selected.effort)) throw new Error('task-outcomes: invalid effort'); if (args.validationEvidence && (!Array.isArray(args.validationEvidence) || args.validationEvidence.length > 8 || args.validationEvidence.some(v => typeof v !== 'string' || v.length > 500))) throw new Error('task-outcomes: invalid evidence');
       const appendRecord = async artifacts => {
         const observedArtifactGenerations = [];
@@ -170,7 +183,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
           if (!result.artifact || result.artifact.subject !== check.artifact || target?.revision !== result.artifact.revision || target.generation !== result.artifact.generation) throw new Error(`task-outcomes: contracted check ${check.id} requires the current artifact ${check.artifact} receipt`);
           observedArtifactGenerations.push({ checkId: check.id, subject: check.artifact, revision: target.revision, generation: target.generation, selfReported: true });
         }
-        const recorded = { schemaVersion: 2, recordedAt: new Date(timestamp).toISOString(), elapsedScope: 'process_observation', sessionId: sessionID, taskId: taskID, scope: args.scope, messageId: call.messageID, status: args.status, progressState: args.progressState, dependencySessionIDs: args.dependencySessionIDs, elapsedMs: Math.max(0, timestamp - tasks.get(key)), attribution: { intended: selected, recordingActor: actor ? { ...actor, agent: call.agent ?? null, source: 'message.updated', agentSource: 'tool.context', effortSource: actor.effort ? 'message.updated.variant' : 'unavailable', messageId: call.messageID } : undefined, actualKnown: !!actor }, escalationReason: args.escalationReason, validationEvidence: args.validationEvidence, results, blocker, repairs: args.repairs ?? 0, userCorrections: args.userCorrections ?? 0, observedArtifactGenerations: observedArtifactGenerations.length ? observedArtifactGenerations : undefined, selfReported: true };
+        const recorded = { schemaVersion: 2, recordedAt: new Date(timestamp).toISOString(), elapsedScope: 'process_observation', sessionId: sessionID, taskId: taskID, scope: args.scope, messageId: call.messageID, status: args.status, progressState: args.progressState, dependencySessionIDs: args.dependencySessionIDs, elapsedMs: startedAt === undefined ? undefined : Math.max(0, timestamp - startedAt), attribution: { intended: selected, recordingActor: actor ? { ...actor, agent: call.agent ?? null, source: 'message.updated', agentSource: 'tool.context', effortSource: actor.effort ? 'message.updated.variant' : 'unavailable', messageId: call.messageID } : undefined, actualKnown: !!actor }, escalationReason: args.escalationReason, validationEvidence: args.validationEvidence, results, blocker, repairs: args.repairs, userCorrections: args.userCorrections, observedArtifactGenerations: observedArtifactGenerations.length ? observedArtifactGenerations : undefined, selfReported: true };
         await append(recorded);
         try { await milestoneStore.record(recorded); } catch { /* UI reporting must not affect checkpoint acceptance. */ }
         return observedArtifactGenerations;
