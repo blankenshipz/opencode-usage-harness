@@ -59,7 +59,7 @@ test('only uncomplicated test/build commands get log deduplication',()=>{
  for(const command of ['cat source.ts','npm test; cat file','npm test | cat','npm test > file']) assert.equal(compressionKind({...base,tool:'shell',input:{command}}),'json');
 });
 test('native MCP namespace registrations receive JSON-only projection',async()=>{
- const hooks={}; await installContextCompression({mcp:{transform:async fn=>fn({list:()=>[['example-server',{}]]})},tool:{transform:async fn=>fn({list:()=>[{name:'list_records',options:{namespace:'example-server'}}]}),hook:async(n,fn)=>{hooks[n]=fn;}}},{save:async(_e,_i,_o,c)=>c.text});
+ const hooks={}; await installContextCompression({mcp:{transform:async fn=>fn({list:()=>[['example-server',{}]]})},tool:{list:async()=>[{name:'list_records',options:{namespace:'example-server'}}],hook:async(n,fn)=>{hooks[n]=fn;}}},{save:async(_e,_i,_o,c)=>c.text});
  const e={...base,tool:'example-server_list_records',status:'completed',result:{content:source,output:{unchanged:true}}};
  await hooks['execute.before'](e);await hooks['execute.after'](e);assert.notEqual(e.result.content,source);assert.deepEqual(e.result.output,{unchanged:true});
 });
@@ -85,4 +85,11 @@ test('directory sync failure never publishes a retrieval marker',async t=>{
  }};
  const f=await fixture(t,{io}),e={...base,status:'completed',result:{content:source}};
  await f.before(e);await f.after(e);assert.equal(e.result.content,source);assert.equal((await fs.readdir(f.directory)).length,0);
+});
+test('late MCP registration is discovered and catalog errors leave results intact',async()=>{
+ const hooks={};let catalog=[];
+ await installContextCompression({mcp:{transform:async fn=>fn({list:()=>[['late',{}]]})},tool:{list:async()=>{if(!catalog)throw Error('reload');return catalog;},hook:async(n,fn)=>{hooks[n]=fn;}}},{save:async(_e,_i,_o,c)=>c.text});
+ catalog=[{name:'query',options:{namespace:'late'}}];
+ const run=async()=>{const e={...base,tool:'late_query',status:'completed',result:{content:source}};await hooks['execute.before'](e);await hooks['execute.after'](e);return e.result.content;};
+ assert.notEqual(await run(),source);catalog=null;assert.equal(await run(),source);
 });

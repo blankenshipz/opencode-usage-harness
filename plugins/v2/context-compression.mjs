@@ -102,20 +102,15 @@ export function createOutputStore(directory = statePath('tool-output-store'), op
 
 export async function installContextCompression(ctx, { save = createOutputStore() } = {}) {
   if (typeof ctx.tool?.hook !== 'function') return () => {}; // Older runtimes retain native output.
-  const roots = new Map(), mcpNamespaces = new Set(), mcpNames = new Set();
+  const roots = new Map(), mcpNamespaces = new Set();
   const controller = new AbortController();
   // Identify MCP registrations from native namespace metadata, never name guesses.
-  if (typeof ctx.mcp?.transform === 'function' && typeof ctx.tool.transform === 'function') {
+  if (typeof ctx.mcp?.transform === 'function') {
     await ctx.mcp.transform(editor => {
       mcpNamespaces.clear();
       for (const [server] of editor.list()) mcpNamespaces.add(server.replace(/[^a-zA-Z0-9_-]/g, '_'));
     });
-    await ctx.tool.transform(editor => {
-      mcpNames.clear();
-      for (const tool of editor.list()) {
-        if (mcpNamespaces.has(tool.options?.namespace)) mcpNames.add(`${tool.options.namespace}_${tool.name.replace(/[^a-zA-Z0-9_-]/g, '_')}`);
-      }
-    });
+
   }
   if (typeof ctx.event?.subscribe === 'function') void (async () => {
     try { for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
@@ -137,9 +132,17 @@ export async function installContextCompression(ctx, { save = createOutputStore(
     if (--current.depth > 0) return; // CodeMode leaves must keep even fallback text untouched.
     roots.delete(id);
     if (current.tool !== event.tool || event.status !== 'completed') return;
-    const kind = compressionKind(event) ?? (mcpNames.has(event.tool) ? 'json' : undefined);
-    if (!kind) return;
     try {
+      let kind = compressionKind(event);
+      if (!kind && mcpNamespaces.size && typeof ctx.tool.list === 'function') {
+        // Consult the settled catalog: MCP transforms may register after ours,
+        // and reconnects can replace tools without re-running plugin setup.
+        const tools = await ctx.tool.list();
+        const nativeMcp = tools.some(tool => mcpNamespaces.has(tool.options?.namespace) &&
+          `${tool.options.namespace}_${tool.name.replace(/[^a-zA-Z0-9_-]/g, '_')}` === event.tool);
+        if (nativeMcp) kind = 'json';
+      }
+      if (!kind) return;
       const content = event.result.content;
       const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : content;
       if (!Array.isArray(blocks)) return;
