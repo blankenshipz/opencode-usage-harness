@@ -10,3 +10,12 @@ plugin in spotify/portal-ai-plugins:
 https://engineering.atspotify.com/2026/9/portal-by-spotify-cut-my-claude-code-token-usage-by-90
 https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt
 This acknowledgment credits the approach and does not imply Spotify endorsement.
+
+Design inspiration for conservative log previews and recoverable originals:
+Headroom (headroomlabs-ai/headroom), Apache-2.0, reviewed at commit
+976aa714ef3e19174dc0cb586cee7b20d064e4ef. In particular:
+https://github.com/headroomlabs-ai/headroom/blob/976aa714ef3e19174dc0cb586cee7b20d064e4ef/crates/headroom-core/src/transforms/log_compressor.rs
+https://github.com/headroomlabs-ai/headroom/blob/976aa714ef3e19174dc0cb586cee7b20d064e4ef/headroom/cache/compression_store.py
+Our bounded exact-repeat preview is independently implemented; no Headroom code
+is copied or vendored, and no Headroom dependency is installed. This credits
+design ideas, not equivalent functionality, savings, affiliation or endorsement.

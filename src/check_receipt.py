@@ -7,6 +7,7 @@ import json
 import os
 import re
 import signal
+import stat
 import shutil
 import subprocess
 import tempfile
@@ -148,6 +149,82 @@ def inspect_receipt(path: Path) -> dict[str, Any]:
     if not isinstance(document, dict):
         return {"path": str(path), "status": "unknown"}
     return {"path": str(path), "status": _health(document)}
+
+
+def preview_log(receipt: Path, stream: str = "stderr", offset: int = 1,
+                limit: int = 120) -> dict[str, Any]:
+    """Read a bounded page from an existing finalized private check log.
+
+    No subprocess, extra cache, automatic deletion, or permission override.
+    Originals and process exit evidence remain untouched.
+    """
+    try:
+        from .log_preview import compact_lines
+    except ImportError:
+        from log_preview import compact_lines
+    if stream not in {"stdout", "stderr"} or offset < 1 or not 1 <= limit <= 350:
+        raise ValueError("preview requires stdout/stderr, offset >= 1 and limit 1..350")
+    root = (state_dir() / "check-receipts").resolve(strict=True)
+    receipt = receipt.resolve(strict=True)
+    if receipt.name != "receipt.json" or not receipt.is_relative_to(root):
+        raise ValueError("preview receipt must be inside the harness check-receipts directory")
+    if receipt.stat().st_size > 65536:
+        raise ValueError("invalid oversized receipt")
+    document = json.loads(receipt.read_text())
+    if not isinstance(document, dict) or document.get("outcome") not in _TERMINAL_OUTCOMES:
+        raise ValueError("preview requires a finalized check; use check_status while it runs")
+    name = stream + ".log"
+    if document.get(stream + "_file") != name:
+        raise ValueError("receipt has no matching retained log")
+    source = receipt.parent / name
+    if source.is_symlink() or source.resolve(strict=True).parent != receipt.parent:
+        raise ValueError("preview log must be a regular retained file, not a symlink")
+    fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("preview log must be a regular file")
+        scanned = 0
+        selected_bytes = 0
+        lines = []
+        reached_end = False
+        for number in range(1, offset + limit):
+            remaining = 4 * 1024 * 1024 - scanned
+            if remaining <= 0:
+                raise ValueError("preview scan bound exceeded; use a focused native log search")
+            raw = handle.readline(min(65537, remaining))
+            scanned += len(raw)
+            if len(raw) > 65536 or (len(raw) == remaining and not raw.endswith(b"\n")):
+                raise ValueError("preview scan bound exceeded; use a focused native log search")
+            if not raw:
+                reached_end = True
+                break
+            if number >= offset:
+                if selected_bytes + len(raw) > 65536:
+                    handle.seek(-len(raw), os.SEEK_CUR)
+                    break
+                selected_bytes += len(raw)
+                try:
+                    lines.append(raw.decode("utf-8"))
+                except UnicodeDecodeError as error:
+                    raise ValueError("preview requires UTF-8 text; original bytes remain intact") from error
+                if selected_bytes >= 65536:
+                    break
+        if not reached_end and scanned < 4 * 1024 * 1024:
+            reached_end = not bool(handle.read(1))
+    read_count = len(lines)
+    while True:
+        result = {"receipt": str(receipt), "source": str(source), "stream": stream,
+                  "offset": offset, "lines_read": len(lines),
+                  "next_offset": None if reached_end and len(lines) == read_count else offset + len(lines),
+                  "source_size_bytes": info.st_size, "source_mtime_ns": info.st_mtime_ns,
+                  "scope": "bounded preview, not full-log analysis or acceptance evidence",
+                  **compact_lines(lines, offset)}
+        if len(json.dumps(result, ensure_ascii=True).encode()) <= 32768:
+            return result
+        if len(lines) <= 1:
+            raise ValueError("preview line exceeds output budget; use a focused native log search")
+        lines.pop()
 
 
 def run(label: str, revision: str | None, command: list[str], reserve_bytes: int | None = None) -> int:
@@ -312,9 +389,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--label")
     parser.add_argument("--revision")
     parser.add_argument("--reserve-bytes", type=int, help="minimum free bytes required on cwd and receipt filesystems")
+    parser.add_argument("--preview", metavar="RECEIPT", help="preview a finalized retained log; does not run a command")
+    parser.add_argument("--stream", choices=("stdout", "stderr"), default="stderr")
+    parser.add_argument("--offset", type=int, default=1)
+    parser.add_argument("--limit", type=int, default=120)
     parser.add_argument("--status", metavar="RECEIPT", help="inspect a receipt without changing it or its process")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    if args.preview:
+        if args.status or args.label or args.command:
+            parser.error("--preview cannot run a command or be combined with --status/--label")
+        try:
+            print(json.dumps(preview_log(Path(args.preview), args.stream, args.offset, args.limit), ensure_ascii=True))
+            return 0
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
     if args.status:
         print(json.dumps(inspect_receipt(Path(args.status)), sort_keys=True, separators=(",", ":")))
         return 0

@@ -50,7 +50,7 @@ Read [compatibility](docs/COMPATIBILITY.md) before changing your agent setup.
 The harness does not promise a percentage saving or a hard billing guarantee.
 Provider-side subscription eligibility and spend controls still matter. See
 [security and limitations](SECURITY.md). This project is independent of OpenAI,
-OpenCode, OpenChamber, and Spotify.
+OpenCode, OpenChamber, Spotify, or Headroom.
 
 ## Multiple subscriptions
 
@@ -140,7 +140,7 @@ harness-metrics --days 7
 harness-metrics --days 7 --json
 ```
 
-Preserve expensive check output privately with `harness-check --label tests --revision REV -- python3 -m pytest`. Each run keeps separate stdout, stderr and an exit-status receipt; see [durable diagnostics](docs/TELEMETRY.md#release-gates-and-durable-diagnostics).
+Preserve expensive check output privately with `harness-check --label tests --revision REV -- python3 -m pytest`. Each run keeps separate stdout, stderr and an exit-status receipt. Optional `harness-check --preview RECEIPT --stream stderr` returns a bounded page with exact repeated lines compacted; see [durable diagnostics](docs/TELEMETRY.md#release-gates-and-durable-diagnostics).
 
 Progress guidance separates active execution from verified outcomes. When small work expands, agents revisit the next useful result; follow-up reviews carry existing findings forward and focus on affected changes. These are instructions, not new approval gates or timer-driven model calls.
 
@@ -184,6 +184,9 @@ Release code and state are separate. Never commit auth files, financial attestat
 The large-file context control was inspired by Spotify’s [“Portal by Spotify cut my Claude Code token usage by 90%”](https://engineering.atspotify.com/2026/9/portal-by-spotify-cut-my-claude-code-token-usage-by-90) and the [Shunt plugin in spotify/portal-ai-plugins](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt).
 
 Credit to Spotify for the approach of blocking broad reads of files over a 350-line threshold and delegating focused analysis to a smaller worker that returns a compact summary, while allowing targeted reads. This harness applies that approach to OpenCode with its own routing and quota controls. Spotify’s reported savings describe its experiments; they are not measured results for this project. No Spotify affiliation or endorsement is implied.
+
+Headroom inspired our conservative log previews: compact repeated output while keeping originals retrievable. We examined its [log compressor](https://github.com/headroomlabs-ai/headroom/blob/976aa714ef3e19174dc0cb586cee7b20d064e4ef/crates/headroom-core/src/transforms/log_compressor.rs) and [compression store](https://github.com/headroomlabs-ai/headroom/blob/976aa714ef3e19174dc0cb586cee7b20d064e4ef/headroom/cache/compression_store.py). Our independently written implementation collapses only exact consecutive repeats inside a bounded log page and reuses durable check logs. It does not install Headroom, proxy model traffic, normalize distinct errors, or claim Headroom's savings. See [preview behavior and limits](docs/TELEMETRY.md#bounded-log-previews).
+
 
 ## License
 

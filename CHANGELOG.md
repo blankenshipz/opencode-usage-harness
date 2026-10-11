@@ -2,6 +2,8 @@
 
 ## 0.2.0 — unreleased
 
+- Add opt-in bounded check-log previews with exact-repeat compaction and retained originals; credit Headroom design inspiration without adding its dependency or proxy.
+
 - Consolidate convergence guidance: distinguish verified outcomes from activity, revisit an expanding task at existing progress boundaries, and carry review findings forward to affected-code follow-ups.
 - Add passive metadata-only execution timing and overlap-aware workload reports; unknown time is not attributed to provider throttling.
 

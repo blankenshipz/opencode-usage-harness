@@ -359,3 +359,40 @@ Follow-up review carries one canonical findings list forward and inspects change
 code, fixes and affected regression risks. Broader review remains appropriate when
 new evidence, cross-cutting risk, required gates or the user justify it. This
 replaces repeated whole-project reviews without weakening required checks.
+
+## Bounded log previews
+
+For repetitive output from a **finalized** harness check, request a preview through
+normal shell permissions:
+
+```sh
+harness-check --preview /path/to/check-receipts/RUN/receipt.json --stream stderr --offset 1 --limit 120
+```
+
+`--stream stdout` selects the other retained log. The result identifies the original
+file, source line range, next page offset, file size/mtime and character counts.
+Only exact consecutive runs of three or more identical lines are collapsed, with
+explicit source ranges and repetition counts. If the formatted body would grow,
+the original page is returned. Distinct numbers, paths, whitespace and trace lines
+are preserved. This is a deterministic view of a page, not a full-log summary,
+redaction service, complete failure analysis or evidence that a check passed.
+
+Defaults read 120 source lines; the maximum is 350. Scan work is bounded to 4 MiB,
+selected content to about 64 KiB, and serialized output to 32 KiB. A smaller page
+returns `next_offset`; use focused native search rather than paging through entire
+logs. Oversized individual lines and non-UTF-8 data fail explicitly rather than
+being silently rewritten. Preview accepts only regular retained logs under the
+configured harness receipt root; symlink logs, running receipts, alternate paths
+and trailing commands are rejected. It executes no command and grants no authority.
+
+The original logs and exit-status receipt remain unchanged, with no new cache,
+expiry, deletion policy or proxy. Use a normal bounded native read of `source` for
+exact text. Logs can contain secrets: the same care as an ordinary log read applies.
+No preview is automatically injected into prompts or shared journals. Character
+reductions apply to the preview body only, not JSON overhead, tokenizer counts,
+subscription quota or dollar savings.
+
+This design draws on Headroom's conservative deduplication and recoverable-original
+approach; pinned source references and attribution are in [NOTICE](../NOTICE).
+We deliberately use exact repeats and existing durable files rather than its
+heuristic sampling, model proxy, automatic effort changes or expiring cache.
