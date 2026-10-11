@@ -2,6 +2,8 @@
 
 ## 0.2.0 — unreleased
 
+- Automatically compress eligible new V2 tool results with lossless JSON tables, search prefixes and exact-repeat test logs; retain private originals for bounded native reads, preserve CodeMode values/history/permissions, and expose metadata-only preparation metrics.
+
 - Add opt-in bounded check-log previews with exact-repeat compaction and retained originals; credit Headroom design inspiration without adding its dependency or proxy.
 
 - Consolidate convergence guidance: distinguish verified outcomes from activity, revisit an expanding task at existing progress boundaries, and carry review findings forward to affected-code follow-ups.

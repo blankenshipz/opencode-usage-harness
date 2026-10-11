@@ -24,6 +24,12 @@ except ImportError:  # direct execution via bin/harness-metrics
     from timing_metrics import collect_timing, read_timing_events
 
 
+try:
+    from .compression_metrics import compression_metrics
+except ImportError:
+    from compression_metrics import compression_metrics
+
+
 def _json(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -227,7 +233,7 @@ def collect_metrics(db_path: str | Path | None = None, *, days: int = 7,
                                 native_timing.append({"session_id": sid, "messageId": msg.get("_message_id"), "toolId": tool.get("id"), "category": timing_category, "interval_id": f"{sid}:{msg.get('_message_id') or ''}:{tool.get('id') or tool.get('name') or started}", "start_ms": int(started), "end_ms": int(ended)})
             acceptance = _accepted(Path(ownership_dir), root)
             timing = collect_timing(timing_path, session_ids=set(ids), start_ms=cutoff, end_ms=now_ms, fallback_intervals=native_timing, events=timing_events, read_error=timing_error)
-            reports.append({"root_session": root, "sessions": len(ids), "models_roles": dict(models), "tokens": {"uncached_input": tokens["input"], "output": tokens["output"], "reasoning": tokens["reasoning"], "cache_read": tokens["cache_read"], "cache_write": tokens["cache_write"]}, "tool_calls": dict(tools), "tool_errors": errors, "tool_retries": retries, "outstanding_tools": outstanding, "timing": timing, "blocked_minutes": None, "acceptance": acceptance or [{"status": "unknown", "gap": "no reliable intent evidence"}], "workload_label": "self-reported completion; usage is per root workload" if acceptance and all(x["status"] == "self_reported_complete" for x in acceptance) else "per-root workload"})
+            reports.append({"root_session": root, "sessions": len(ids), "models_roles": dict(models), "tokens": {"uncached_input": tokens["input"], "output": tokens["output"], "reasoning": tokens["reasoning"], "cache_read": tokens["cache_read"], "cache_write": tokens["cache_write"]}, "tool_calls": dict(tools), "tool_errors": errors, "tool_retries": retries, "outstanding_tools": outstanding, "timing": timing, "context_compression": compression_metrics(state_dir() / "tool-output-store", session_ids=set(ids), cutoff_ms=cutoff, now_ms=now_ms), "blocked_minutes": None, "acceptance": acceptance or [{"status": "unknown", "gap": "no reliable intent evidence"}], "workload_label": "self-reported completion; usage is per root workload" if acceptance and all(x["status"] == "self_reported_complete" for x in acceptance) else "per-root workload"})
         return {"days": days, "cutoff_ms": cutoff, "reports": reports}
     finally:
         conn.close()
@@ -251,6 +257,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  task={task.get('task_id', 'unknown')} checks={task.get('passed_checks', 0)}/{task.get('required_checks', '?')} status={task['status']}")
         for tool in report["outstanding_tools"]:
             print(f"  outstanding {tool['tool']} age-ms={tool['duration_ms']} (not proven blocked)")
+        compression = report["context_compression"]
+        print(f"  context compression: prepared={compression['prepared_results']} reduced-chars={compression['reduced_chars']} (not token/credit savings)")
         timing = report.get("timing", {})
         overall = timing.get("overall", {})
         print(f"  timing source={timing.get('source', 'unavailable')} overall-ms={overall.get('duration_ms', 'unknown')} status={overall.get('status', 'unknown')}")
