@@ -93,3 +93,21 @@ test('late MCP registration is discovered and catalog errors leave results intac
  const run=async()=>{const e={...base,tool:'late_query',status:'completed',result:{content:source}};await hooks['execute.before'](e);await hooks['execute.after'](e);return e.result.content;};
  assert.notEqual(await run(),source);catalog=null;assert.equal(await run(),source);
 });
+test('compression is independent of model family, provider metadata and inference APIs',async()=>{
+ // Synthetic routes verify the shared hook contract, not live provider support.
+ const hooks={},ctx={tool:{hook:async(n,fn)=>{hooks[n]=fn;}}};
+ for(const name of ['aisdk','provider','auth']) Object.defineProperty(ctx,name,{get(){throw Error('compression must not access inference or authentication');}});
+ const stop=await installContextCompression(ctx,{save:async(_e,_i,_o,c)=>c.text});
+ const projections=[];
+ for(const family of ['codex','claude','gemini','local-model','future-family']) {
+  const output={original:source},metadata={exit:0};
+  const e={...base,id:family,agent:`${family}-worker`,status:'completed',result:{content:source,output,metadata}};
+  // Native tool hooks don't require model/provider fields. Future additions must
+  // not turn this shared optimization into a provider-specific admission path.
+  for(const name of ['model','provider','reasoningEffort']) Object.defineProperty(e,name,{get(){throw Error('compression must not depend on routing metadata');}});
+  await hooks['execute.before'](e);await hooks['execute.after'](e);
+  assert.notEqual(e.result.content,source);assert.equal(e.result.output,output);assert.equal(e.result.metadata,metadata);
+  projections.push(e.result.content);
+ }
+ assert.equal(new Set(projections).size,1);stop();
+});

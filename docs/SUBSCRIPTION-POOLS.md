@@ -128,6 +128,12 @@ The existing Codex guard and `codex-quota` are the reference runtime integration
 Their OpenAI-specific checks must move behind a tested adapter when the runtime
 becomes multi-provider; simply widening `enabled_providers` is insufficient.
 
+Tool-result compression is already provider-neutral shared middleware. New
+adapters should reuse it once, preserve retrieval and permission semantics, and
+validate their message conversion instead of implementing a separate compressor.
+Its character-count metrics must not be treated as equivalent tokens or credits
+across families. See the [model-family integration contract](CONTEXT-COMPRESSION.md#model-family-independence).
+
 ## Runtime work still required
 
 - A registry of tested adapters and explicit per-pool opt-in configuration.

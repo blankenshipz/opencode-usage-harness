@@ -6,6 +6,37 @@ use the existing harness plugin distribution; no extra dependency, provider,
 proxy, model call, or agent opt-in is needed. Runtimes without this hook keep their
 native results. Legacy V1 does not implement automatic compression.
 
+## Model-family independence
+
+Compression is shared OpenCode middleware, not part of the Codex adapter. It
+operates on native tool-result text before provider message serialization and
+uses no model IDs, reasoning variants, inference APIs, authentication, quota
+telemetry or provider tokenizer. The same eligible result receives the same
+projection whether the eventual model is Codex, Claude, Gemini, a local model,
+or a future family. This is a runtime contract, not a claim of live testing or
+subscription support for those providers.
+
+When adding a provider:
+
+1. Keep `installContextCompression` installed once in the shared V2 tool path
+   (currently through `task-outcomes`); do not duplicate it in provider adapters.
+2. Preserve its projected content, retrieval marker, structured tool output and
+   native read permissions through the provider's message conversion. Run the
+   hook regression tests and a real tool/retrieval smoke test for that adapter.
+3. Reuse the generic retrieval guidance from `config/instructions.json`; replace
+   the **separate Codex-specific financial/routing policy** with that provider's
+   tested admission and quota adapter. Do not copy the entire current profile
+   blindly or merely expand its allowlist.
+4. Measure actual token usage and retrieval quality per family. Character savings
+   are not universal token savings; tokenization and prompt caching differ. A
+   future token estimator belongs behind a model-specific metrics interface,
+   not inside the lossless transformation or billing guard.
+
+The current live profile still enables only OpenAI with its existing safeguards.
+Provider-hosted tools that bypass OpenCode's local tool hooks need a separately
+validated integration; shared compression cannot cover that path automatically.
+See the [subscription adapter contract](SUBSCRIPTION-POOLS.md#adapter-contract-before-enabling-a-provider).
+
 ## What it does
 
 - JSON whitespace removal preserves raw numbers, escaped strings and duplicate

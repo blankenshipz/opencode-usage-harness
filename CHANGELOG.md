@@ -2,6 +2,8 @@
 
 ## 0.2.0 — unreleased
 
+- Specify and regression-test model-family-independent context compression; keep provider admission and token accounting separate.
+
 - Automatically compress eligible new V2 tool results with lossless JSON tables, search prefixes and exact-repeat test logs; retain private originals for bounded native reads, preserve CodeMode values/history/permissions, and expose metadata-only preparation metrics.
 
 - Add opt-in bounded check-log previews with exact-repeat compaction and retained originals; credit Headroom design inspiration without adding its dependency or proxy.
