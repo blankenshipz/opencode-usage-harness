@@ -27,7 +27,7 @@ work. See [execution and outcome telemetry](docs/TELEMETRY.md).
 | See whether capacity is running out or going unused | Codex quota telemetry and pacing based on reported allowance windows and reset times. |
 | Keep large files from crowding the main agent's context | A 350-line broad-read threshold, focused worker summaries, targeted reads, and reasoned one-use exceptions. |
 | Keep delegated work connected to the task | Shared task intent, scoped worker ownership, resumption, and recorded acceptance evidence. |
-| Understand what your agents accomplished | Workload metrics for usage, retries, tool results, and reported completion, with unknowns called out. |
+| Understand what your agents accomplished | Workload metrics for usage, observed execution time, retries and reported acceptance, with overlap and unknowns called out. |
 | Keep subscription-only inference explicit | ChatGPT OAuth checks, account matching, financial admission checks, and no automatic API-key/provider fallback in the supported profile. |
 | Adopt changes incrementally | An isolated toolkit installer, versioned updates, integrity checks, and code rollback. |
 
@@ -141,6 +141,8 @@ harness-metrics --days 7 --json
 ```
 
 Preserve expensive check output privately with `harness-check --label tests --revision REV -- python3 -m pytest`. Each run keeps separate stdout, stderr and an exit-status receipt; see [durable diagnostics](docs/TELEMETRY.md#release-gates-and-durable-diagnostics).
+
+Progress guidance separates active execution from verified outcomes. When small work expands, agents revisit the next useful result; follow-up reviews carry existing findings forward and focus on affected changes. These are instructions, not new approval gates or timer-driven model calls.
 
 The database is opened read-only. The public repository includes no database. Historical permission-blocked minutes are unknown, and artifact freshness is not independently verified by the metrics tool. Completed checks are self-reported evidence, not proof of real-world correctness. Tokens are not subscription-dollar prices. For deduplicated completion counts and token totals across legacy logs and the new ledger, see [completion telemetry](docs/TELEMETRY.md).
 

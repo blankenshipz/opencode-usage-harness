@@ -317,3 +317,45 @@ checkpoints when the requested journey has not been demonstrated. Check target
 platform and matching backend prerequisites before release builds. These are
 procedural instructions, not a new automatic retry counter, visual evaluator, or
 permission gate; their effectiveness must be assessed against subsequent outcomes.
+
+## Execution time and convergence
+
+`harness-metrics` now includes a per-root `timing` report. The task-outcomes plugin
+passively records native start/end metadata in
+`$HARNESS_STATE_DIR/telemetry/execution-timing.jsonl`. It performs no inference,
+permission decisions, retries of user work, polling of agents, or automatic restart.
+Writes are coalesced with bounded in-memory queues; the file is private on POSIX
+filesystems. Records exclude prompt text, tool arguments/results, error messages,
+reasoning, credentials and provider state.
+
+Timing distinguishes native model-request steps, tool execution, permission waits
+and form waits. Native model-request windows are not a breakdown of network,
+provider queueing and model computation. Tool execution can itself contain parent
+orchestration waits. Explicit HTTP 429 failures are counted only when exposed by
+the native event; quiet periods and generic transport failures are not counted as
+throttling. Pure provider latency, retry backoff and independent-review time remain
+unknown unless separately evidenced. A zero observed 429 count is not proof that
+no rate limiting occurred outside the observer's coverage.
+
+Intervals are unioned per category and overall across the root and descendants.
+Categories overlap and must not be added together: a parent waiting on a child can
+coincide with that child's work. Native database `ran` to `completed` intervals supplement the stream and preserve
+limited historical tool timing; `execute`/`subagent` windows are
+labeled orchestration/delegation waits, not pure review. Unknown durations stay
+unknown. Loss diagnostics are service-wide; explicit 429 counts are scoped to the root. Missing endpoints, dropped records and partial coverage are surfaced;
+restarts and bounded deduplication mean this is best-effort observation, not a
+lossless profiler. New observations cannot reconstruct historical model latency.
+The append-only file has no automatic deletion policy; use an explicit retention
+or archival decision before removing private telemetry.
+
+Instructions use existing progress boundaries for a convergence checkpoint when
+small work expands or repeated repairs miss the same behavior. The agent identifies
+what is verified, what expanded, the missed assumption and the simplest next step.
+There is no new approval, timer, hard deadline, mandatory journal or status-only
+model call. Active tool cards remain execution evidence; reported acceptance is
+separate and still needs appropriate verification.
+
+Follow-up review carries one canonical findings list forward and inspects changed
+code, fixes and affected regression risks. Broader review remains appropriate when
+new evidence, cross-cutting risk, required gates or the user justify it. This
+replaces repeated whole-project reviews without weakening required checks.

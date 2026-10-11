@@ -2,6 +2,9 @@
 
 ## 0.2.0 — unreleased
 
+- Consolidate convergence guidance: distinguish verified outcomes from activity, revisit an expanding task at existing progress boundaries, and carry review findings forward to affected-code follow-ups.
+- Add passive metadata-only execution timing and overlap-aware workload reports; unknown time is not attributed to provider throttling.
+
 - Ground acceptance in normal user journeys, change verification after repeated visible misses, and report remaining acceptance before test counts.
 
 - Preflight build/test disk capacity, expose check preparation and read-only receipt/session health tools, and preserve unknown ownership instead of assuming liveness.

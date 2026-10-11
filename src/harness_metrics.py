@@ -15,9 +15,13 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .paths import opencode_db, ownership_dir as ownership_dir_path
+    from .paths import opencode_db, ownership_dir as ownership_dir_path, state_dir
 except ImportError:  # direct execution via bin/harness-metrics
-    from paths import opencode_db, ownership_dir as ownership_dir_path
+    from paths import opencode_db, ownership_dir as ownership_dir_path, state_dir
+try:
+    from .timing_metrics import collect_timing, read_timing_events
+except ImportError:  # direct execution via bin/harness-metrics
+    from timing_metrics import collect_timing, read_timing_events
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -157,11 +161,14 @@ def collect_metrics(db_path: str | Path | None = None, *, days: int = 7,
         messages_by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
         if selected:
             placeholders = ",".join("?" for _ in by_id)
-            for row in conn.execute(f"select session_id, type, time_created, {data_col} as data from {message_table} where session_id in ({placeholders}) and time_created >= ?", tuple(by_id) + (cutoff,)):
+            for row in conn.execute(f"select id, session_id, type, time_created, {data_col} as data from {message_table} where session_id in ({placeholders}) and time_created >= ?", tuple(by_id) + (cutoff,)):
                 parsed = _json(row["data"])
                 parsed["_message_type"] = row["type"]
+                parsed["_message_id"] = row["id"]
                 messages_by_session[row["session_id"]].append(parsed)
 
+        timing_path = state_dir() / "telemetry" / "execution-timing.jsonl"
+        timing_events, timing_error = read_timing_events(timing_path)
         reports = []
         for root, ids in selected.items():
             tokens = Counter()
@@ -169,6 +176,7 @@ def collect_metrics(db_path: str | Path | None = None, *, days: int = 7,
             tools = Counter(succeeded=0, interrupted=0, failed=0, outstanding=0)
             errors = retries = 0
             outstanding = []
+            native_timing = []
             for sid in ids:
                 for msg in messages_by_session.get(sid, []):
                     if msg.get("_message_type") != "assistant":
@@ -196,8 +204,30 @@ def collect_metrics(db_path: str | Path | None = None, *, days: int = 7,
                         if status == "outstanding":
                             started = (tool.get("time") or {}).get("created")
                             outstanding.append({"tool": str(tool.get("name") or "unknown"), "duration_ms": max(0, now_ms - _num(started)) if started else None, "label": "outstanding"})
+                        # Native DB timing is only a fallback for explicitly
+                        # classified tool intervals.  Command text is never
+                        # inspected to guess whether a tool was a test.
+                        if tool.get("executed") is True:
+                            continue  # Provider-hosted execution is not native runtime work.
+                        tool_name = str(tool.get("name") or "").lower()
+                        if tool_name in {"execute", "subagent"}:
+                            timing_category = "delegation_wait_review"
+                        elif tool_name in {"shell", "native", "native_tool"}:
+                            timing_category = "native_tool"
+                        else:
+                            timing_category = "native_tool"
+                        timing = tool.get("timing") if isinstance(tool.get("timing"), dict) else tool.get("time")
+                        if isinstance(timing_category, str) and isinstance(timing, dict):
+                            # `created` precedes native execution and includes
+                            # model tool-input generation; only ran->completed
+                            # is attributable to the native operation.
+                            started = timing.get("start_ms") or timing.get("ran")
+                            ended = timing.get("end_ms") or timing.get("completed")
+                            if isinstance(started, (int, float)) and isinstance(ended, (int, float)):
+                                native_timing.append({"session_id": sid, "messageId": msg.get("_message_id"), "toolId": tool.get("id"), "category": timing_category, "interval_id": f"{sid}:{msg.get('_message_id') or ''}:{tool.get('id') or tool.get('name') or started}", "start_ms": int(started), "end_ms": int(ended)})
             acceptance = _accepted(Path(ownership_dir), root)
-            reports.append({"root_session": root, "sessions": len(ids), "models_roles": dict(models), "tokens": {"uncached_input": tokens["input"], "output": tokens["output"], "reasoning": tokens["reasoning"], "cache_read": tokens["cache_read"], "cache_write": tokens["cache_write"]}, "tool_calls": dict(tools), "tool_errors": errors, "tool_retries": retries, "outstanding_tools": outstanding, "blocked_minutes": None, "acceptance": acceptance or [{"status": "unknown", "gap": "no reliable intent evidence"}], "workload_label": "self-reported completion; usage is per root workload" if acceptance and all(x["status"] == "self_reported_complete" for x in acceptance) else "per-root workload"})
+            timing = collect_timing(timing_path, session_ids=set(ids), start_ms=cutoff, end_ms=now_ms, fallback_intervals=native_timing, events=timing_events, read_error=timing_error)
+            reports.append({"root_session": root, "sessions": len(ids), "models_roles": dict(models), "tokens": {"uncached_input": tokens["input"], "output": tokens["output"], "reasoning": tokens["reasoning"], "cache_read": tokens["cache_read"], "cache_write": tokens["cache_write"]}, "tool_calls": dict(tools), "tool_errors": errors, "tool_retries": retries, "outstanding_tools": outstanding, "timing": timing, "blocked_minutes": None, "acceptance": acceptance or [{"status": "unknown", "gap": "no reliable intent evidence"}], "workload_label": "self-reported completion; usage is per root workload" if acceptance and all(x["status"] == "self_reported_complete" for x in acceptance) else "per-root workload"})
         return {"days": days, "cutoff_ms": cutoff, "reports": reports}
     finally:
         conn.close()
@@ -221,6 +251,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  task={task.get('task_id', 'unknown')} checks={task.get('passed_checks', 0)}/{task.get('required_checks', '?')} status={task['status']}")
         for tool in report["outstanding_tools"]:
             print(f"  outstanding {tool['tool']} age-ms={tool['duration_ms']} (not proven blocked)")
+        timing = report.get("timing", {})
+        overall = timing.get("overall", {})
+        print(f"  timing source={timing.get('source', 'unavailable')} overall-ms={overall.get('duration_ms', 'unknown')} status={overall.get('status', 'unknown')}")
+        categories = timing.get("categories", {})
+        if categories:
+            summary = ", ".join(f"{name}={item.get('duration_ms') if item.get('duration_ms') is not None else 'unknown'}ms" for name, item in categories.items())
+            print(f"  timing categories: {summary}")
     return 0
 
 
