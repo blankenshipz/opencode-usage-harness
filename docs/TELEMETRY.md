@@ -294,3 +294,26 @@ agent-submitted outcomes remain self-reported. Optional result `freshness` (`fre
 new evidence versus reused or unrun checks; reused evidence retains its source
 `sourceReceipt` reference and still has to satisfy current artifact identity and acceptance rules.
 Unknown metrics must not become zero in downstream reports or success rates.
+
+
+## Repeated corrections and outcome acceptance
+
+The harness instructions distinguish one-time setup from normal use and ask agents
+to verify the requested action, visible result, exit/stop, and return path where
+relevant. Setup expiry and test shutdown must not accidentally break everyday use.
+Existing safeguards remain applicable; this does not add a universal approval gate.
+
+After two corrections to the same observable behavior, agents should change how
+they verify it before patching again. For layout/navigation work, inspect rendered
+geometry and affected states rather than relying on additional component tests.
+A changed preference updates scope; it is not automatically an implementation
+failure. Keep the same owner and reuse unaffected evidence. When the actual target
+is inaccessible, disclose that limitation and request the specific missing
+observation rather than imply verification or stop all independent work.
+
+Completion reports lead with the user outcome and evidence level. Passing tests,
+player registration, successful builds and healthy HTTP endpoints remain narrower
+checkpoints when the requested journey has not been demonstrated. Check target
+platform and matching backend prerequisites before release builds. These are
+procedural instructions, not a new automatic retry counter, visual evaluator, or
+permission gate; their effectiveness must be assessed against subsequent outcomes.

@@ -2,6 +2,8 @@
 
 ## 0.2.0 — unreleased
 
+- Ground acceptance in normal user journeys, change verification after repeated visible misses, and report remaining acceptance before test counts.
+
 - Preflight build/test disk capacity, expose check preparation and read-only receipt/session health tools, and preserve unknown ownership instead of assuming liveness.
 - Distinguish unmeasured outcome counters from zero and fresh/reused/unrun evidence; guide selective phase handoffs and cheap pre-freeze checks.
 
