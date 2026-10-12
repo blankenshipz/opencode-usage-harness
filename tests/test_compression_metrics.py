@@ -17,3 +17,32 @@ class CompressionMetricsTest(unittest.TestCase):
             self.assertEqual(result['prepared_results'],1)
             self.assertEqual(result['reduced_chars'],7000)
             self.assertEqual(result['invalid_records'],1)
+            self.assertEqual(result['native_original_retrievals'], 0)
+            self.assertEqual(result['diagnostics_status'], 'unavailable')
+            self.assertEqual(result['token_estimate']['status'], 'unavailable')
+
+    def test_aggregates_bounded_metadata_only_diagnostics(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'tool-output-store'; root.mkdir()
+            telemetry = root.parent / 'telemetry'; telemetry.mkdir()
+            records = [
+                {'version': 1, 'type': 'candidate', 'session_id': 's', 'created_ms': 50,
+                 'reason': 'unsupported_tool', 'processing_ms': 4,
+                 'token_estimate': {'status': 'unavailable', 'reason': 'no-model-specific-tokenizer'}},
+                {'version': 1, 'type': 'candidate', 'session_id': 's', 'created_ms': 60,
+                 'reason': 'prepared', 'processing_ms': 6,
+                 'token_estimate': {'status': 'unavailable', 'reason': 'no-model-specific-tokenizer'}},
+                {'version': 1, 'type': 'native_original_retrieval', 'session_id': 's', 'created_ms': 70,
+                 'token_estimate': {'status': 'unavailable', 'reason': 'no-model-specific-tokenizer'}},
+                {'version': 1, 'type': 'candidate', 'session_id': 'other', 'created_ms': 50,
+                 'reason': 'unsupported_tool', 'processing_ms': 9},
+                'not-json',
+            ]
+            (telemetry / 'compression-diagnostics.jsonl').write_text('\n'.join(
+                item if isinstance(item, str) else json.dumps(item) for item in records))
+            result = compression_metrics(root, session_ids={'s'}, cutoff_ms=10, now_ms=100)
+            self.assertEqual(result['skipped_reasons'], {'unsupported_tool': 1})
+            self.assertEqual(result['processing_overhead_ms'], {'total': 10, 'events': 2, 'average': 5})
+            self.assertEqual(result['native_original_retrievals'], 1)
+            self.assertEqual(result['diagnostics_status'], 'observed')
+            self.assertEqual(result['invalid_diagnostic_records'], 1)

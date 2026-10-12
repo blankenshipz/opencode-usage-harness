@@ -1,10 +1,11 @@
-// Lossless model-facing projections. Originals are local history artifacts;
+// Recoverable model-facing projections. Originals are local history artifacts;
 // retrieval uses the native read tool, never a permission-bypassing plugin tool.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { statePath } from './paths.mjs';
 import { compactToolText } from './result-compactor.mjs';
+import { createCompressionDiagnostics } from './compression-diagnostics.mjs';
 
 const digest = text => crypto.createHash('sha256').update(text).digest('hex');
 const key = e => JSON.stringify([e.sessionID, e.messageID, e.id]);
@@ -19,7 +20,10 @@ export function compressionKind(event) {
     const command = event.input?.command;
     // Exact repeats only for an uncomplicated test/build command. Shell scripts,
     // source reads, pipes and redirection are deliberately excluded.
-    return typeof command === 'string' && /^(?:npm (?:test|run (?:test|build|lint|typecheck))|pnpm (?:test|build|lint|typecheck)|bun test|pytest|python3? -m (?:pytest|unittest)|cargo (?:test|check|build)|go test)(?:\s+[\w./=@,:+-]+)*\s*$/.test(command.trim()) ? 'shell' : 'json';
+    if (typeof command !== 'string') return 'json';
+    const trimmed = command.trim();
+    if (/^git diff(?:\s+(?:--[\w-]+(?:=[\w./:@,+-]+)?|[\w./:@,+-]+))*\s*$/.test(trimmed)) return 'diff';
+    return /^(?:npm (?:test|run (?:test|build|lint|typecheck))|pnpm (?:test|build|lint|typecheck)|bun test|pytest|python3? -m (?:pytest|unittest)|cargo (?:test|check|build)|go test)(?:\s+[\w./=@,:+-]+)*\s*$/.test(trimmed) ? 'shell' : 'json';
   }
 }
 
@@ -28,14 +32,19 @@ export function createOutputStore(directory = statePath('tool-output-store'), op
   const maxRecords = options.maxRecords ?? MAX_RECORDS;
   const maxBytes = options.maxBytes ?? MAX_STORE_BYTES;
   const reserveBytes = options.reserveBytes ?? 256 * 1024 * 1024;
-  return async (event, index, original, compacted) => {
+  return async (event, index, original, compacted, onSkip = () => {}) => {
+    const skip = reason => { try { onSkip(reason); } catch {} return undefined; };
     const hash = digest(original);
     const reference = digest(JSON.stringify([event.sessionID, event.messageID, event.id, index, hash]));
     const destination = path.join(directory, reference);
     const chunksPath = path.join(destination, 'chunks.jsonl');
-    const projected = `${compacted.text}\n${marker} ${compacted.strategy}; all values/entries retained. Exact original snapshot: ${path.join(destination, 'original.txt')}. For bounded retrieval use native read on ${chunksPath}, offset=1, limit=3; ignore native read headers and strip each N: line prefix; each stored line is a JSON string, concatenate decoded strings in order. Snapshot is not current source.]`;
+    const preservation = compacted.lossless === false
+      ? 'unchanged context omitted; every file, hunk, and changed line retained; this preview is not an applyable patch.'
+      : 'all values/entries retained.';
+    const projected = `${compacted.text}\n${marker} ${compacted.strategy}; ${preservation} Exact original snapshot: ${path.join(destination, 'original.txt')}. For bounded retrieval use native read on ${chunksPath}, offset=1, limit=3; ignore native read headers and strip each N: line prefix; each stored line is a JSON string, concatenate decoded strings in order. Snapshot is not current source.]`;
     // Include the retrieval instructions in the saving; compression must pay for itself.
-    if (Buffer.byteLength(projected) > 24 * 1024 || projected.split('\n').length > 1500 || original.length - projected.length < 512 || projected.length > original.length * 0.85) return;
+    if (Buffer.byteLength(projected) > 24 * 1024 || projected.split('\n').length > 1500) return skip('projection_over_budget');
+    if (original.length - projected.length < 512 || projected.length > original.length * 0.85) return skip('no_net_saving');
     await io.mkdir(directory, { recursive: true, mode: 0o700 });
     if ((await io.lstat(directory)).isSymbolicLink()) throw new Error('unsafe output store');
     await io.chmod(directory, 0o700);
@@ -43,7 +52,7 @@ export function createOutputStore(directory = statePath('tool-output-store'), op
     const lockPath = path.join(directory, '.writer.lock');
     let lock;
     try { lock = await io.open(lockPath, 'wx', 0o600); }
-    catch (error) { if (error.code === 'EEXIST') return; throw error; }
+    catch (error) { if (error.code === 'EEXIST') return skip('store_busy'); throw error; }
     let temporary;
     try {
       await lock.writeFile(String(process.pid));
@@ -55,11 +64,11 @@ export function createOutputStore(directory = statePath('tool-output-store'), op
         if (saved.digest === hash && saved.projected_chars === projected.length &&
             digest(await io.readFile(path.join(destination, 'original.txt'), 'utf8')) === hash &&
             digest(await io.readFile(chunksPath, 'utf8')) === saved.chunks_digest) return projected;
-        return;
+        return skip('snapshot_conflict');
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       const entries = await io.readdir(directory, { withFileTypes: true });
       const directories = entries.filter(x => x.isDirectory());
-      if (directories.length >= maxRecords) return;
+      if (directories.length >= maxRecords) return skip('store_record_limit');
       let used = 0;
       for (const entry of directories) {
         for (const file of await io.readdir(path.join(directory, entry.name))) {
@@ -80,7 +89,8 @@ export function createOutputStore(directory = statePath('tool-output-store'), op
         strategy: compacted.strategy, digest: hash, chunks_digest: digest(chunkText), original_chars: original.length, projected_chars: projected.length });
       const bytes = Buffer.byteLength(original) + Buffer.byteLength(chunkText) + Buffer.byteLength(metadata);
       const space = await io.statfs(directory);
-      if (used + bytes > maxBytes || space.bavail * space.bsize < reserveBytes + bytes) return;
+      if (used + bytes > maxBytes) return skip('store_byte_limit');
+      if (space.bavail * space.bsize < reserveBytes + bytes) return skip('disk_reserve');
       temporary = await io.mkdtemp(path.join(directory, '.pending-'));
       await io.chmod(temporary, 0o700);
       for (const [name, content] of [['original.txt', original], ['chunks.jsonl', chunkText], ['metadata.json', metadata]]) {
@@ -92,6 +102,7 @@ export function createOutputStore(directory = statePath('tool-output-store'), op
       await io.rename(temporary, destination); temporary = undefined;
       const parent = await io.open(directory, 'r');
       try { await parent.sync(); } finally { await parent.close(); }
+      options.onPublished?.({ sessionID: event.sessionID, chunksPath });
       return projected;
     } finally {
       if (temporary) await io.rm(temporary, { recursive: true, force: true }).catch(() => {});
@@ -100,10 +111,19 @@ export function createOutputStore(directory = statePath('tool-output-store'), op
   };
 }
 
-export async function installContextCompression(ctx, { save = createOutputStore() } = {}) {
+export async function installContextCompression(ctx, options = {}) {
   if (typeof ctx.tool?.hook !== 'function') return () => {}; // Older runtimes retain native output.
+  const diagnostics = options.diagnostics ?? createCompressionDiagnostics();
   const roots = new Map(), mcpNamespaces = new Set();
+  const snapshotDirectory = options.snapshotDirectory ?? (options.save ? undefined : statePath('tool-output-store'));
+  const isSnapshotRead = requested => typeof requested === 'string' && typeof snapshotDirectory === 'string' &&
+    (path.basename(requested) === 'chunks.jsonl' || path.basename(requested) === 'original.txt') &&
+    path.dirname(path.dirname(requested)) === snapshotDirectory && /^[a-f0-9]{64}$/.test(path.basename(path.dirname(requested)));
+  const save = options.save ?? createOutputStore(snapshotDirectory);
   const controller = new AbortController();
+  const observe = event => {
+    try { diagnostics?.record?.(event); } catch { /* Telemetry is never on the result path. */ }
+  };
   // Identify MCP registrations from native namespace metadata, never name guesses.
   if (typeof ctx.mcp?.transform === 'function') {
     await ctx.mcp.transform(editor => {
@@ -127,11 +147,17 @@ export async function installContextCompression(ctx, { save = createOutputStore(
     if (roots.size < 2048) roots.set(id, { tool: event.tool, depth: 1 });
   });
   await ctx.tool.hook('execute.after', async event => {
+    const started = Date.now();
+    let blockStarted = started;
     const id = key(event), current = roots.get(id);
-    if (!current) return;
+    if (event.tool === 'read' && event.status === 'completed' && isSnapshotRead(event.input?.path)) {
+      observe({ type: 'native_original_retrieval', sessionID: event.sessionID });
+    }
+    if (!current) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'missing_root_tracking', processingMs: Date.now() - started }); return; }
     if (--current.depth > 0) return; // CodeMode leaves must keep even fallback text untouched.
     roots.delete(id);
-    if (current.tool !== event.tool || event.status !== 'completed') return;
+    if (current.tool !== event.tool) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'tool_changed', processingMs: Date.now() - started }); return; }
+    if (event.status !== 'completed') { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'not_completed', processingMs: Date.now() - started }); return; }
     try {
       let kind = compressionKind(event);
       if (!kind && mcpNamespaces.size && typeof ctx.tool.list === 'function') {
@@ -142,20 +168,32 @@ export async function installContextCompression(ctx, { save = createOutputStore(
           `${tool.options.namespace}_${tool.name.replace(/[^a-zA-Z0-9_-]/g, '_')}` === event.tool);
         if (nativeMcp) kind = 'json';
       }
-      if (!kind) return;
+      if (!kind) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'unsupported_tool', processingMs: Date.now() - started }); return; }
       const content = event.result.content;
       const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : content;
-      if (!Array.isArray(blocks)) return;
+      if (!Array.isArray(blocks)) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'non_text_content', processingMs: Date.now() - started }); return; }
       const next = [];
       for (let index = 0; index < blocks.length; index++) {
+        if (index > 0) blockStarted = Date.now();
         const block = blocks[index];
-        if (block?.type !== 'text' || typeof block.text !== 'string' || block.text.includes(marker)) { next.push(block); continue; }
+        if (block?.type !== 'text' || typeof block.text !== 'string') { next.push(block); continue; }
+        if (block.text.includes(marker)) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'already_projected', processingMs: Date.now() - blockStarted }); next.push(block); continue; }
+        let excluded;
+        if (block.text.length < 4096) excluded = 'below_minimum';
+        else if (Buffer.byteLength(block.text) > 1024 * 1024) excluded = 'input_over_budget';
+        else if (Buffer.from(block.text,'utf8').toString('utf8') !== block.text) excluded = 'invalid_unicode';
+        if (excluded) { observe({ type:'candidate', sessionID:event.sessionID, reason:excluded, processingMs:Date.now()-blockStarted, originalChars:block.text.length }); next.push(block); continue; }
         const compacted = compactToolText(block.text, kind);
-        const text = compacted && await save(event, index, block.text, compacted);
+        if (!compacted) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'no_useful_projection', processingMs: Date.now() - blockStarted, originalChars: block.text.length }); next.push(block); continue; }
+        let skipReason = 'store_not_published';
+        const text = await save(event, index, block.text, compacted, reason => { skipReason = reason; });
+        if (text) {
+          observe({ type: 'candidate', sessionID: event.sessionID, reason: 'prepared', processingMs: Date.now() - blockStarted, originalChars: block.text.length, projectedChars: text.length, strategy: compacted.strategy });
+        } else observe({ type: 'candidate', sessionID: event.sessionID, reason: skipReason, processingMs: Date.now() - blockStarted, originalChars: block.text.length, strategy: compacted.strategy });
         next.push(text ? { ...block, text } : block);
       }
       event.result = { ...event.result, content: typeof content === 'string' ? next[0].text : next };
-    } catch { /* Optional optimization fails open to the original result, not to provider fallback. */ }
+    } catch { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'processing_failed', processingMs: Date.now() - blockStarted }); /* Optional optimization fails open to the original result, not to provider fallback. */ }
   });
   return () => { controller.abort(); roots.clear(); };
 }

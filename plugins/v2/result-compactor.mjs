@@ -1,5 +1,6 @@
 // Independent implementation inspired by Headroom's conservative compression and
 // recoverable originals. See NOTICE for pinned upstream references. No inference.
+import { previewDiff } from './diff-preview.mjs';
 const MAX_BYTES = 1024 * 1024;
 const useful = (before, after) => before.length - after.length >= 512 && after.length <= before.length * 0.85;
 
@@ -90,8 +91,9 @@ function pathPrefix(text) {
 }
 
 export function compactToolText(text, kind) {
-  if (typeof text !== 'string' || text.length < 4096 || Buffer.from(text, 'utf8').toString('utf8') !== text || Buffer.byteLength(text) > MAX_BYTES || !['shell', 'grep', 'glob', 'json'].includes(kind)) return undefined;
+  if (typeof text !== 'string' || text.length < 4096 || Buffer.from(text, 'utf8').toString('utf8') !== text || Buffer.byteLength(text) > MAX_BYTES || !['shell', 'grep', 'glob', 'json', 'diff'].includes(kind)) return undefined;
   const candidates = [];
+  if (kind === 'diff') { const preview = previewDiff(text); if (preview) candidates.push(preview); }
   const minified = jsonMinify(text);
   if (minified !== undefined) {
     candidates.push({ text: minified, strategy: 'json-whitespace' });

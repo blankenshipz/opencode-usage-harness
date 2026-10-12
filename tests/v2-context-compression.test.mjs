@@ -7,10 +7,11 @@ import { createOutputStore, installContextCompression, compressionKind } from '.
 import { compactToolText } from '../plugins/v2/result-compactor.mjs';
 const source = JSON.stringify(Array.from({length: 100}, (_, i) => ({very_long_name_for_identifier:i,very_long_name_for_status:'ready'})), null, 2);
 const base = {sessionID:'session',messageID:'message',id:'call',tool:'execute',input:{}};
+const quietDiagnostics={record:()=>{}};
 async function fixture(t, options = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(),'harness-compression-'));
   t.after(()=>fs.rm(directory,{recursive:true,force:true}));
-  const hooks={}; await installContextCompression({tool:{hook:async(name,fn)=>{hooks[name]=fn;}}}, {save:createOutputStore(directory, options)});
+  const hooks={}; await installContextCompression({tool:{hook:async(name,fn)=>{hooks[name]=fn;}}}, {save:createOutputStore(directory, options),diagnostics:quietDiagnostics});
   return {directory,hooks,before:e=>hooks['execute.before'](e),after:e=>hooks['execute.after'](e)};
 }
 test('root projection is persisted only after originals exist; output and metadata unchanged',async t=>{
@@ -44,7 +45,7 @@ test('errors, protected tools, unknown tools and missing before stay unchanged',
 });
 test('storage failure and capacity pressure preserve originals without fallback',async t=>{
  const f=await fixture(t,{maxRecords:0}); const e={...base,status:'completed',result:{content:source}};await f.before(e);await f.after(e);assert.equal(e.result.content,source);
- await installContextCompression({tool:{hook:async(n,fn)=>{f.hooks[n]=fn;}}},{save:async()=>{throw Error('disk unavailable');}});
+ await installContextCompression({tool:{hook:async(n,fn)=>{f.hooks[n]=fn;}}},{save:async()=>{throw Error('disk unavailable');},diagnostics:quietDiagnostics});
  await f.before(e);await f.after(e);assert.equal(e.result.content,source);
 });
 test('serialized chunk lines survive native read line clamps and Unicode boundaries',async t=>{
@@ -57,16 +58,18 @@ test('serialized chunk lines survive native read line clamps and Unicode boundar
 test('only uncomplicated test/build commands get log deduplication',()=>{
  assert.equal(compressionKind({...base,tool:'shell',input:{command:'npm test -- foo'}}),'shell');
  for(const command of ['cat source.ts','npm test; cat file','npm test | cat','npm test > file']) assert.equal(compressionKind({...base,tool:'shell',input:{command}}),'json');
+ assert.equal(compressionKind({...base,tool:'shell',input:{command:'git diff --cached src/app.ts'}}),'diff');
+ for(const command of ['git diff; cat secret', 'git diff | less', 'git diff > patch']) assert.equal(compressionKind({...base,tool:'shell',input:{command}}),'json');
 });
 test('native MCP namespace registrations receive JSON-only projection',async()=>{
- const hooks={}; await installContextCompression({mcp:{transform:async fn=>fn({list:()=>[['example-server',{}]]})},tool:{list:async()=>[{name:'list_records',options:{namespace:'example-server'}}],hook:async(n,fn)=>{hooks[n]=fn;}}},{save:async(_e,_i,_o,c)=>c.text});
+ const hooks={}; await installContextCompression({mcp:{transform:async fn=>fn({list:()=>[['example-server',{}]]})},tool:{list:async()=>[{name:'list_records',options:{namespace:'example-server'}}],hook:async(n,fn)=>{hooks[n]=fn;}}},{save:async(_e,_i,_o,c)=>c.text,diagnostics:quietDiagnostics});
  const e={...base,tool:'example-server_list_records',status:'completed',result:{content:source,output:{unchanged:true}}};
  await hooks['execute.before'](e);await hooks['execute.after'](e);assert.notEqual(e.result.content,source);assert.deepEqual(e.result.output,{unchanged:true});
 });
 test('terminal events release interrupted or declined root tracking',async()=>{
  const hooks={}; let send;
  const ctx={tool:{hook:async(n,fn)=>{hooks[n]=fn;}},event:{subscribe:async function*(){yield await new Promise(resolve=>{send=resolve;});}}};
- const stop=await installContextCompression(ctx,{save:async(_e,_i,_o,c)=>c.text});
+ const stop=await installContextCompression(ctx,{save:async(_e,_i,_o,c)=>c.text,diagnostics:quietDiagnostics});
  await hooks['execute.before'](base);await hooks['execute.before']({...base,tool:'read'});
  send({type:'session.tool.failed',data:{sessionID:base.sessionID,assistantMessageID:base.messageID,id:base.id,executed:false}});
  await new Promise(resolve=>setImmediate(resolve));
@@ -88,7 +91,7 @@ test('directory sync failure never publishes a retrieval marker',async t=>{
 });
 test('late MCP registration is discovered and catalog errors leave results intact',async()=>{
  const hooks={};let catalog=[];
- await installContextCompression({mcp:{transform:async fn=>fn({list:()=>[['late',{}]]})},tool:{list:async()=>{if(!catalog)throw Error('reload');return catalog;},hook:async(n,fn)=>{hooks[n]=fn;}}},{save:async(_e,_i,_o,c)=>c.text});
+ await installContextCompression({mcp:{transform:async fn=>fn({list:()=>[['late',{}]]})},tool:{list:async()=>{if(!catalog)throw Error('reload');return catalog;},hook:async(n,fn)=>{hooks[n]=fn;}}},{save:async(_e,_i,_o,c)=>c.text,diagnostics:quietDiagnostics});
  catalog=[{name:'query',options:{namespace:'late'}}];
  const run=async()=>{const e={...base,tool:'late_query',status:'completed',result:{content:source}};await hooks['execute.before'](e);await hooks['execute.after'](e);return e.result.content;};
  assert.notEqual(await run(),source);catalog=null;assert.equal(await run(),source);
@@ -97,7 +100,7 @@ test('compression is independent of model family, provider metadata and inferenc
  // Synthetic routes verify the shared hook contract, not live provider support.
  const hooks={},ctx={tool:{hook:async(n,fn)=>{hooks[n]=fn;}}};
  for(const name of ['aisdk','provider','auth']) Object.defineProperty(ctx,name,{get(){throw Error('compression must not access inference or authentication');}});
- const stop=await installContextCompression(ctx,{save:async(_e,_i,_o,c)=>c.text});
+ const stop=await installContextCompression(ctx,{save:async(_e,_i,_o,c)=>c.text,diagnostics:quietDiagnostics});
  const projections=[];
  for(const family of ['codex','claude','gemini','local-model','future-family']) {
   const output={original:source},metadata={exit:0};
@@ -110,4 +113,53 @@ test('compression is independent of model family, provider metadata and inferenc
   projections.push(e.result.content);
  }
  assert.equal(new Set(projections).size,1);stop();
+});
+test('diagnostics classify skips and publication without retaining tool text',async()=>{
+ const hooks={}, events=[];
+ await installContextCompression({tool:{hook:async(n,fn)=>{hooks[n]=fn;}}},{save:async(_e,_i,_o,c)=>c.text,diagnostics:{record:event=>events.push(event)}});
+ const prepared={...base,status:'completed',result:{content:source}};
+ await hooks['execute.before'](prepared);await hooks['execute.after'](prepared);
+ const unsupported={...base,id:'read',tool:'read',status:'completed',result:{content:source}};
+ await hooks['execute.before'](unsupported);await hooks['execute.after'](unsupported);
+ const short={...base,id:'short',status:'completed',result:{content:'small'}};
+ await hooks['execute.before'](short);await hooks['execute.after'](short);
+ assert.deepEqual(events.map(x=>x.reason),['prepared','unsupported_tool','below_minimum']);
+ assert.ok(events.every(x=>Number.isInteger(x.processingMs) && !Object.values(x).includes(source)));
+});
+test('observer and diagnostics failures preserve native output',async()=>{
+ const hooks={}, e={...base,status:'completed',result:{content:source}};
+ await installContextCompression({event:{subscribe:async function*(){throw Error('observer unavailable');}},tool:{hook:async(n,fn)=>{hooks[n]=fn;}}},{save:async(_e,_i,_o,c)=>c.text,diagnostics:{record:()=>{throw Error('telemetry unavailable');}}});
+ await hooks['execute.before'](e);await hooks['execute.after'](e);
+ assert.notEqual(e.result.content,source);
+});
+test('native snapshot retrieval is counted without persisting requested paths',async t=>{
+ const directory=await fs.mkdtemp(path.join(os.tmpdir(),'harness-compression-'));t.after(()=>fs.rm(directory,{recursive:true,force:true}));
+ const hooks={}, events=[];
+ const ctx={tool:{hook:async(n,fn)=>{hooks[n]=fn;}}};
+ await installContextCompression(ctx,{save:createOutputStore(directory),snapshotDirectory:directory,diagnostics:{record:event=>events.push(event)}});
+ const e={...base,status:'completed',result:{content:source}};await hooks['execute.before'](e);await hooks['execute.after'](e);
+ const [record]=await fs.readdir(directory);const chunks=path.join(directory,record,'chunks.jsonl');
+ const read={...base,id:'read',tool:'read',input:{path:chunks},status:'completed',result:{content:'native read result'}};
+ await hooks['execute.before'](read);await hooks['execute.after'](read);
+ assert.equal(events.filter(x=>x.type==='native_original_retrieval').length,1);
+ assert.ok(events.every(x=>!JSON.stringify(x).includes(chunks)));
+});
+test('diff preview marker is honest and the saved snapshot remains exact',async t=>{
+ const f=await fixture(t);
+ const hunk=file=>`diff --git a/${file} b/${file}\nindex 123..456 100644\n--- a/${file}\n+++ b/${file}\n@@ -1,101 +1,101 @@\n`+Array.from({length:50},(_,i)=>` unchanged context ${i} that is long enough to omit\n`).join('')+'-old required line\n+new required line\n'+Array.from({length:50},(_,i)=>` unchanged trailing context ${i} that is long enough to omit\n`).join('');
+ const original=hunk('one.txt')+hunk('two.txt');
+ const e={...base,tool:'shell',input:{command:'git diff --cached'},status:'completed',result:{content:original}};
+ await f.before(e);await f.after(e);
+ assert.match(e.result.content,/diff-context-preview; unchanged context omitted; every file, hunk, and changed line retained; this preview is not an applyable patch/);
+ assert.match(e.result.content,/-old required line/);assert.match(e.result.content,/\+new required line/);
+ const [record]=(await fs.readdir(f.directory)).filter(x=>!x.startsWith('.'));
+ assert.equal(await fs.readFile(path.join(f.directory,record,'original.txt'),'utf8'),original);
+});
+test('diagnostics distinguish capacity from unprofitable projections',async t=>{
+ const f=await fixture(t),reasons=[];
+ const original=source,c=compactToolText(source,'json');
+ assert.equal(await createOutputStore(f.directory,{maxRecords:0})(base,0,original,c,r=>reasons.push(r)),undefined);
+ assert.equal(reasons.at(-1),'store_record_limit');
+ assert.equal(await createOutputStore(f.directory)(base,0,original,{...c,text:original},r=>reasons.push(r)),undefined);
+ assert.equal(reasons.at(-1),'no_net_saving');
 });

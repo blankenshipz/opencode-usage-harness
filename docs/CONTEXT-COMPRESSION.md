@@ -37,6 +37,8 @@ Provider-hosted tools that bypass OpenCode's local tool hooks need a separately
 validated integration; shared compression cannot cover that path automatically.
 See the [subscription adapter contract](SUBSCRIPTION-POOLS.md#adapter-contract-before-enabling-a-provider).
 
+See also [compression diagnostics](COMPRESSION-DIAGNOSTICS.md), [passive cache monitoring](CACHE-DRIFT.md), and [conservative diff previews](DIFF-PREVIEWS.md).
+
 ## What it does
 
 - JSON whitespace removal preserves raw numbers, escaped strings and duplicate
@@ -48,6 +50,7 @@ See the [subscription adapter contract](SUBSCRIPTION-POOLS.md#adapter-contract-b
   repeated lines with explicit counts and source line ranges. Distinct errors,
   timestamps, paths and numbers are not normalized. Other shell results and the
   outer CodeMode `execute` result are eligible only for JSON transformations.
+- Large plain Git diffs can omit surplus unchanged context with explicit markers, retaining every file, hunk and change. These are labeled non-applyable previews; originals remain available.
 - Only model-facing text changes. Structured `.output`, metadata/exit status,
   file/image blocks and nested CodeMode fallback text remain native. Direct
   source reads, edits, patches, unknown tools and harness control tools are

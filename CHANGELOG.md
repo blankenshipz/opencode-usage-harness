@@ -2,6 +2,8 @@
 
 ## 0.2.0 — unreleased
 
+- Add compression skip/overhead/retrieval diagnostics, passive prepared-context drift monitoring, and recoverable Git diff previews that preserve every changed line and hunk.
+
 - Specify and regression-test model-family-independent context compression; keep provider admission and token accounting separate.
 
 - Automatically compress eligible new V2 tool results with lossless JSON tables, search prefixes and exact-repeat test logs; retain private originals for bounded native reads, preserve CodeMode values/history/permissions, and expose metadata-only preparation metrics.
