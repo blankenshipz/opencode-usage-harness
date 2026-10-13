@@ -17,7 +17,7 @@ and [help build the next integrations](#contributing).
 Substantial test/build commands can retain private diagnostic receipts and check
 available disk space before starting. Read-only health tools help distinguish
 stalled execution from stale status, without automatically retrying or restarting
-work. See [execution and outcome telemetry](docs/TELEMETRY.md). Repeated handoffs receive [convergence guidance](docs/CONVERGENCE.md), and recorded human-action waits appear in task status so deployment can reach its final user test.
+work. See [execution and outcome telemetry](docs/TELEMETRY.md). Sustained handoffs use native background completion with cooperative work checkpoints. [Convergence guidance](docs/CONVERGENCE.md) tracks reported evidence despite artifact churn, and optional verification-attempt records expose readiness, retained results and expiry before repeating a human/device test.
 
 ## What you get
 
@@ -142,7 +142,7 @@ harness-metrics --days 7 --json
 
 Preserve expensive check output privately with `harness-check --label tests --revision REV -- python3 -m pytest`. Each run keeps separate stdout, stderr and an exit-status receipt. Optional `harness-check --preview RECEIPT --stream stderr` returns a bounded page with exact repeated lines compacted; see [durable diagnostics](docs/TELEMETRY.md#release-gates-and-durable-diagnostics).
 
-Progress guidance separates active execution from verified outcomes. When small work expands, agents revisit the next useful result; follow-up reviews carry existing findings forward and focus on affected changes. These are instructions, not new approval gates or timer-driven model calls.
+Progress guidance separates active execution from verified outcomes. When small work expands, agents revisit the next useful result; follow-up reviews carry existing findings forward and focus on affected changes. Checkpoint reminders are injected on existing primary model requests; they are cooperative guidance, not hard timeouts, new approval gates, or timer-driven model calls.
 
 The database is opened read-only. The public repository includes no database. Historical permission-blocked minutes are unknown, and artifact freshness is not independently verified by the metrics tool. Completed checks are self-reported evidence, not proof of real-world correctness. Tokens are not subscription-dollar prices. For deduplicated completion counts and token totals across legacy logs and the new ledger, see [completion telemetry](docs/TELEMETRY.md).
 

@@ -2,6 +2,9 @@
 
 ## 0.2.0 — unreleased
 
+- Default sustained dispatches to native background completion, inject cooperative 10-minute/30-step checkpoint reminders at existing model boundaries, and support focused continuation targets.
+- Detect repeated continuations despite artifact churn with bounded, self-reported semantic evidence; persist optional human/device verification attempts with readiness, expiry and retained result references.
+
 - Add compression skip/overhead/retrieval diagnostics, passive prepared-context drift monitoring, and recoverable Git diff previews that preserve every changed line and hunk.
 
 - Specify and regression-test model-family-independent context compression; keep provider admission and token accounting separate.

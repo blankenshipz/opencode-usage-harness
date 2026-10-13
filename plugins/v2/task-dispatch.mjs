@@ -1,4 +1,6 @@
-import { observeAdmission, convergenceAdvice, userActions } from './convergence.mjs';
+import { observeAdmission, convergenceAdvice, userActions, recordProgress, normalizeProgressEvidence } from './convergence.mjs';
+import { checkpointSchema, normalizeCheckpoint, beginCheckpoint, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
+import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRegistry, runtimeSessions, runtimeIntentSources, lineage, descendant, overlaps } from './dispatch-registry.mjs';
@@ -37,6 +39,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   requiredCapabilities: { type: 'array', uniqueItems: true, items: { type: 'string', enum: ['shell','edit','delegate'] } },
   writePaths: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1 } },
   sessionID: { type: 'string', minLength: 1 }, model: { type: 'string' }, background: { type: 'boolean' }, refreshIntent: { type: 'boolean' },
+  checkpoint: checkpointSchema,
   recovery: { type: 'object', additionalProperties: false, properties: {
     kind: { type: 'string', enum: ['scope_changed','inputs_changed','authorization_changed'] }, scope: { type: 'string', minLength: 1, maxLength: 160 },
     inputs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 160 } },
@@ -45,7 +48,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
 }, required: ['taskId','workKey','operation','agent','description','prompt','requiredCapabilities'] };
 const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
 const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
-export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, now = Date.now } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -66,11 +69,29 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
     const current = getIntent(state,owner.rootID,owner.taskId);
     if (current && current.revision !== owner.intentRevision) throw new Error('task-intent: assignment superseded by user correction; parent must rebind this child to the current revision');
   }));
+  // Native context is prepared only for primary model steps, not titles/compaction.
+  // Inject a stable reminder on an existing request; never interrupt a tool or
+  // manufacture a request just to observe elapsed time.
+  if (ctx.session?.hook) await ctx.session.hook('context', async event => {
+    const checkpoint = await registry(workspace, async (state, save) => {
+      const owner = state.records.find(r => r.childID === event.sessionID && r.workCheckpoint);
+      if (!owner || !['starting', 'running'].includes(owner.state) ||
+          getIntent(state, owner.rootID, owner.taskId)?.revision !== owner.intentRevision) return;
+      const status = prepareCheckpoint(owner, now());
+      await save();
+      return status;
+    });
+    if (checkpoint?.due && Array.isArray(event.system) && !event.system.some(p => p.text === checkpointReminder)) {
+      event.system.push({ type: 'text', text: checkpointReminder });
+    }
+  });
   await ctx.tool.transform(editor => {
     const native = editor.get('subagent');
     if (!native) throw new Error('task-dispatch: native subagent unavailable');
     const rawExecute = native.execute;
     const dispatch = async (input, context) => {
+      const checkpoint = normalizeCheckpoint(input.checkpoint);
+      if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
       const catalog = await ctx.agent.list(), agents = catalog.data ?? catalog;
@@ -143,6 +164,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         // Assignment binding starts at admission so an accepted child can record checkpoints while
         // its native call is still running. Delivery acknowledgement is tracked separately below.
         Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now() });
+        beginCheckpoint(record, checkpoint, now());
         await save(); return { key,childID:requested,intent,fullIntent,convergence };
       });
       if (admission.existing) return { content:`Existing child ${admission.existing} is still running. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
@@ -153,7 +175,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         const handoff = !admission.intent ? input.prompt : admission.fullIntent
           ? `${renderIntent(admission.intent,input.checkIds)}\n\nWorker assignment:\n${input.prompt}`
           : `${renderIntentReference(admission.intent,input.checkIds)}\n\nNext action:\n${input.prompt}`;
-        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:admission.convergence ? `${handoff}\n\nConvergence advisory: ${admission.convergence.advisory}` : handoff,...(admission.childID?{sessionID:admission.childID}:{}),...(input.model?{model:input.model}:{}),background:input.background??false }, {
+        const boundedHandoff = `${handoff}\n\n${checkpointHandoff(checkpoint)}`;
+        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:admission.convergence ? `${boundedHandoff}\n\nConvergence advisory: ${admission.convergence.advisory}` : boundedHandoff,...(admission.childID?{sessionID:admission.childID}:{}),...(input.model?{model:input.model}:{}),background:backgroundDispatch(input) }, {
           ...context, progress: async progress => {
             if(progress.sessionID) { observed=progress.sessionID;await update({childID:observed,state:'running'}); }
             return visible.native(progress);
@@ -196,7 +219,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
     })});
     editor.add({name:'task_dispatch_status',description:'Read durable child ownership and current active descendants without launching or resuming work. Use after errors and before replacement.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string'}}},execute:async(input,context)=>registry(workspace,async state=>{
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID);
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>({...r,key:undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)}));
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>({...r,key:undefined,workCheckpoint:checkpointStatus(r,now()),verificationAttempt:r.attemptIntentRevision===getIntent(state,rootID,r.taskId)?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)}));
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return s.agent !== 'router' && !descendant(sessions,context.sessionID,s.id); }
@@ -219,7 +242,22 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const busy=state.records.some(r=>r.rootID===rootID&&r.taskId===args.taskId&&(r.inFlight||sessions.some(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID)))));
       if(busy) throw new Error('task-intent: collect active workers before completing the full user outcome');
     }
+    const progressEvidence = normalizeProgressEvidence(args.progressEvidence);
+    // Validate on a copy before accepting/recording an outcome. A rejected outcome
+    // must not advance durable attempt state or semantic progress.
+    const stagedOwner = owner ? structuredClone(owner) : undefined;
+    if (args.attempt !== undefined) {
+      if (!stagedOwner) throw new Error('task-dispatch: verification attempts require a bound worker owner');
+      if (stagedOwner.attemptIntentRevision !== current.revision) delete stagedOwner.verificationAttempt;
+      recordAttempt(stagedOwner, args.attempt, now());
+      stagedOwner.attemptIntentRevision = current.revision;
+    }
     const answer=await run({goal:current.intent.outcome,authorization:current.intent.authorizedEffects.join('; ')||'No external effects authorized',checks:current.intent.checks});
+    if (owner && progressEvidence) recordProgress(owner, progressEvidence);
+    if (owner && args.attempt !== undefined) {
+      owner.verificationAttempt = stagedOwner.verificationAttempt;
+      owner.attemptIntentRevision = stagedOwner.attemptIntentRevision;
+    }
     state.intentEvidence??={};const key=JSON.stringify([rootID,args.taskId]);
     const prior=state.intentEvidence[key];const evidence=prior?.revision===current.revision?prior:{revision:current.revision,checks:{}};
     for(const r of args.results??[]) evidence.checks[r.id]={...r,sessionID:call.sessionID,recordedAt:Date.now(),selfReported:true};

@@ -13,7 +13,7 @@ import { createRegistry } from '../plugins/v2/dispatch-registry.mjs';
 import { createWorkerProgress } from '../plugins/v2/worker-progress.mjs';
 const agents = JSON.parse(fs.readFileSync(new URL('./fixtures/agents.json', import.meta.url)));
 const intent = {outcome:'Working release',target:'Local backend',nonGoals:[],authorizedEffects:['Local changes'],assumptions:[],checks:[{id:'backend',description:'Actual backend check',mode:'local'}],sourceMessageIDs:['msg_user']};
-const base = { intentRevision:1,checkIds:['backend'],taskId:'release',workKey:'backend',operation:'implement',agent:'builder',description:'Fix backend',prompt:'Implement requested backend checks',requiredCapabilities:['edit','shell'],writePaths:['backend'] };
+const base = { background:false,intentRevision:1,checkIds:['backend'],taskId:'release',workKey:'backend',operation:'implement',agent:'builder',description:'Fix backend',prompt:'Implement requested backend checks',requiredCapabilities:['edit','shell'],writePaths:['backend'] };
 async function harness(t, custom) {
  const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'dispatch-test-'));t.after(()=>fsp.rm(dir,{recursive:true,force:true}));
  const sessions=[{id:'root',agent:'router',directory:'/project',active:true}];const calls=[];const tools=new Map();
@@ -296,4 +296,52 @@ test('user actions surface by current task binding and clear on continued checkp
  assert.equal((await read()).userActions[0].nextAction,'Press Play once');
  await h.runtime.outcome({taskId:'release',intentRevision:1,scope:'checkpoint',status:'in_progress'},{sessionID:'ses_1'},async()=> 'recorded');
  assert.deepEqual((await read()).userActions,[]);
+});
+
+test('sustained work defaults to native background and retains ownership on duplicate', async t => {
+ const h=await harness(t);const input={...base,background:undefined,checkpoint:{objective:'Capture the current failure',expectedEvidence:'One retained exception'}};
+ const result=await h.call(input);assert.equal(h.calls[0].background,true);assert.equal(result.metadata.status,'running');
+ assert.match(h.calls[0].prompt,/One retained exception/);
+ await h.call(input);assert.equal(h.calls.length,1);
+ const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].workCheckpoint.preparedSteps,0);
+});
+
+test('context checkpoint is cooperative, durable and excludes unrelated or legacy owners', async t => {
+ const h=await harness(t);const id=(await h.call({...base,background:true})).metadata.sessionID;
+ const context=()=>({sessionID:id,system:[]});
+ for(let n=0;n<29;n++){const e=context();await h.hooks.get('context')(e);assert.equal(e.system.length,0);}
+ const e=context();await h.hooks.get('context')(e);assert.match(e.system[0].text,/Work checkpoint due/);
+ assert.equal(h.calls.length,1);assert.equal(h.sessions.find(s=>s.id===id).active,true);
+ const unrelated={sessionID:'root',system:[]};await h.hooks.get('context')(unrelated);assert.deepEqual(unrelated.system,[]);
+ const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].workCheckpoint.due,true);assert.equal(status.owners[0].workCheckpoint.preparedSteps,30);
+ await h.call({...base,background:true,sessionID:id});const resumed=context();await h.hooks.get('context')(resumed);assert.deepEqual(resumed.system,[]);
+});
+
+test('accepted outcomes record durable semantic evidence; rejected outcomes do not', async t => {
+ const h=await harness(t);await h.call(base);
+ const receipt={taskId:'release',intentRevision:1,scope:'checkpoint',status:'in_progress',progressEvidence:{failureKey:'observer-closed',kind:'reproduced',reference:'receipts/replay-1'}};
+ await assert.rejects(h.runtime.outcome(receipt,{sessionID:'ses_1'},async()=>{throw new Error('receipt rejected');}),/receipt rejected/);
+ let status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].convergence,undefined);
+ await h.runtime.outcome(receipt,{sessionID:'ses_1'},async()=> 'recorded');
+ await h.call({...base,sessionID:'ses_1'});await h.call({...base,sessionID:'ses_1'});
+ status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].convergence,undefined);
+ const third=await h.call({...base,sessionID:'ses_1'});assert.equal(third.metadata.convergence.semanticNoProgressContinuations,2);
+});
+
+test('attempt readiness and capture survive registry reload; invalid outcomes cannot alter them',async t=>{
+ const h=await harness(t);await h.call(base);const now=Date.now();
+ const receipt={taskId:'release',intentRevision:1,scope:'checkpoint',status:'blocked',progressState:'needs_user_action',blocker:{kind:'environment',evidence:'Ready for device action',nextAction:'Press Play once'},attempt:{id:'attempt-1',phase:'ready',expectedSignal:'First receiver event',receipt:'receipts/attempt-1',observedAt:now,expiresAt:now+60000,readiness:{receiver:true,observer:true,recorder:true}}};
+ await h.runtime.outcome(receipt,{sessionID:'ses_1'},async()=> 'recorded');
+ const status=()=>h.call({taskId:'release'},'task_dispatch_status').then(r=>JSON.parse(r.content));
+ assert.equal((await status()).owners[0].verificationAttempt.phase,'ready');
+ const capture={...receipt,status:'in_progress',progressState:'working',blocker:undefined,attempt:{id:'attempt-1',phase:'captured',observedAt:now,evidence:'Event retained'}};
+ await assert.rejects(h.runtime.outcome(capture,{sessionID:'ses_1'},async()=>{throw new Error('failed append');}),/failed append/);
+ assert.equal((await status()).owners[0].verificationAttempt.phase,'ready');
+ await h.runtime.outcome(capture,{sessionID:'ses_1'},async()=> 'recorded');
+ assert.equal((await status()).owners[0].verificationAttempt.phase,'captured');assert.deepEqual((await status()).userActions,[]);
+ await assert.rejects(h.runtime.outcome({...receipt,attempt:{...receipt.attempt,id:'other',readiness:{receiver:true,observer:true,recorder:false}}},{sessionID:'ses_1'},async()=> 'should not record'),/readiness/);
 });
