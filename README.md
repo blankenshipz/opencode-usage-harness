@@ -17,7 +17,7 @@ and [help build the next integrations](#contributing).
 Substantial test/build commands can retain private diagnostic receipts and check
 available disk space before starting. Read-only health tools help distinguish
 stalled execution from stale status, without automatically retrying or restarting
-work. See [execution and outcome telemetry](docs/TELEMETRY.md).
+work. See [execution and outcome telemetry](docs/TELEMETRY.md). Repeated handoffs receive [convergence guidance](docs/CONVERGENCE.md), and recorded human-action waits appear in task status so deployment can reach its final user test.
 
 ## What you get
 

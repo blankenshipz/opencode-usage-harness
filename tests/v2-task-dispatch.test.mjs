@@ -264,3 +264,36 @@ test('worker reasoning and response phases are visible without forwarding conten
  handle.close();const before=updates.length;await emit('session.text.started');assert.equal(updates.length,before);
  tracker.dispose();closed=true;wake?.();
 });
+
+test('convergence advises without blocking, preserves result, ignores polling and resets on receipts', async t => {
+ const h=await harness(t);
+ await h.call(base);
+ await h.call({...base,sessionID:'ses_1'});
+ const third=await h.call({...base,sessionID:'ses_1'});
+ assert.equal(third.metadata.convergence.admissionsWithoutReceiptChange,3);
+ assert.equal(third.content,'OK');
+ assert.match(h.calls.at(-1).prompt,/Convergence advisory/);
+ for(let i=0;i<4;i++) await h.call({taskId:'release'},'task_dispatch_status');
+ let status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].convergence.admissionsWithoutReceiptChange,3);
+ h.sessions.find(s=>s.id==='ses_1').active=true;
+ await h.call(base);
+ assert.equal(h.calls.length,3);
+ h.sessions.find(s=>s.id==='ses_1').active=false;
+ const receipt={taskId:'release',intentRevision:1,scope:'checkpoint',status:'completed',results:[{id:'backend',status:'passed',mode:'local',evidence:'Verified'}]};
+ await h.runtime.outcome(receipt,{sessionID:'ses_1'},async()=> 'recorded');
+ assert.equal((await h.call({...base,sessionID:'ses_1'})).metadata.convergence,undefined);
+ await h.runtime.outcome({...receipt,results:[{...receipt.results[0],evidence:'Same proof reworded'}]},{sessionID:'ses_1'},async()=> 'recorded');
+ await h.call({...base,sessionID:'ses_1'});
+ assert.equal((await h.call({...base,sessionID:'ses_1'})).metadata.convergence.admissionsWithoutReceiptChange,3);
+});
+
+test('user actions surface by current task binding and clear on continued checkpoint',async t=>{
+ const h=await harness(t);await h.call(base);
+ const args={taskId:'release',intentRevision:1,scope:'checkpoint',status:'blocked',progressState:'needs_user_action',blocker:{kind:'environment',evidence:'Device needs physical test',nextAction:'Press Play once'}};
+ await h.runtime.outcome(args,{sessionID:'ses_1'},async()=> 'recorded');
+ const read=async()=>JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ assert.equal((await read()).userActions[0].nextAction,'Press Play once');
+ await h.runtime.outcome({taskId:'release',intentRevision:1,scope:'checkpoint',status:'in_progress'},{sessionID:'ses_1'},async()=> 'recorded');
+ assert.deepEqual((await read()).userActions,[]);
+});

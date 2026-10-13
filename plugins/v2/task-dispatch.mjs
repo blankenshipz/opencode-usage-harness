@@ -1,3 +1,4 @@
+import { observeAdmission, convergenceAdvice, userActions } from './convergence.mjs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRegistry, runtimeSessions, runtimeIntentSources, lineage, descendant, overlaps } from './dispatch-registry.mjs';
@@ -137,11 +138,12 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           if (legacy) throw new Error(`task-dispatch: existing untracked worker ${legacy.id} may own workspace edits; finish or coordinate through its parent before starting another writer. Recovery: ${JSON.stringify(recovery(sessions,legacy.id,context.sessionID,state.records))}`);
         }
         if (!record) { record = { key,rootID,parentID:context.sessionID,taskId:input.taskId,workKey:input.workKey }; state.records.push(record); }
+        const convergence = observeAdmission(record,state,input,rootID);
         const fullIntent = !!intent && (!requested || record.deliveredIntentRevision !== intent.revision || !sameChecks(record.deliveredCheckIds,input.checkIds) || input.refreshIntent === true);
         // Assignment binding starts at admission so an accepted child can record checkpoints while
         // its native call is still running. Delivery acknowledgement is tracked separately below.
         Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now() });
-        await save(); return { key,childID:requested,intent,fullIntent };
+        await save(); return { key,childID:requested,intent,fullIntent,convergence };
       });
       if (admission.existing) return { content:`Existing child ${admission.existing} is still running. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
       const update = async patch => registry(workspace,async(state,save)=> { const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly'); Object.assign(r,patch,{updatedAt:Date.now()});await save(); });
@@ -151,7 +153,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         const handoff = !admission.intent ? input.prompt : admission.fullIntent
           ? `${renderIntent(admission.intent,input.checkIds)}\n\nWorker assignment:\n${input.prompt}`
           : `${renderIntentReference(admission.intent,input.checkIds)}\n\nNext action:\n${input.prompt}`;
-        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:handoff,...(admission.childID?{sessionID:admission.childID}:{}),...(input.model?{model:input.model}:{}),background:input.background??false }, {
+        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:admission.convergence ? `${handoff}\n\nConvergence advisory: ${admission.convergence.advisory}` : handoff,...(admission.childID?{sessionID:admission.childID}:{}),...(input.model?{model:input.model}:{}),background:input.background??false }, {
           ...context, progress: async progress => {
             if(progress.sessionID) { observed=progress.sessionID;await update({childID:observed,state:'running'}); }
             return visible.native(progress);
@@ -166,7 +168,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           return {...result,content:`task-dispatch: native ${denied} recorded. ${denialAdvice(denied)}`,metadata:{...(result?.metadata??{}),denial:{category:denied}}};
         }
         await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null});
-        return result;
+        return admission.convergence ? {...result, metadata:{...(result.metadata ?? {}),convergence:admission.convergence}} : result;
       } catch(error) {
         const denied = admissionDenial(error);
         await update(denied ? {childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null} : {childID:observed,state:observed?'paused':'not_started',inFlight:null});
@@ -194,11 +196,11 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
     })});
     editor.add({name:'task_dispatch_status',description:'Read durable child ownership and current active descendants without launching or resuming work. Use after errors and before replacement.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string'}}},execute:async(input,context)=>registry(workspace,async state=>{
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID);
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>({...r,key:undefined,inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)}));
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>({...r,key:undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)}));
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return s.agent !== 'router' && !descendant(sessions,context.sessionID,s.id); }
-      return {content:JSON.stringify({owners,existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
+      return {content:JSON.stringify({owners,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
     })});
   });
   return { dispose: () => workerProgress.dispose(), outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
@@ -221,6 +223,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
     state.intentEvidence??={};const key=JSON.stringify([rootID,args.taskId]);
     const prior=state.intentEvidence[key];const evidence=prior?.revision===current.revision?prior:{revision:current.revision,checks:{}};
     for(const r of args.results??[]) evidence.checks[r.id]={...r,sessionID:call.sessionID,recordedAt:Date.now(),selfReported:true};
+    if (owner) owner.attention = args.progressState === 'needs_user_action' ? {intentRevision:current.revision,progressState:'needs_user_action',nextAction:args.blocker?.nextAction,recordedAt:Date.now(),selfReported:true} : undefined;
     evidence.lastStatus=args.status;evidence.lastScope=args.scope;state.intentEvidence[key]=evidence;await save();return answer;
   })};
 }
