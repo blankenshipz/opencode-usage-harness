@@ -14,11 +14,6 @@ the result; unused quota alone is no reason to manufacture work.
 combining several subscriptions? Explore the [pool planner and architecture](docs/SUBSCRIPTION-POOLS.md)
 and [help build the next integrations](#contributing).
 
-Substantial test/build commands can retain private diagnostic receipts and check
-available disk space before starting. Read-only health tools help distinguish
-stalled execution from stale status, without automatically retrying or restarting
-work. See [execution and outcome telemetry](docs/TELEMETRY.md). Sustained handoffs use native background completion with cooperative work checkpoints. [Convergence guidance](docs/CONVERGENCE.md) tracks reported evidence despite artifact churn, and optional verification-attempt records expose readiness, retained results and expiry before repeating a human/device test.
-
 ## What you get
 
 | For your workflow | What the harness provides |
@@ -31,25 +26,137 @@ work. See [execution and outcome telemetry](docs/TELEMETRY.md). Sustained handof
 | Keep subscription-only inference explicit | ChatGPT OAuth checks, account matching, financial admission checks, and no automatic API-key/provider fallback in the supported profile. |
 | Adopt changes incrementally | An isolated toolkit installer, versioned updates, integrity checks, and code rollback. |
 
-A typical workflow is: **check quota → scout the relevant code → delegate to an
-appropriate specialist → run targeted verification → repair or escalate when the
-evidence warrants it**. The full workflow requires the compatible agent integration;
-installing the standalone tools does not activate it automatically.
+A typical workflow is: **check quota → inspect only the relevant code → route to
+an appropriate specialist → run targeted verification → repair or escalate when
+the evidence warrants it**. A separate scout is useful when discovery is needed,
+not a required extra agent for every task. The full workflow requires the compatible
+agent integration; installing the standalone tools does not activate it automatically.
 
-## Spend fewer cycles getting to a verified result
+## How model and reasoning selection work
 
-The development branch now applies the configured worker model on continuation,
-preserves explicit overrides, and uses quota pace to downshift clearly routine,
-normal-risk work within the same provider. Cumulative work reviews survive
-handoffs; high-context workers can compact in the same session with ownership
-and intent retained. Historical chat copies can point to a canonical continuation
-instead of repeatedly failing cross-parent ownership checks.
+The behavior below describes the current development branch and its compatible
+V2 agent integration, not everything in the v0.1.0 toolkit release.
 
-Shared agent instructions are about 60% smaller. One bounded task goes directly
-to one worker; coordinators and additional review belong where integration or risk
-warrants them. These changes target avoidable cycles, not fewer necessary tests.
-See [usage controls, parameters, and limits](docs/USAGE-CONTROLS.md). No percentage
-reduction in subscription consumption is promised.
+The public profile uses four user-supplied tiers: **FAST, BALANCED, STRONG and
+MAXIMUM**. Each maps to an actual `openai/<model-id>#<variant>` reference discovered
+in your account's catalog. The variant selects the reasoning effort supported by
+that model. The harness does not assume particular model names, a universal effort
+ladder, or that API prices describe subscription consumption.
+
+The generated profile in [configure.py](configure.py) maps roles as follows:
+
+| Agent | Configured tier | Intended work and capabilities |
+|---|---|---|
+| `router` | STRONG | Own the goal, choose workers, integrate evidence; no shell or edits. |
+| `coordinator` | BALANCED | Coordinate multiple sustained lanes through terminal workers; no shell or edits. |
+| `scout` | FAST | Focused repository exploration and summaries; no shell, edits or delegation. |
+| `quick-builder` | FAST | Mechanical fixes, small localized changes and straightforward tests. |
+| `builder` | BALANCED | Ordinary implementation and feature work. |
+| `deep-debugger` | STRONG | Ambiguous failures and difficult debugging. |
+| `architect` | STRONG | Design and consequential analysis; no shell or edits. |
+| `reviewer` | STRONG | Correctness, regression and risk review; no shell or edits. |
+| `maximum` | MAXIMUM | Exceptional problems where the expected quality improvement justifies the capacity. |
+
+Only the router and coordinator delegate; other roles are terminal workers.
+Shell-capable roles still obey native command permissions. Assign executable checks
+to a capable worker rather than expecting a read-only reviewer to run them.
+
+**Selection is task → role → configured model and effort.** The parent is instructed
+to choose the smallest capable worker, accounting for complexity, risk, prior
+verification and quota pressure. One bounded task normally goes directly from the
+router to one worker. A coordinator or independent review is justified by the task,
+not added automatically. Passing, sufficient verification is a reason to stop;
+uncertainty alone is not a reason to escalate.
+
+By default, every role sharing a tier also shares its configured reasoning variant.
+There is no automatic low/medium/high effort optimizer or measured price ranking.
+Customize role references explicitly when different efforts are appropriate. The
+public generator selects STRONG for the router; it does not dynamically demote the
+primary router. An existing private profile may have different role assignments.
+
+Every admitted worker dispatch, including a continuation, passes the effective
+model reference to OpenCode so an old child does not silently retain an obsolete
+model. An explicit dispatch `model` override persists for that work key;
+`resetModel: true` returns to configured selection. A UI model change observed
+after a known harness selection is also preserved. Legacy children have no override
+provenance: their next dispatch adopts the configured role unless an explicit
+model is supplied. This does not change inference already running. Dispatch status
+shows configured, selected and previously observed models; completed-response
+telemetry is the evidence for what actually ran.
+
+### Quota pacing and the automatic adjustment
+
+`codex-quota` reads actual reported allowance windows through Codex's app-server.
+For each usable window, it calculates elapsed fraction from its duration and reset
+time, then `pace_delta = used_percent - elapsed_fraction × 100`. Missing windows
+stay unknown; neither a weekly nor a short window is assumed to exist.
+
+At meaningful dispatch boundaries, the parent supplies task complexity and risk.
+The routing quota read is cached for 30 seconds, and telemetry older than two minutes
+is unsuitable for selection. **If any usable window is more than ten percentage
+points ahead of pace, or has at most 10% remaining**, an explicitly routine,
+normal-risk `builder` or `deep-debugger` dispatch can use the configured
+`quick-builder` model and variant within the same provider. This is a specific
+role substitution, not a general one-rung search across all tiers. The worker keeps
+its original role, permissions and ownership.
+
+High-risk work, explicit overrides and other roles are not automatically demoted.
+Absent routing classification or usable telemetry retains configured selection;
+the independent financial guard still blocks inference when admission cannot be
+established. Behind-pace capacity does not automatically promote a model, launch a
+review or generate work. The parent may choose stronger reasoning or useful extra
+verification when justified. The objective is useful prepaid capacity, not token
+burn or a guaranteed 97–100% utilization target.
+
+## Usage optimizations and their limits
+
+These controls work together; some are automatic middleware, some are dispatch
+rules, and others are instructions for the agent. None establishes a hard spending
+ceiling or a promised percentage saving.
+
+| Optimization | Behavior and limits |
+|---|---|
+| **Short instructions and focused handoffs** | Shared instruction sections are about 60% smaller than the preceding revision. Revisioned task intent carries the goal, authorization and checks; handoffs add bounded objectives, files and evidence. Agents are instructed to batch bookkeeping at meaningful transitions rather than repeat raw context. |
+| **Large-file read control** | The guard blocks broad reads over the 350-line threshold while allowing targeted ranges. A focused smaller worker can return a summary; terminal workers cannot recursively delegate. An eligible writer can request a reasoned one-use direct-read exception. Agents are told not to page through a whole file to evade the guard; ordinary permissions still apply. |
+| **Recoverable tool-result compression** | Automatic V2 middleware compacts eligible new JSON, rectangular arrays and plain search listings, collapses exact consecutive repetitions in recognized test/build logs, and shortens unchanged Git diff context. Every JSON row/value and every diff change remains represented. It adds no inference call. |
+| **Exact originals on demand** | A profitable projection is published only after its exact original is stored privately. Retrieval uses bounded native reads under existing permissions. Source reads, edits, patches, unknown tools and nested CodeMode fallback text are not rewritten. Malformed, oversized or unprofitable results pass through. A snapshot is not proof of current file contents. |
+| **Stable history and cache diagnostics** | Tool compression happens once on new results, without repeatedly rewriting history. Passive cache monitoring observes instruction/tool/early-message changes and reported cache-token counters. It does not alter cache headers, guarantee cache hits or perform inference. |
+| **Selective conversation compaction** | High context produces an advisory. The parent can request native same-session compaction at an idle checkpoint with no active descendants, keeping ownership and refreshing intent afterward. Continuation waits for the matching durable outcome. This is opt-in, can consume included inference and does not clone the worker. |
+| **Same-worker resumption** | Stable task/work keys and ownership reuse the existing child instead of launching replacements. Revision and assigned-check bindings help prevent stale scope from carrying forward. Explicitly marked historical copies point to the canonical chat and cannot start competing inference; old copies are not automatically discovered or merged. |
+| **Bounded work and cumulative review** | A cooperative reminder after ten minutes or 30 prepared model steps asks for evidence and a next action; it does not cancel tools. At the next idle admission, 120 steps/six continuations per lane or 240 steps/12 continuations across the root task require an agent-supplied evidence-backed reassessment. Totals survive handoffs; this is not a new human approval gate. |
+| **Repeated-work detection** | Two continuations without new reported progress produce a convergence advisory. Changed wording, timestamps or artifact churn alone do not count as progress. Evidence remains self-reported and must be checked; the advisory is not an automatic stop or extra review call. |
+| **Verification reuse and retained diagnostics** | Instructions favor targeted checks, reuse of unaffected passing evidence and follow-up reviews of changed findings. Substantial checks retain stdout, stderr, exit status and revision in private receipts, with bounded previews and disk-space checks. Necessary tests still run; avoiding quota is not a reason to skip requested validation. |
+| **Useful human/device attempts** | Optional verification records retain readiness, expected signal, result references and expiry so agents inspect prior evidence before asking for another live test. They do not verify a physical device themselves or turn expiry into an automatic retry. |
+| **Background completion and health visibility** | Sustained implementation, coordination and deployment default to native background work; completion resumes the parent. Guidance discourages polling and duplicate workers. Read-only health/status tools help distinguish stale status from execution; they do not automatically retry or restart services. |
+
+Compression only considers results from 4,096 characters up to 1 MiB and requires
+at least 512 characters and 15% savings, including retrieval instructions. The
+private original store is bounded; once full, new results pass through instead of
+evicting evidence. These are character reductions, not measured subscription-token
+savings. Provider-hosted tools and background completion results are not covered
+by this local compression hook.
+
+For operational details, see [routing, review thresholds and compaction](docs/USAGE-CONTROLS.md),
+[compression and retrieval](docs/CONTEXT-COMPRESSION.md),
+[diff previews](docs/DIFF-PREVIEWS.md), [compression diagnostics](docs/COMPRESSION-DIAGNOSTICS.md),
+[cache monitoring](docs/CACHE-DRIFT.md), [convergence and live attempts](docs/CONVERGENCE.md),
+and [execution, receipts and outcome telemetry](docs/TELEMETRY.md).
+
+### Measure outcomes, not just smaller prompts
+
+Use `harness-metrics` to compare completed work, reported acceptance, retries,
+observed execution time, input/output/cache tokens, compression characters and
+cache-drift observations. Compare those with actual quota deltas during ordinary
+work. Account-wide allowance can also be consumed by other Codex clients, cached
+tokens are not free by assumption, and model names do not establish cost. Retained
+receipts and tests support acceptance; metric counts alone do not prove correctness
+or savings.
+
+The supported profile keeps OpenAI-only access, ChatGPT OAuth/account checks and
+financial admission separate from optimization. Quota pressure never authorizes
+purchased credits, API-key inference or an automatic paid/provider fallback.
+Compression and context diagnostics are model-family-neutral middleware; that does
+not mean other subscription providers are enabled or validated today.
 
 ## What works today
 
