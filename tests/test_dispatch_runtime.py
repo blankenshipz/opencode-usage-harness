@@ -39,6 +39,19 @@ class DispatchRuntimeTest(unittest.TestCase):
             connection.execute("update session_v2 set time_suspended=123")
         self.assertTrue(sessions(db_path=db)[0]["active"])
 
+    def test_runtime_projection_retains_only_model_context_and_canonical_identity(self):
+        db = self.fixture()
+        with sqlite3.connect(db) as connection:
+            connection.execute("alter table session_v2 add column model text")
+            connection.execute("alter table session_v2 add column metadata text")
+            connection.execute("update session_v2 set model=?,metadata=?", (json.dumps({"id":"balanced","providerID":"demo","variant":"medium","private":"SECRET"}), json.dumps({"private":"SECRET","harnessMigration":{"historical":True,"canonicalSessionID":"original"}})))
+            connection.execute("insert into session_message values ('assistant','root','assistant',3,?)", (json.dumps({"tokens":{"input":200,"cache":{"read":120000}},"content":[{"type":"text","text":"SECRET"}]}),))
+        result = sessions(db_path=db)[0]
+        self.assertEqual(result["model"], {"id":"balanced","providerID":"demo","variant":"medium"})
+        self.assertEqual(result["contextTokens"], 120200)
+        self.assertEqual(result["canonicalSessionID"], "original")
+        self.assertNotIn("SECRET", json.dumps(result))
+
     def test_defaults_are_state_dir_and_database_is_required(self):
         with patch.dict(os.environ, {"HARNESS_STATE_DIR": "/tmp/harness-state"}, clear=True):
             self.assertEqual(state_dir(), Path("/tmp/harness-state"))

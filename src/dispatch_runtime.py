@@ -43,12 +43,37 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
     # Pinned V2 contract: claim() sets this historically named column; release()
     # clears it. Non-null means claimed execution, not proof of useful progress.
     with _connect(db_path) as connection:
-        return [
-            {"id": row[0], "parentID": row[1], "agent": row[2], "directory": row[3], "active": row[4] is not None, "created": row[5]}
-            for row in connection.execute(
-                "SELECT id,parent_id,agent,directory,time_suspended,time_created,title FROM session_v2"
-            )
-        ]
+        columns = {r[1] for r in connection.execute("pragma table_info(session_v2)")}
+        extra = ",model" if "model" in columns else ",null"
+        extra += ",metadata" if "metadata" in columns else ",null"
+        rows = []
+        for row in connection.execute("SELECT id,parent_id,agent,directory,time_suspended,time_created" + extra + " FROM session_v2"):
+            item = {"id": row[0], "parentID": row[1], "agent": row[2], "directory": row[3], "active": row[4] is not None, "created": row[5]}
+            try:
+                model = json.loads(row[6] or "null")
+                if isinstance(model, dict):
+                    item["model"] = {k: model[k] for k in ("id", "providerID", "variant") if isinstance(model.get(k), str)}
+                metadata = json.loads(row[7] or "{}")
+                migration = metadata.get("harnessMigration", {})
+                if migration.get("historical") is True and isinstance(migration.get("canonicalSessionID"), str):
+                    item["canonicalSessionID"] = migration["canonicalSessionID"]
+            except (ValueError, TypeError, AttributeError):
+                pass
+            latest = connection.execute("SELECT id,json_extract(data,'$.tokens.input'),json_extract(data,'$.tokens.cache.read') FROM session_message WHERE session_id=? AND type='assistant' ORDER BY seq DESC LIMIT 1", (row[0],)).fetchone()
+            if latest:
+                try:
+                    values = [latest[1] or 0, latest[2] or 0]
+                    if all(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 for v in values):
+                        item["contextTokens"] = sum(values)
+                        item["lastAssistantID"] = latest[0]
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            compact = connection.execute("SELECT id,json_extract(data,'$.status') FROM session_message WHERE session_id=? AND type='compaction' AND json_extract(data,'$.reason')='manual' ORDER BY seq DESC LIMIT 1", (row[0],)).fetchone()
+            if compact and compact[1] in ('running', 'completed', 'failed'):
+                item['lastCompaction'] = {'id': compact[0], 'status': compact[1]}
+            rows.append(item)
+        return rows
+
 
 
 def main(argv: list[str] | None = None) -> int:

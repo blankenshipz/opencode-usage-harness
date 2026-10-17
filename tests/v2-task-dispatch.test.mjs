@@ -345,3 +345,32 @@ test('attempt readiness and capture survive registry reload; invalid outcomes ca
  assert.equal((await status()).owners[0].verificationAttempt.phase,'captured');assert.deepEqual((await status()).userActions,[]);
  await assert.rejects(h.runtime.outcome({...receipt,attempt:{...receipt.attempt,id:'other',readiness:{receiver:true,observer:true,recorder:false}}},{sessionID:'ses_1'},async()=> 'should not record'),/readiness/);
 });
+
+test('dispatch supplies configured model on continuation and preserves explicit override',async t=>{
+ const h=await harness(t);const list=h.ctx.agent.list;h.ctx.agent.list=async()=>({data:(await list()).data.map(a=>a.id==='builder'?{...a,model:{providerID:'demo',id:'balanced',variant:'medium'}}:a)});
+ await h.call({...base,background:false});const id=h.calls[0].sessionID??'ses_1';
+ await h.call({...base,sessionID:id,background:false});assert.equal(h.calls.at(-1).model,'demo/balanced#medium');
+ await h.call({...base,sessionID:id,background:false,model:'demo/strong#high'});
+ await h.call({...base,sessionID:id,background:false});assert.equal(h.calls.at(-1).model,'demo/strong#high');
+});
+test('historical transcript refuses dispatch and model inference with canonical recovery',async t=>{
+ const h=await harness(t);h.sessions[0].canonicalSessionID='canonical';
+ await assert.rejects(h.call(base),/canonical/);assert.equal(h.calls.length,0);
+ await assert.rejects(h.hooks.get('model.request')({sessionID:'root'}),/canonical/);
+});
+test('cumulative review persists across continuations and accepts evidence without human approval',async t=>{
+ const h=await harness(t);await h.call({...base,background:false});
+ await h.registry('/project',async(state,save)=>{state.records[0].workAccounting={preparedSteps:240,continuations:12,reviewBaseline:{preparedSteps:0,continuations:0}};await save();});
+ await assert.rejects(h.call({...base,background:false}),/cumulative work review due/);
+ await h.call({...base,background:false,workReview:{hypothesis:'Repair measured parse failure',evidenceReference:'receipt-parse-1'}});
+ await h.registry('/project',async state=>assert.equal(state.records[0].workAccounting.preparedSteps,240));
+});
+test('native compaction keeps ownership and resets only intent delivery acknowledgement',async t=>{
+ const h=await harness(t);await h.call({...base,background:false});const child=h.sessions.find(s=>s.parentID==='root');child.lastAssistantID='last-message';let compacted;
+ h.ctx.session.compact=async input=>{compacted=input;};
+ const result=await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'Parsing repair verified',expectedEvidence:'receipt-parse-1'}});
+ assert.equal(result.metadata.status,'compacting');assert.equal(compacted.sessionID,child.id);assert.match(compacted.id,/^msg_/);assert.equal(h.calls.length,1);
+ await h.call({...base,sessionID:child.id});assert.equal(h.calls.length,1);
+ child.lastCompaction={id:compacted.id,status:'completed'};child.active=false;await assert.rejects(h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'same',expectedEvidence:'same'}}),/no new observed context/);
+ await h.call({...base,sessionID:child.id,background:false});assert.match(h.calls.at(-1).prompt,/Shared user intent/);
+});

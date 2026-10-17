@@ -2,6 +2,13 @@
 
 ## 0.2.0 — unreleased
 
+- Apply effective configured models on same-child continuations, preserve explicit overrides, and expose routing decisions. Quota pacing downshifts explicitly routine/normal-risk work within the same provider.
+- Retain cumulative per-lane and task work accounting; require evidence-backed reassessment at idle admission without adding human permission gates.
+- Add opt-in native same-session checkpoint compaction and high-context advisories, with full-intent refresh afterward.
+- Reduce shared instruction sections by about 60%; prefer direct bounded delegation and batch bookkeeping.
+- Add a dry-run-first historical-session linking utility with private metadata backups and canonical-session execution guidance. Marked copies cannot dispatch or start model inference through the harness.
+
+
 - Default sustained dispatches to native background completion, inject cooperative 10-minute/30-step checkpoint reminders at existing model boundaries, and support focused continuation targets.
 - Detect repeated continuations despite artifact churn with bounded, self-reported semantic evidence; persist optional human/device verification attempts with readiness, expiry and retained result references.
 

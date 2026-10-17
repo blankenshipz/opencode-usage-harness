@@ -255,6 +255,7 @@ def wrappers(prefix: Path) -> None:
         "codex-quota": 'exec "$base/current/bin/codex-quota" "$@"',
         "harness-check": 'exec "$base/current/bin/harness-check" "$@"',
         "harness-metrics": 'exec "$base/current/bin/harness-metrics" "$@"',
+        "harness-session-link": 'exec "$base/current/bin/harness-session-link" "$@"',
         # Python is used explicitly so a source checkout need not mark install.py
         # executable; this still executes the installed current/install.py.
         "harness-manage": 'exec python3 "$base/current/install.py" --prefix "$base" "$@"',

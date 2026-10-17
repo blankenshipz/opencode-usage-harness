@@ -36,6 +36,21 @@ appropriate specialist → run targeted verification → repair or escalate when
 evidence warrants it**. The full workflow requires the compatible agent integration;
 installing the standalone tools does not activate it automatically.
 
+## Spend fewer cycles getting to a verified result
+
+The development branch now applies the configured worker model on continuation,
+preserves explicit overrides, and uses quota pace to downshift clearly routine,
+normal-risk work within the same provider. Cumulative work reviews survive
+handoffs; high-context workers can compact in the same session with ownership
+and intent retained. Historical chat copies can point to a canonical continuation
+instead of repeatedly failing cross-parent ownership checks.
+
+Shared agent instructions are about 60% smaller. One bounded task goes directly
+to one worker; coordinators and additional review belong where integration or risk
+warrants them. These changes target avoidable cycles, not fewer necessary tests.
+See [usage controls, parameters, and limits](docs/USAGE-CONTROLS.md). No percentage
+reduction in subscription consumption is promised.
+
 ## What works today
 
 This is an **experimental project** extracted from a working private installation.
@@ -79,6 +94,9 @@ The next milestones are:
 - **Add subscription adapters one at a time.** Verify supported authentication,
   model/effort discovery, quota telemetry, and no metered fallback for each provider.
   Claude and other subscriptions are candidates, not currently supported adapters.
+- **Validate usage improvements in ordinary work.** Compare accepted results, cumulative
+  work, effective models, compaction outcomes and actual quota deltas. Model-step
+  thresholds are reassessment points, not hard spending limits.
 - **Measure useful outcomes across pools.** Attribute task results, retries,
   elapsed time, and quota changes without equating token counts to subscription
   dollars. Evaluate independent-provider review where it adds value.

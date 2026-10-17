@@ -1,5 +1,6 @@
+import { readRoutingQuota, selectDispatchModel } from './dispatch-routing.mjs';
 import { observeAdmission, convergenceAdvice, userActions, recordProgress, normalizeProgressEvidence } from './convergence.mjs';
-import { checkpointSchema, normalizeCheckpoint, beginCheckpoint, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
+import { checkpointSchema, normalizeCheckpoint, beginCheckpoint, acknowledgeTaskReview, normalizeReviewAcknowledgement, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -40,6 +41,9 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   writePaths: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1 } },
   sessionID: { type: 'string', minLength: 1 }, model: { type: 'string' }, background: { type: 'boolean' }, refreshIntent: { type: 'boolean' },
   checkpoint: checkpointSchema,
+  compact: {type:'boolean'}, resetModel: {type:'boolean'},
+  workReview: {type:'object',additionalProperties:false,properties:{hypothesis:{type:'string',minLength:1,maxLength:500},evidenceReference:{type:'string',minLength:1,maxLength:500}},required:['hypothesis','evidenceReference']},
+  routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']}},required:['complexity','risk']},
   recovery: { type: 'object', additionalProperties: false, properties: {
     kind: { type: 'string', enum: ['scope_changed','inputs_changed','authorization_changed'] }, scope: { type: 'string', minLength: 1, maxLength: 160 },
     inputs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 160 } },
@@ -48,7 +52,13 @@ const schema = { type: 'object', additionalProperties: false, properties: {
 }, required: ['taskId','workKey','operation','agent','description','prompt','requiredCapabilities'] };
 const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
 const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
-export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, now = Date.now } = {}) {
+export function taskWorkStatus(state,rootID,taskId) {
+  const records=state.records.filter(r=>r.rootID===rootID&&r.taskId===taskId);
+  const totals=records.reduce((a,r)=>({steps:a.steps+(r.workAccounting?.preparedSteps??r.workCheckpoint?.preparedSteps??0),continuations:a.continuations+(r.workAccounting?.continuations??0)}),{steps:0,continuations:0});
+  const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
+  return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
+}
+export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, now = Date.now, loadQuota = readRoutingQuota } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -64,6 +74,9 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
   // A correction parks affected children at their next model request. Already-running tools finish;
   // the parent must explicitly resume that same child against the new revision.
   if (ctx.session?.hook) await ctx.session.hook('model.request', async event => registry(workspace, async state => {
+    const sessions=await loadSessions();
+    const historical=sessions.find(s=>s.id===event.sessionID)?.canonicalSessionID;
+    if (historical) throw new Error(`Historical transcript only: continue canonical session ${historical}; no inference admitted for this copy.`);
     const owner = state.records.find(r => r.childID === event.sessionID && r.intentRevision);
     if (!owner) return;
     const current = getIntent(state,owner.rootID,owner.taskId);
@@ -91,6 +104,12 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
     const rawExecute = native.execute;
     const dispatch = async (input, context) => {
       const checkpoint = normalizeCheckpoint(input.checkpoint);
+      const review = input.workReview === undefined ? undefined : normalizeReviewAcknowledgement(input.workReview);
+      if (input.compact !== undefined && typeof input.compact !== 'boolean') throw new Error('task-dispatch: invalid compact');
+      if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk))) throw new Error('task-dispatch: invalid routing assessment');
+      // Optional planning telemetry never substitutes for mandatory financial admission.
+      let quota;
+      if (input.routing) { try { quota = await loadQuota(); } catch { /* unknown pace: retain configured model; guard still fails closed */ } }
       if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
@@ -109,6 +128,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const writes = paths(input, agent), token = crypto.randomUUID();
       const admission = await registry(workspace, async (state, save) => {
         const sessions = await loadSessions(), rootID = lineage(sessions,context.sessionID);
+        const historical=sessions.find(s=>s.id===context.sessionID)?.canonicalSessionID ?? sessions.find(s=>s.id===rootID)?.canonicalSessionID;
+        if (historical) throw new Error(`task-dispatch: historical transcript only; continue canonical session ${historical}. Do not adopt workers or retry in this copy.`);
         const key = `${rootID}\0${input.taskId}\0${input.workKey}`;
         let record = state.records.find(r => r.key === key);
         if (record?.inFlight && record.ownerPid !== process.pid) {
@@ -133,6 +154,12 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           const owner = state.records.find(r => r.childID === requested);
           if (owner && owner.key !== key) throw new Error(`task-dispatch: child belongs to taskId ${owner.taskId}, workKey ${owner.workKey}; retain that ownership identity`);
           if (record?.childID && record.childID !== requested) throw new Error('task-dispatch: workKey already owns another child; resume that child');
+          if (record?.state === 'compacting') {
+            const settled=child.lastCompaction?.id===record.compactionID && ['completed','failed'].includes(child.lastCompaction.status);
+            if (!settled || child.active) return {existing:requested,compacting:true};
+            record.state='paused';
+            if (child.lastCompaction.status==='failed') record.compactionFailed=true;
+          }
           if (child.active && !input.sessionID) {
             if (intent && record?.intentRevision !== intent.revision) throw new Error(`task-intent: explicitly resume child ${requested} with sessionID and the current revision to deliver the correction`);
             return { existing: requested };
@@ -159,24 +186,48 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           if (legacy) throw new Error(`task-dispatch: existing untracked worker ${legacy.id} may own workspace edits; finish or coordinate through its parent before starting another writer. Recovery: ${JSON.stringify(recovery(sessions,legacy.id,context.sessionID,state.records))}`);
         }
         if (!record) { record = { key,rootID,parentID:context.sessionID,taskId:input.taskId,workKey:input.workKey }; state.records.push(record); }
+        const child = sessions.find(s=>s.id===requested);
+        if ((checkpointStatus(record,now())?.taskReview.due || taskWorkStatus(state,rootID,input.taskId).due) && !review && !child?.active)
+          throw new Error('task-dispatch: cumulative work review due; supply workReview {hypothesis,evidenceReference} from retained results before continuing this same owner. No human permission is required.');
+        if (review) {
+          acknowledgeTaskReview(record,review,now());
+          const total=taskWorkStatus(state,rootID,input.taskId);
+          state.workReviews=(state.workReviews??[]).filter(r=>r.rootID!==rootID||r.taskId!==input.taskId);
+          state.workReviews.push({rootID,taskId:input.taskId,steps:total.steps,continuations:total.continuations,...review,at:now()});
+        }
+        const routing=selectDispatchModel({input,agent,agents,record,child,quota});
+        if (input.compact) {
+          if (!requested || !checkpoint || !ctx.session?.compact) throw new Error('task-dispatch: compaction requires an existing worker, retained checkpoint and supported native compact API');
+          if (sessions.some(s=>s.active&&(s.id===requested||descendant(sessions,s.id,requested)))) throw new Error('task-dispatch: wait for this worker and its descendants before checkpoint compaction');
+          if (!child.lastAssistantID || child.lastAssistantID===record.compactedThrough) throw new Error('task-dispatch: no new observed context to compact');
+        }
+        const contextAdvice=checkpointStatus(record,now(),{knownContext:{tokens:child?.contextTokens}})?.highContext;
+        Object.assign(record,{routing,modelOverride:routing.modelOverride});
         const convergence = observeAdmission(record,state,input,rootID);
         const fullIntent = !!intent && (!requested || record.deliveredIntentRevision !== intent.revision || !sameChecks(record.deliveredCheckIds,input.checkIds) || input.refreshIntent === true);
         // Assignment binding starts at admission so an accepted child can record checkpoints while
         // its native call is still running. Delivery acknowledgement is tracked separately below.
         Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now() });
         beginCheckpoint(record, checkpoint, now());
-        await save(); return { key,childID:requested,intent,fullIntent,convergence };
+        await save(); return { key,childID:requested,intent,fullIntent,convergence,routing,contextAdvice,lastAssistantID:child?.lastAssistantID };
       });
-      if (admission.existing) return { content:`Existing child ${admission.existing} is still running. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
+      if (admission.existing) return { content:`Existing child ${admission.existing} is still running or awaiting its admitted compaction outcome. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
       const update = async patch => registry(workspace,async(state,save)=> { const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly'); Object.assign(r,patch,{updatedAt:Date.now()});await save(); });
       let observed = admission.childID;
       const visible = workerProgress.attach(context.progress ?? (async () => {}));
       try {
+        if (input.compact) {
+          const compactionID='msg_'+crypto.randomUUID().replaceAll('-','');
+          await update({state:'compacting',compactionID});
+          await ctx.session.compact({sessionID:admission.childID,id:compactionID});
+          await update({state:'compacting',inFlight:null,compactedThrough:admission.lastAssistantID,deliveredIntentRevision:undefined,deliveredCheckIds:undefined});
+          return {content:'Native same-session compaction admitted. Wait for idle, then resume this worker; full intent will be refreshed. No replacement worker created.',metadata:{sessionID:admission.childID,status:'compacting'}};
+        }
         const handoff = !admission.intent ? input.prompt : admission.fullIntent
           ? `${renderIntent(admission.intent,input.checkIds)}\n\nWorker assignment:\n${input.prompt}`
           : `${renderIntentReference(admission.intent,input.checkIds)}\n\nNext action:\n${input.prompt}`;
-        const boundedHandoff = `${handoff}\n\n${checkpointHandoff(checkpoint)}`;
-        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:admission.convergence ? `${boundedHandoff}\n\nConvergence advisory: ${admission.convergence.advisory}` : boundedHandoff,...(admission.childID?{sessionID:admission.childID}:{}),...(input.model?{model:input.model}:{}),background:backgroundDispatch(input) }, {
+        const boundedHandoff = `${handoff}\n\n${checkpointHandoff(checkpoint)}${admission.contextAdvice ? "\nHigh context: at the next completed boundary retain a concise checkpoint and ask the parent for same-session compact:true before further work." : ""}`;
+        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:admission.convergence ? `${boundedHandoff}\n\nConvergence advisory: ${admission.convergence.advisory}` : boundedHandoff,...(admission.childID?{sessionID:admission.childID}:{}),...(admission.routing.selected?{model:admission.routing.selected}:{}),background:backgroundDispatch(input) }, {
           ...context, progress: async progress => {
             if(progress.sessionID) { observed=progress.sessionID;await update({childID:observed,state:'running'}); }
             return visible.native(progress);
@@ -191,7 +242,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           return {...result,content:`task-dispatch: native ${denied} recorded. ${denialAdvice(denied)}`,metadata:{...(result?.metadata??{}),denial:{category:denied}}};
         }
         await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null});
-        return admission.convergence ? {...result, metadata:{...(result.metadata ?? {}),convergence:admission.convergence}} : result;
+        return {...result, metadata:{...(result.metadata ?? {}),routing:admission.routing,...(admission.contextAdvice?{contextAdvice:admission.contextAdvice}:{}),...(admission.convergence?{convergence:admission.convergence}:{})}};
       } catch(error) {
         const denied = admissionDenial(error);
         await update(denied ? {childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null} : {childID:observed,state:observed?'paused':'not_started',inFlight:null});
@@ -223,7 +274,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return s.agent !== 'router' && !descendant(sessions,context.sessionID,s.id); }
-      return {content:JSON.stringify({owners,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
+      return {content:JSON.stringify({owners,taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
     })});
   });
   return { dispose: () => workerProgress.dispose(), outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
