@@ -14,6 +14,22 @@ import { createWorkerProgress } from '../plugins/v2/worker-progress.mjs';
 const agents = JSON.parse(fs.readFileSync(new URL('./fixtures/agents.json', import.meta.url)));
 const intent = {outcome:'Working release',target:'Local backend',nonGoals:[],authorizedEffects:['Local changes'],assumptions:[],checks:[{id:'backend',description:'Actual backend check',mode:'local'}],sourceMessageIDs:['msg_user']};
 const base = { background:false,intentRevision:1,checkIds:['backend'],taskId:'release',workKey:'backend',operation:'implement',agent:'builder',description:'Fix backend',prompt:'Implement requested backend checks',requiredCapabilities:['edit','shell'],writePaths:['backend'] };
+test('status neither reconciles nor delivers or exposes another root recovery',async t=>{
+ const h=await harness(t);
+ const {quotaRecoveryReceipt,enqueueQuotaRecovery}=await import('../plugins/v2/quota-recovery.mjs');
+ h.sessions.push({id:'other-root',agent:'router',directory:'/project',active:false},
+  {id:'other-child',parentID:'other-root',agent:'builder',directory:'/project',active:false,lastCompaction:{id:'msg_other_compact',status:'completed'}});
+ const error=Object.assign(new Error('fixture'),{code:'SUBSCRIPTION_QUOTA_CHECK_FAILED',quota:{category:'telemetry_failure'},detail:{reason:'timeout'}});
+ await h.registry('/project',async(state,save)=>{
+  state.records.push({key:'other',rootID:'other-root',parentID:'other-root',childID:'other-child',taskId:'other-task',workKey:'other',state:'compacting',compactionID:'msg_other_compact',admissionGeneration:1});
+  enqueueQuotaRecovery(state,quotaRecoveryReceipt({error,parentID:'other-root',childID:'other-child',generation:1}));await save();
+ });
+ const notices=[];h.ctx.session.synthetic=async input=>notices.push(input);
+ const status=JSON.parse((await h.call({},'task_dispatch_status')).content);
+ assert.equal(notices.length,0);assert.deepEqual(status.quotaRecoveryPending,[]);
+ assert.equal(JSON.stringify(status).includes('other-child'),false);
+ await h.registry('/project',async state=>{const other=state.records.find(r=>r.key==='other');assert.equal(other.state,'compacting');assert.equal(other.compactionOutcome,undefined);assert.equal(state.quotaRecoveryOutbox[0].deliveredAt,undefined);});
+});
 async function harness(t, custom) {
  const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'dispatch-test-'));t.after(()=>fsp.rm(dir,{recursive:true,force:true}));
  const sessions=[{id:'root',agent:'router',directory:'/project',active:true}];const calls=[];const tools=new Map();
@@ -373,4 +389,33 @@ test('native compaction keeps ownership and resets only intent delivery acknowle
  await h.call({...base,sessionID:child.id});assert.equal(h.calls.length,1);
  child.lastCompaction={id:compacted.id,status:'completed'};child.active=false;await assert.rejects(h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'same',expectedEvidence:'same'}}),/no new observed context/);
  await h.call({...base,sessionID:child.id,background:false});assert.match(h.calls.at(-1).prompt,/Shared user intent/);
+});
+test('compaction reconciliation is generation-scoped and status only records the matching native outcome',async t=>{
+ const h=await harness(t);await h.call({...base,background:false});const child=h.sessions.find(s=>s.parentID==='root');let requested=[];
+ child.lastAssistantID='assistant-a';h.ctx.session.compact=async input=>requested.push(input);
+ await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'A',expectedEvidence:'receipt-a'}});
+ const [a]=requested;child.lastCompaction={id:'other-generation',status:'completed'};
+ let status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].state,'compacting');assert.equal(status.owners[0].compactionOutcome,undefined);assert.equal(h.calls.length,1);
+ child.lastCompaction={id:a.id,status:'failed'};
+ status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].state,'awaiting_recovery');assert.equal(status.owners[0].compactionOutcome.status,'failed');assert.deepEqual(status.owners[0].continuationOwner,{parentID:'root',childID:child.id,action:'recover_same_child'});assert.equal(h.calls.length,1);
+ child.lastAssistantID='assistant-b';await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'B',expectedEvidence:'receipt-b'}});
+ const b=requested.at(-1);assert.notEqual(a.id,b.id);child.lastCompaction={id:b.id,status:'completed'};
+ status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].compactionOutcome.id,b.id);assert.equal(status.owners[0].compactionOutcome.status,'completed');assert.deepEqual(status.owners[0].compactionHistory.map(x=>[x.id,x.status]),[[a.id,'failed'],[b.id,'completed']]);assert.equal('compactionFailed' in status.owners[0],false);assert.equal(h.calls.length,1);
+});
+test('matching compaction outcome survives plugin restart with the same continuation owner',async t=>{
+ const h=await harness(t);await h.call({...base,background:false});const child=h.sessions.find(s=>s.parentID==='root');child.lastAssistantID='assistant-a';let compacted;
+ h.ctx.session.compact=async input=>{compacted=input;};await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'A',expectedEvidence:'receipt-a'}});
+ child.lastCompaction={id:compacted.id,status:'completed'};
+ const recreated=new Map([['subagent',{...h.rawNative}]]);
+ await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:tool=>recreated.set(tool.name,tool)})}},{registry:createRegistry(h.dir),loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
+ const status=JSON.parse((await recreated.get('task_dispatch_status').execute({taskId:'release'},{sessionID:'root'})).content);
+ assert.equal(status.owners[0].state,'awaiting_continuation');assert.equal(status.owners[0].compactionOutcome.id,compacted.id);assert.deepEqual(status.owners[0].continuationOwner,{parentID:'root',childID:child.id,action:'resume_same_child'});assert.equal(h.calls.length,1);
+});
+test('status distinguishes an idle native worker from stale recorded running work without completing it',async t=>{
+ const h=await harness(t);const result=await h.call({...base,background:true});const child=h.sessions.find(s=>s.id===result.metadata.sessionID);child.active=false;child.lastIdleOutcome='succeeded';
+ const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];
+ assert.equal(status.recordedState,'running');assert.equal(status.effectiveState,'awaiting_result_collection');assert.deepEqual(status.nativeExecution,{active:false,lastIdleOutcome:'succeeded'});assert.equal(h.calls.length,1);
 });

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — recovery correctness
+
+- Bind compaction outcomes to their native ID, preserve failure history, and
+  expose continuation ownership and observed native activity separately.
+- Persist sanitized quota-recovery notifications without retrying inference or
+  relaxing admission; retain pending delivery across failures.
+- Stage a version-specific native child-result boundary repair separately from
+  plugins; runtime installation remains an explicit deployment step.
+- Exercise real installed entry points and generated config/launchers offline,
+  detect provenance drift and missing dependencies, and include integrations in
+  the installer payload.
+
 ## 0.2.0 — unreleased
 
 - Apply effective configured models on same-child continuations, preserve explicit overrides, and expose routing decisions. Quota pacing downshifts explicitly routine/normal-risk work within the same provider.

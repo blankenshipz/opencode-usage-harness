@@ -9,6 +9,7 @@ import { intentSchema, getIntent, setIntent, bindIntent, renderIntent, renderInt
 import { packageRoot } from './paths.mjs';
 import { createWorkerProgress } from './worker-progress.mjs';
 import { admissionDenial, denialAdvice, receipt, suppression } from './denial-recovery.mjs';
+import { quotaRecoveryReceipt, enqueueQuotaRecovery, deliverQuotaRecovery, pendingQuotaRecovery, quotaRecoverySyntheticInput } from './quota-recovery.mjs';
 // Eligibility is not a permission grant: the native executor still owns authorization and depth.
 export function hasCapability(agent, capability) {
   const rules = agent.permissions ?? [], action = capability === 'delegate' ? 'subagent' : capability;
@@ -52,6 +53,36 @@ const schema = { type: 'object', additionalProperties: false, properties: {
 }, required: ['taskId','workKey','operation','agent','description','prompt','requiredCapabilities'] };
 const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
 const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
+// Native runtime data only exposes the latest compaction.  Keep each observed
+// terminal generation separately so a prior failure cannot describe a later
+// successful request, and never infer an outcome from a different native ID.
+function reconcileCompaction(record, child, now) {
+  if (!record) return false;
+  let changed = false;
+  if ('compactionFailed' in record) {
+    // Older records did not retain a native generation. Preserve that limited
+    // fact without allowing it to describe the current generation.
+    if (record.compactionFailed === true && !(record.legacyCompactionHistory ?? []).some(item => item.status === 'failed'))
+      (record.legacyCompactionHistory ??= []).push({ status:'failed', legacy:true });
+    delete record.compactionFailed;
+    changed = true;
+  }
+  const native = child?.lastCompaction, id = record?.compactionID;
+  if (!id || native?.id !== id || !['completed','failed'].includes(native.status)) return changed;
+  const outcome = { id, status:native.status, observedAt:now() };
+  if (record.compactionOutcome?.id !== id || record.compactionOutcome.status !== native.status) {
+    record.compactionOutcome = outcome;
+    const history = record.compactionHistory ??= [];
+    if (!history.some(item => item.id === id)) history.push(outcome);
+    changed = true;
+  }
+  if (!child.active && record.state === 'compacting') {
+    record.state = native.status === 'failed' ? 'awaiting_recovery' : 'awaiting_continuation';
+    record.continuationOwner = { parentID:record.parentID, childID:record.childID };
+    changed = true;
+  }
+  return changed;
+}
 export function taskWorkStatus(state,rootID,taskId) {
   const records=state.records.filter(r=>r.rootID===rootID&&r.taskId===taskId);
   const totals=records.reduce((a,r)=>({steps:a.steps+(r.workAccounting?.preparedSteps??r.workCheckpoint?.preparedSteps??0),continuations:a.continuations+(r.workAccounting?.continuations??0)}),{steps:0,continuations:0});
@@ -62,6 +93,24 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
+  const quotaNotifier = async notice => {
+    if (typeof ctx.session?.synthetic !== 'function') throw new Error('task-dispatch: synthetic notification unavailable');
+    await ctx.session.synthetic(quotaRecoverySyntheticInput(notice));
+  };
+  const queueQuotaRecovery = async ({ error, parentID, childID, generation, requestKind, compactionID }) => {
+    const recorded = await registry(workspace,async(state,save) => {
+      const receipt = quotaRecoveryReceipt({error,parentID,childID,generation,requestKind,compactionID,now});
+      if (!receipt) return;
+      enqueueQuotaRecovery(state,receipt); await save(); return receipt;
+    });
+    if (!recorded) return;
+    try {
+      await registry(workspace,async(state,save) => {
+        const result = await deliverQuotaRecovery({state,target:recorded.target,notify:quotaNotifier,now});
+        if (result.delivered.length) await save();
+      });
+    } catch { /* durable pending receipt is retried at a later explicit status boundary */ }
+  };
   const paths = (input, agent) => {
     if (input.operation === 'deploy') return ['.'];
     if (input.operation !== 'implement' && !input.requiredCapabilities.includes('edit') && !hasCapability(agent, 'edit')) return [];
@@ -154,11 +203,10 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           const owner = state.records.find(r => r.childID === requested);
           if (owner && owner.key !== key) throw new Error(`task-dispatch: child belongs to taskId ${owner.taskId}, workKey ${owner.workKey}; retain that ownership identity`);
           if (record?.childID && record.childID !== requested) throw new Error('task-dispatch: workKey already owns another child; resume that child');
+          if (reconcileCompaction(record, child, now)) await save();
           if (record?.state === 'compacting') {
-            const settled=child.lastCompaction?.id===record.compactionID && ['completed','failed'].includes(child.lastCompaction.status);
+            const settled=record.compactionOutcome?.id===record.compactionID;
             if (!settled || child.active) return {existing:requested,compacting:true};
-            record.state='paused';
-            if (child.lastCompaction.status==='failed') record.compactionFailed=true;
           }
           if (child.active && !input.sessionID) {
             if (intent && record?.intentRevision !== intent.revision) throw new Error(`task-intent: explicitly resume child ${requested} with sessionID and the current revision to deliver the correction`);
@@ -207,18 +255,20 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         const fullIntent = !!intent && (!requested || record.deliveredIntentRevision !== intent.revision || !sameChecks(record.deliveredCheckIds,input.checkIds) || input.refreshIntent === true);
         // Assignment binding starts at admission so an accepted child can record checkpoints while
         // its native call is still running. Delivery acknowledgement is tracked separately below.
-        Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now() });
+        const generation=(record.admissionGeneration ?? 0)+1;
+        Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now(),admissionGeneration:generation });
         beginCheckpoint(record, checkpoint, now());
-        await save(); return { key,childID:requested,intent,fullIntent,convergence,routing,contextAdvice,lastAssistantID:child?.lastAssistantID };
+        await save(); return { key,childID:requested,intent,fullIntent,convergence,routing,contextAdvice,lastAssistantID:child?.lastAssistantID,generation };
       });
       if (admission.existing) return { content:`Existing child ${admission.existing} is still running or awaiting its admitted compaction outcome. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
       const update = async patch => registry(workspace,async(state,save)=> { const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly'); Object.assign(r,patch,{updatedAt:Date.now()});await save(); });
       let observed = admission.childID;
+      let compactionID;
       const visible = workerProgress.attach(context.progress ?? (async () => {}));
       try {
         if (input.compact) {
-          const compactionID='msg_'+crypto.randomUUID().replaceAll('-','');
-          await update({state:'compacting',compactionID});
+          compactionID='msg_'+crypto.randomUUID().replaceAll('-','');
+          await update({state:'compacting',compactionID,compactionOutcome:undefined,compactionFailed:undefined,continuationOwnerID:admission.childID});
           await ctx.session.compact({sessionID:admission.childID,id:compactionID});
           await update({state:'compacting',inFlight:null,compactedThrough:admission.lastAssistantID,deliveredIntentRevision:undefined,deliveredCheckIds:undefined});
           return {content:'Native same-session compaction admitted. Wait for idle, then resume this worker; full intent will be refreshed. No replacement worker created.',metadata:{sessionID:admission.childID,status:'compacting'}};
@@ -246,6 +296,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       } catch(error) {
         const denied = admissionDenial(error);
         await update(denied ? {childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null} : {childID:observed,state:observed?'paused':'not_started',inFlight:null});
+        try { await queueQuotaRecovery({error,parentID:context.sessionID,childID:observed,generation:admission.generation,requestKind:input.compact?'compaction':'dispatch',compactionID}); } catch { /* recovery reporting cannot replace the native admission failure */ }
         // Preserve original permission/guard error; never retry, change provider, or replace the child here.
         throw error;
       } finally { visible.close(); }
@@ -268,13 +319,25 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const workers=state.records.filter(r=>r.rootID===rootID&&r.taskId===input.taskId).map(r=>({sessionID:r.childID,workKey:r.workKey,revision:r.intentRevision,checkIds:r.checkIds,state:r.state,needsRebind:!!current&&r.intentRevision!==current.revision}));
       return {content:JSON.stringify({current,workers,evidence:(state.intentEvidence??{})[JSON.stringify([rootID,input.taskId])],...(context.sessionID===rootID?{sourceMessageIDs:await loadSources(rootID)}:{})})};
     })});
-    editor.add({name:'task_dispatch_status',description:'Read durable child ownership and current active descendants without launching or resuming work. Use after errors and before replacement.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string'}}},execute:async(input,context)=>registry(workspace,async state=>{
+    editor.add({name:'task_dispatch_status',description:'Read durable child ownership and current active descendants without launching or resuming work. Use after errors and before replacement.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string'}}},execute:async(input,context)=>registry(workspace,async(state,save)=>{
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID);
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>({...r,key:undefined,workCheckpoint:checkpointStatus(r,now()),verificationAttempt:r.attemptIntentRevision===getIntent(state,rootID,r.taskId)?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)}));
+      let reconciled = false;
+      for (const record of state.records.filter(record=>record.rootID===rootID)) if (reconcileCompaction(record,sessions.find(s=>s.id===record.childID),now)) reconciled = true;
+      if (reconciled) await save();
+      try {
+        let delivered=false;
+        for (const record of state.records.filter(r=>r.rootID===rootID&&r.parentID===rootID&&r.childID&&r.admissionGeneration)) {
+          const recovered = await deliverQuotaRecovery({state,target:{parentID:rootID,childID:record.childID,generation:record.admissionGeneration},notify:quotaNotifier,now});
+          delivered ||= recovered.delivered.length > 0;
+        }
+        if (delivered) await save();
+      } catch { /* status remains read-safe; the durable receipt stays pending for a later explicit retry */ }
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID);const awaiting=r.state==='running'&&!native?.active;return {...r,key:undefined,recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,nativeExecution:{active:!!native?.active,lastIdleOutcome:native?.lastIdleOutcome},workCheckpoint:checkpointStatus(r,now()),verificationAttempt:r.attemptIntentRevision===getIntent(state,rootID,r.taskId)?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return s.agent !== 'router' && !descendant(sessions,context.sessionID,s.id); }
-      return {content:JSON.stringify({owners,taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
+      const knownParentIDs=new Set(state.records.filter(r=>r.rootID===rootID).map(r=>r.parentID));
+      return {content:JSON.stringify({owners,quotaRecoveryPending:pendingQuotaRecovery(state,{parentID:rootID}).filter(entry=>knownParentIDs.has(entry.target.parentID)),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
     })});
   });
   return { dispose: () => workerProgress.dispose(), outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{

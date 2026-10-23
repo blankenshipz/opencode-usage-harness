@@ -102,6 +102,8 @@ test('V2 quota failures preserve secret-safe process diagnostics and never retry
         assert.equal(error.detail.timeout_ms, 25000);
         assert.ok(error.detail.elapsed_ms >= 0);
         assert.equal(error.cause, undefined);
+        const expectedCategory = ['telemetry_unavailable','timeout'].includes(reason) ? 'telemetry_failure' : reason === 'policy_denied' ? 'policy_denial' : undefined;
+        assert.deepEqual(error.quota, expectedCategory ? { category: expectedCategory } : undefined);
         assert.doesNotMatch(error.stack + JSON.stringify(error), /private-sentinel/);
         return true;
       });

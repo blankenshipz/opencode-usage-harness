@@ -1,0 +1,18 @@
+{
+  "deployment_label": "2.0.30-managed (label only; source hashes control applicability)",
+  "effect_version": "4.0.0-rc.112",
+  "files": {
+    "packages/core/src/job.ts": "a36c776a7d5ad0ba9a4a47e6b6fcf043ade8b6dbb9c77d34182647241c7413f6",
+    "packages/core/src/session/subagent-job.ts": "6566a826a3ab4a8adea4528e85bc25394d4622c747c8fcac6c80e23dff3a03db",
+    "packages/core/src/session/subagent-completion.ts": "54b8fb5cf578d82db09ca68e2571456c565ee249460eff2b96025c77d85bb733",
+    "packages/core/src/session/execution/restart.ts": "4757779a499e5674de735956a5b68e26c01e747fa6b6f3d362320472efb378f5",
+    "packages/core/src/tool/plugin/subagent.ts": "46ac5c6fd9395932c9138471b685f808ab5a9456a89c9c067a77f998da190947"
+  },
+  "patched_files": {
+    "packages/core/src/job.ts": "321b76a5a0e17cc7a88af20673455a1236b86244932d662fb71c223966a58ae5",
+    "packages/core/src/session/subagent-job.ts": "4688d177f3adf766d1da20985467386b086e79e94b9df40c8243bd8e848fe419",
+    "packages/core/src/session/subagent-completion.ts": "54b8fb5cf578d82db09ca68e2571456c565ee249460eff2b96025c77d85bb733",
+    "packages/core/src/session/execution/restart.ts": "90d741dbaedb1a8740a59b3a02f85e9860adc26d4e317bedaba0d45ed7757a29",
+    "packages/core/src/tool/plugin/subagent.ts": "0a975c316ea75678c49fc5387efc58e9bebc6074ca87ecb16ccadfd2ea36d75e"
+  }
+}

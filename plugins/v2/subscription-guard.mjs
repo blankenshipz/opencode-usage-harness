@@ -7,6 +7,8 @@ import { promisify } from 'node:util';
 import { validateFinancial } from '../../config/guard-validation.mjs';
 import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
 import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
+import { createRegistry } from './dispatch-registry.mjs';
+import { quotaRecoveryReceipt, enqueueQuotaRecovery, deliverQuotaRecovery, quotaRecoverySyntheticInput } from './quota-recovery.mjs';
 
 const quotaEnvironment = env => Object.fromEntries([
   'HOME', 'PATH', 'LANG', 'HARNESS_STATE_DIR', 'CODEX_HOME', 'HARNESS_CODEX_BIN', 'HARNESS_PYTHON',
@@ -53,6 +55,10 @@ function quotaFailure(error, operation, elapsed, timeout) {
     'Admission remains blocked; inspect the process result and run codex-quota --refresh --check. No retry or fallback was attempted.');
   failure.code = 'SUBSCRIPTION_QUOTA_CHECK_FAILED';
   failure.detail = detail;
+  // This closed-set classification is for the dispatch recovery outbox. It never
+  // grants admission and deliberately excludes operational process diagnostics.
+  if (reason === 'telemetry_unavailable' || reason === 'timeout') failure.quota = { category: 'telemetry_failure' };
+  if (reason === 'policy_denied') failure.quota = { category: 'policy_denial' };
   return failure;
 }
 
@@ -83,7 +89,7 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     appendFileSync(path.join(telemetry, `${file}.jsonl`), JSON.stringify(value) + '\n', { mode: 0o600 });
   }, env = process.env, now = () => new Date().toISOString(), recordCompletion = value => persistCompletion({
     database: statePath('telemetry', 'completions.sqlite3'), value, python: env.HARNESS_PYTHON || 'python3', env,
-  }) } = {}) {
+  }), registry = createRegistry() } = {}) {
   async function quota(operation) {
     const started = performance.now();
     try {
@@ -131,6 +137,30 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
   return {
     id: 'subscription.guard',
     async setup(ctx) {
+      const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
+      const quotaNotifier = async notice => {
+        if (typeof ctx.session?.synthetic !== 'function') throw new Error('subscription guard: synthetic notification unavailable');
+        await ctx.session.synthetic(quotaRecoverySyntheticInput(notice));
+      };
+      const recoverQuotaFailure = async (event,error) => {
+        if (error?.code !== 'SUBSCRIPTION_QUOTA_CHECK_FAILED') return;
+        let target;
+        await registry(workspace,async(state,save) => {
+          const owner=state.records.find(record=>record.childID===event.sessionID);
+          const generated=owner?.admissionGeneration;
+          const requestKind=event.kind === 'compaction' ? 'compaction' : 'dispatch';
+          const receipt=quotaRecoveryReceipt({error,parentID:owner?.parentID,childID:owner?.childID,generation:generated,requestKind,compactionID:requestKind === 'compaction' ? owner?.compactionID : undefined});
+          if (!receipt) return;
+          enqueueQuotaRecovery(state,receipt); await save(); target=receipt.target;
+        });
+        if (!target) return;
+        try { await registry(workspace,async(state,save)=>{const result=await deliverQuotaRecovery({state,target,notify:quotaNotifier});if(result.delivered.length)await save();}); }
+        catch { /* retain the durable outbox entry for task_dispatch_status */ }
+      };
+      const guarded = async (event, run) => {
+        try { return await run(); }
+        catch (error) { try { await recoverQuotaFailure(event,error); } catch { /* preserve the original failed admission */ } throw error; }
+      };
       const steps = new Map();
       await ctx.provider.transform(editor => {
         const provider = editor.get('openai')?.provider;
@@ -149,21 +179,21 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
         execute: async () => ({ content: await quota('read') }),
       }));
       await ctx.session.hook('model.request', async event => {
-        if (event.baseURL !== undefined) verifyEndpoint(event.baseURL);
-        await verify(ctx, event);
-        append('requests', { checked_at: now(), session: event.sessionID, agent: event.agent,
-          model: event.model.id, provider: event.model.providerID,
-          variant: event.model.variant ?? null, reasoning_effort: null });
+        await guarded(event,async()=>{
+          if (event.baseURL !== undefined) verifyEndpoint(event.baseURL);
+          await verify(ctx, event);
+          append('requests', { checked_at: now(), session: event.sessionID, agent: event.agent,
+            model: event.model.id, provider: event.model.providerID,
+            variant: event.model.variant ?? null, reasoning_effort: null });
+        });
       });
       // Validate the resolved transport as well: a later plugin or provider setting can
       // rewrite baseURL after model.request. HTTP and WS are both possible in V2.
       await ctx.session.hook('http.request', async event => {
-        await verify(ctx, event);
-        verifyEndpoint(event.request.url);
+        await guarded(event,async()=>{await verify(ctx, event);verifyEndpoint(event.request.url);});
       });
       await ctx.session.hook('experimental.ws.handshake', async event => {
-        await verify(ctx, event);
-        verifyEndpoint(event.url.replace(/^wss:/, 'https:'));
+        await guarded(event,async()=>{await verify(ctx, event);verifyEndpoint(event.url.replace(/^wss:/, 'https:'));});
       });
       const controller = new AbortController();
       void (async () => {

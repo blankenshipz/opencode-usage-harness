@@ -16,6 +16,11 @@ and [help build the next integrations](#contributing).
 
 ## What you get
 
+The standalone toolkit's `install`/`update` commands switch its tool release only;
+they do not activate an OpenCode runtime. For a recovery runtime candidate, use
+the separate [stage → provenance → activate procedure](docs/recovery-release.md).
+Publishing or installing the toolkit does not make native runtime patches live.
+
 | For your workflow | What the harness provides |
 |---|---|
 | Choose the right level of reasoning | Specialist roles for exploration, implementation, debugging, architecture, and review, mapped to models and efforts you select from your actual catalog. |
@@ -31,6 +36,13 @@ an appropriate specialist → run targeted verification → repair or escalate w
 the evidence warrants it**. A separate scout is useful when discovery is needed,
 not a required extra agent for every task. The full workflow requires the compatible
 agent integration; installing the standalone tools does not activate it automatically.
+
+Recovery status distinguishes a running compaction, successful compaction awaiting
+same-child continuation, and failed compaction awaiting recovery. Quota telemetry
+failures keep admission closed and retain generation-bound parent notifications;
+notification delivery never resumes inference. See the
+[staged recovery release and activation procedure](docs/recovery-release.md) for
+compatibility, artifact verification and live-install limitations.
 
 ## How model and reasoning selection work
 
