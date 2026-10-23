@@ -60,7 +60,7 @@ def main():
         for fixture in ["job-generation.test.ts", "subagent-recovery.test.ts"]:
             subprocess.run([str(args.bun.resolve(strict=True)), "test", str(ROOT / "tests/native" / fixture)],
                            cwd=stage, env=env, check=True, timeout=30)
-    print("Native managed patch: baseline and output hashes verified; 9 offline fixtures passed.")
+    print("Native managed patch: baseline and output hashes verified; offline fixtures passed.")
 
 
 if __name__ == "__main__":

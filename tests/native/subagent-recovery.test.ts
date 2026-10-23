@@ -85,3 +85,14 @@ test('A completes between pending read and wait: exact generation wait never blo
  expect(waits).toBe(1);expect(scans).toBe(2);expect(visible.length).toBe(1);
  expect(visible[0].sessionID).toBe('parent-A');expect(visible[0].text).toContain('RESULT A');expect(ack).toEqual(['notice-A']);
 });
+
+for (const capturedBoundary of ['before-admission', undefined]) {
+ test(`pre-admission boundary survives child completion before observer: ${capturedBoundary ?? 'empty history'}`, async()=>{
+  const fresh=assistant('already-completed','NEW RESULT');const queries=[];
+  const sessions={messages:input=>Effect.sync(()=>{queries.push(input);return input.limit===1?[fresh]:[fresh];}),resume:()=>Effect.void};
+  const jobs={start:input=>Effect.map(input.run,output=>({output}))};
+  const result=await run(sessions,jobs,runner=>runner.start({...recovery,boundaryCaptured:true,boundaryMessageID:capturedBoundary,promptMessageID:'new-prompt'}));
+  expect(result.output).toBe('NEW RESULT');expect(queries.length).toBe(1);
+  expect(queries[0].cursor).toEqual(capturedBoundary?{id:capturedBoundary,direction:'next'}:undefined);
+ });
+}

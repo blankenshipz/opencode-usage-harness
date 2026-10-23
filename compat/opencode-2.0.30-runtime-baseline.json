@@ -1,0 +1,22 @@
+{
+  "deployment_label": "2.0.30-runtime (source hashes control applicability)",
+  "effect_version": "4.0.1",
+  "files": {
+    "packages/core/src/job.ts": "97975b2dfe93c5f6fc69fb131679c3a131372af73d32ff66feef2b05d5b1b320",
+    "packages/core/src/session/subagent-job.ts": "fcecd0bc044e643ab749e98aeee08cb40c391bb692fbcf73001b2902f4b62fbd",
+    "packages/core/src/session/subagent-completion.ts": "76fd1bc8cde61470d79aa5144c05d08537b32aa2fd75980b5067270e8d364b03",
+    "packages/core/src/session/execution/restart.ts": "4757779a499e5674de735956a5b68e26c01e747fa6b6f3d362320472efb378f5",
+    "packages/core/src/tool/plugin/subagent.ts": "fc6e821262ea17c26e63f2955e6fc1ad17475894701ec79d79494318204ad74b",
+    "packages/core/test/job.test.ts": "6a74fba6222203d081e10bc057ca7841dbf62ad5d486f879c44767bb2cc0fc77",
+    "packages/core/test/tool-subagent.test.ts": "2b86272d891cf866b4ac465e78356f0da7a0f2a19c197588c9cbd23b3101d8e0"
+  },
+  "patched_files": {
+    "packages/core/src/job.ts": "9bcd423320afdec2409e033f9cc3a0a8ba54a4346cb61cad62246f833d731c14",
+    "packages/core/src/session/subagent-job.ts": "3528d4247c5746e6c990ac66342e2111b76e25747d60c63a5f24f71d073ed822",
+    "packages/core/src/session/subagent-completion.ts": "76fd1bc8cde61470d79aa5144c05d08537b32aa2fd75980b5067270e8d364b03",
+    "packages/core/src/session/execution/restart.ts": "bc9292d19ae28ecfdebcdb45f973782b2e11c99c18b2875806d7b3e10b4515cf",
+    "packages/core/src/tool/plugin/subagent.ts": "c766bd18df51c82d457375614825f84745ac507f813f002971a4c575264f5991",
+    "packages/core/test/job.test.ts": "c0678e39eebb9beb4856c3f7ac04ca08a2f63130ebcde547bbcdb9e7f0aff54b",
+    "packages/core/test/tool-subagent.test.ts": "622195857e0e34e79c3d96ddcf7b8fa3b9f410271c082ea56e039a963f17d332"
+  }
+}

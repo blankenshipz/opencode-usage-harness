@@ -1,7 +1,9 @@
 # Recovery release: staged changes and activation
 
-This repair is staged source, not a live runtime update. It does not start or
-restart OpenCode, resume a child, or change approvals or financial policy.
+This repair has separate source, build, and deployment stages. Publishing these
+patches does not restart OpenCode, resume a child, or change approvals or financial
+policy. The October 23 private Intel deployment was activated only after approval
+and a repeated idle/interaction check; local deployment receipts remain private.
 
 ## Findings
 
@@ -161,3 +163,51 @@ or activates an OpenCode runtime. The native service activation below is separat
 
 No live activation, service interruption or automatic continuation is part of
 publishing these source changes.
+
+
+## Validated 2.0.30 runtime baseline and activation
+
+The installed binary's actual build tree was the October 15 upgrade source,
+with Effect 4.0.1 and the newer service/node wrappers. The older `v2-current/source`
+tree contains a different layout despite its deployment label. Use
+`compat/opencode-2.0.30-runtime-recovery.patch` and its `runtime-baseline.json`
+for the actual 2.0.30 build; the `managed` pair remains for the separately hashed
+older layout. These patches are alternatives, never cumulative. Verify every
+original hash before applying either, then every output hash afterward.
+
+Real integration tests exposed a further race: a child can finish between prompt
+admission and the observer starting. The caller now persists the last message
+boundary **before** admission, plus the admitted prompt ID and an explicit
+boundary-captured flag. The observer and restart path use this retained boundary.
+An empty captured history is distinct from legacy missing metadata. Legacy jobs
+use a conservative boundary and may produce an explicit no-new-result response
+rather than replaying an older answer. Recovery metadata fields are optional;
+there is no database migration or approval/provider-policy change.
+
+Validation against the actual staged 2.0.30 runtime:
+
+- Full workspace check: 35 tasks passed; final core typecheck passed.
+- Five real core test files: 38 passed, zero failures, 297 assertions. Coverage
+  includes jobs, subagent execution/lifetime, activation and native compaction.
+- Intel macOS binary built with embedded web UI using Bun 1.4.2.
+- Isolated compiled-server smoke loaded the location and agent catalog with all
+  required plugins enforced, zero sessions and no inference.
+- Older-layout hash-pinned fixtures also passed: 11 tests, 56 assertions, including
+  fast completion before observer startup and captured empty history.
+
+For reproduction on a disposable copy of the exact runtime baseline, verify and
+apply the runtime patch, install the frozen lockfile in isolation, run `bun run
+check` at the root, and run the five core test files (`job`, `tool-subagent`,
+`subagent-lifetime`, `session-activation`, `session-native-compaction`) from
+`packages/core`. Build from `packages/cli` with `bun run script/build.ts --single
+--skip-install --outdir=/staging/built`; retain the web UI. A compatible Intel
+Bun/toolchain and installed frozen dependencies are required. Never repair live
+dependency links or build over a running release.
+
+The private activation preserved all 1,010 sessions and 93,322 message records;
+inbox/pending counts also matched immediately afterward. Authenticated backend,
+Tessera location/agent loading, frontend HTTP health and installed hashes passed.
+The launcher environment remains free of `OPENAI_API_KEY`. This establishes
+startup/artifact preservation, not an end-to-end paid inference recovery test.
+No inference was requested and no paused child was automatically resumed. Mobile
+reconnection still requires confirmation from the user's device.

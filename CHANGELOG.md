@@ -73,3 +73,12 @@
 - Fixture-based tests and macOS/Linux CI configuration; no bundled credentials, databases, provider inference, or runtime binaries.
 
 Known gaps: a fresh public-runtime integration run, prebuilt compatible binaries, automated runtime builds, signed releases, and OpenChamber installation/pairing automation are not included.
+
+
+### October 23 activation validation
+
+- Pin the actual 2.0.30 runtime source separately from the older managed layout.
+- Capture child-result boundaries before prompt admission, covering children that
+  finish before their observer starts; preserve exact-generation restart delivery.
+- Validate the real Intel build, workspace checks, 38 native integration tests and
+  compiled plugin startup. Document the approved private activation and rollback.
