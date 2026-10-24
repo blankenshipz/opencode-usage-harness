@@ -158,6 +158,7 @@ class InstallerTests(unittest.TestCase):
             (source / dirname).mkdir()
             (source / dirname / "checkout-only.txt").write_text("not installed\n")
         (source / ".gitignore").write_text("__pycache__/\n")
+        (source / ".gitattributes").write_text("*.patch -whitespace\n")
         for name in ("SECURITY.md", "CHANGELOG.md", "CONTRIBUTING.md"):
             (source / name).write_text("documentation\n")
         cache = source / "src" / "__pycache__"
@@ -168,6 +169,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         current = (self.prefix / "current").resolve()
         self.assertTrue((current / "SECURITY.md").is_file())
+        self.assertFalse((current / ".gitattributes").exists())
         self.assertFalse((current / "tests").exists())
         self.assertFalse((current / "scripts").exists())
         self.assertFalse((current / ".github").exists())
@@ -177,6 +179,29 @@ class InstallerTests(unittest.TestCase):
         rejected = self.invoke("update", "--source", str(source))
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("unknown source", rejected.stderr)
+
+    def test_gitattributes_exception_is_only_a_regular_checkout_root_file(self):
+        source = self.source()
+        marker = source / ".gitattributes"
+        marker.symlink_to(source / "README.md")
+        with self.assertRaises(INSTALL.InstallError):
+            INSTALL.scan_source(source)
+        marker.unlink()
+        marker.mkdir()
+        with self.assertRaises(INSTALL.InstallError):
+            INSTALL.scan_source(source)
+        marker.rmdir()
+        marker.write_text("*.patch -whitespace\n")
+        _, files = INSTALL.scan_source(source)
+        self.assertNotIn('.gitattributes', {item['path'] for item in files})
+        for relative in ['config/.env', 'config/auth.json', 'config/financial-verification.json',
+                         'src/secrets/fixture.txt', 'src/private/fixture.txt']:
+            target = source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('synthetic canary')
+            with self.assertRaises(INSTALL.InstallError):
+                INSTALL.scan_source(source)
+            target.unlink()
 
 
 if __name__ == "__main__":

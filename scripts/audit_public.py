@@ -18,7 +18,8 @@ def audit():
         if any(x in {'.git','__pycache__'} for x in rel.parts):continue
         if p.is_symlink():errors.append(f'{rel}: symlink not allowed');continue
         if p.is_dir():continue
-        if rel.parts[0] not in ALLOWED:errors.append(f'{rel}: unexpected release path')
+        checkout_metadata = rel.parts == ('.gitattributes',) and p.is_file()
+        if rel.parts[0] not in ALLOWED and not checkout_metadata:errors.append(f'{rel}: unexpected release path')
         if p.name in {'auth.json','financial-verification.json','.env'} or p.suffix in {'.db','.sqlite','.log','.jsonl','.pem','.key','.pyc'}:
             errors.append(f'{rel}: private/generated file type')
         try:text=p.read_text()
