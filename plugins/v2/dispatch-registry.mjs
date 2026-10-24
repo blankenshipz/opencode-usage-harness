@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { configuredPython, packageRoot, statePath } from './paths.mjs';
 const exec = promisify(execFile);
@@ -12,37 +12,51 @@ const runtimeRead = async (args = []) => {
 };
 export const runtimeSessions = () => runtimeRead();
 export const runtimeIntentSources = rootID => runtimeRead(['--intent-sources', rootID]);
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
+// Python locks the inherited open-file description. The parent retains its fd:
+// helper exit cannot release the lock while the JS callback is still running.
+// Process death closes the descriptor in the kernel; no PID/reaper files needed.
+const flockHelper = `import fcntl, time
+end = time.monotonic() + 5
+while True:
+    try:
+        fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= end:
+            raise SystemExit(1)
+        time.sleep(0.02)
+`;
+async function acquireLock(file, legacy) {
+  const handle = await fs.open(file, 'a+', 0o600);
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(configuredPython, ['-c', flockHelper],
+        { stdio: ['ignore', 'ignore', 'ignore', handle.fd] });
+      const timer = setTimeout(() => child.kill('SIGKILL'), 6000);
+      child.once('error', () => { clearTimeout(timer); reject(new Error('task-dispatch: registry lock helper unavailable')); });
+      child.once('close', code => {
+        clearTimeout(timer);
+        code === 0 ? resolve() : reject(new Error('task-dispatch: ownership registry busy or lock unavailable; retry the same task after the current admission finishes'));
+      });
+    });
+    // Old processes use exclusive marker files, not flock. Never delete those
+    // markers or overlap their owners. Upgrade/rollback requires quiescence.
+    for (const marker of [legacy, `${legacy}.recovery`]) {
+      try { await fs.lstat(marker); }
+      catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      throw new Error('task-dispatch: legacy registry lock requires operator reconciliation while all registry writers are stopped; no marker was removed');
+    }
+    return handle;
+  } catch (error) { await handle.close(); throw error; }
+}
 export function createRegistry(directory = statePath('dispatch-ownership')) {
   return async (workspace, run) => {
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     const name = crypto.createHash('sha256').update(workspace).digest('hex');
-    const file = path.join(directory, `${name}.json`), lock = path.join(directory, `${name}.lock`);
+    const file = path.join(directory, `${name}.json`), legacy = path.join(directory, `${name}.lock`);
     const nonce = crypto.randomUUID();
-    // Atomic exclusive file creation: the lock contains only ownership metadata.
-    const deadline = Date.now() + 5000;
-    for (;;) {
-      try { const handle = await fs.open(lock, 'wx', 0o600); try { await handle.writeFile(JSON.stringify({ pid: process.pid, nonce })); } finally { await handle.close(); } break; }
-      catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        let owner;
-        try { owner = JSON.parse(await fs.readFile(lock, 'utf8')); } catch { /* Writer may still be publishing the lock; fail closed if it stays malformed. */ }
-        if (owner?.pid && !alive(owner.pid)) {
-          // Rename recovery is serialized by an exclusive recovery file; recheck owner under it.
-          const recovery = `${lock}.recovery`;
-          let handle;
-          try {
-            handle = await fs.open(recovery, 'wx', 0o600);
-            const current = JSON.parse(await fs.readFile(lock, 'utf8'));
-            if (current.nonce === owner.nonce && !alive(current.pid)) await fs.unlink(lock);
-          } catch (e) { if (!['EEXIST', 'ENOENT'].includes(e.code)) throw e; }
-          finally { if (handle) { await handle.close(); await fs.unlink(recovery).catch(() => {}); } }
-        }
-        if (Date.now() >= deadline) throw new Error('task-dispatch: ownership registry busy; retry this same task after the current admission finishes');
-        await sleep(20);
-      }
-    }
+    // Keep this inode permanently: unlinking a flock file would split owners.
+    const lock = await acquireLock(path.join(directory, `${name}.flock`), legacy);
     try {
       let state = { records: [] };
       try { state = JSON.parse(await fs.readFile(file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -51,10 +65,7 @@ export function createRegistry(directory = statePath('dispatch-ownership')) {
         try { await fs.writeFile(temp, JSON.stringify(state), { mode: 0o600 }); await fs.rename(temp, file); }
         finally { await fs.rm(temp, { force: true }).catch(() => {}); }
       });
-    } finally {
-      const owner = JSON.parse(await fs.readFile(lock, 'utf8'));
-      if (owner.nonce === nonce) await fs.unlink(lock);
-    }
+    } finally { await lock.close(); }
   };
 }
 export function lineage(sessions, id) {
