@@ -419,3 +419,30 @@ test('status distinguishes an idle native worker from stale recorded running wor
  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];
  assert.equal(status.recordedState,'running');assert.equal(status.effectiveState,'awaiting_result_collection');assert.deepEqual(status.nativeExecution,{active:false,lastIdleOutcome:'succeeded'});assert.equal(h.calls.length,1);
 });
+
+test('nested owner retries durable quota notices across restart and generations without resuming',async t=>{
+ const h=await harness(t);
+ const {quotaRecoveryReceipt,enqueueQuotaRecovery}=await import('../plugins/v2/quota-recovery.mjs');
+ h.sessions.push({id:'parent',parentID:'root',agent:'builder',directory:'/project',active:false},
+  {id:'leaf',parentID:'parent',agent:'builder',directory:'/project',active:false});
+ const error=Object.assign(new Error('SECRET'),{code:'SUBSCRIPTION_QUOTA_CHECK_FAILED',quota:{category:'telemetry_failure'},detail:{reason:'timeout'}});
+ await h.registry('/project',async(state,save)=>{
+  state.records.push({key:'nested',rootID:'root',parentID:'parent',childID:'leaf',taskId:'release',workKey:'nested',state:'paused',admissionGeneration:2});
+  enqueueQuotaRecovery(state,quotaRecoveryReceipt({error,parentID:'parent',childID:'leaf',generation:1}));await save();
+ });
+ const failed=[];h.ctx.session.synthetic=async input=>{failed.push(input);throw Error('delivery unavailable');};
+ const pending=JSON.parse((await h.call({},'task_dispatch_status','parent')).content);
+ assert.equal(pending.quotaRecoveryPending.length,1);assert.equal(failed.length,1);
+ const rootStatus=JSON.parse((await h.call({},'task_dispatch_status')).content);
+ assert.deepEqual(rootStatus.quotaRecoveryPending,[]);assert.equal(failed.length,1);
+ const notices=[];h.ctx.session.synthetic=async input=>notices.push(input);
+ const tools=new Map([['subagent',{...h.rawNative}]]);
+ await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>tools.get(n),update:(n,fn)=>fn(tools.get(n)),add:t=>tools.set(t.name,t)})}},
+  {registry:createRegistry(h.dir),loadSessions:async()=>h.sessions});
+ const status=JSON.parse((await tools.get('task_dispatch_status').execute({},{sessionID:'parent'})).content);
+ assert.deepEqual(status.quotaRecoveryPending,[]);assert.equal(notices.length,1);
+ assert.equal(notices[0].sessionID,'parent');assert.equal(notices[0].resume,false);
+ assert.equal(notices[0].metadata.generation,1);assert.equal(notices[0].id,failed[0].id);
+ await h.call({},'task_dispatch_status','parent');assert.equal(notices.length,1);assert.equal(h.calls.length,0);
+ await h.registry('/project',async state=>{assert.equal(state.records[0].admissionGeneration,2);assert.ok(state.quotaRecoveryOutbox[0].deliveredAt);});
+});

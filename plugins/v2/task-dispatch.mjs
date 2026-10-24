@@ -326,8 +326,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       if (reconciled) await save();
       try {
         let delivered=false;
-        for (const record of state.records.filter(r=>r.rootID===rootID&&r.parentID===rootID&&r.childID&&r.admissionGeneration)) {
-          const recovered = await deliverQuotaRecovery({state,target:{parentID:rootID,childID:record.childID,generation:record.admissionGeneration},notify:quotaNotifier,now});
+        for (const record of state.records.filter(r=>r.rootID===rootID&&r.parentID===context.sessionID&&r.childID)) {
+          const recovered = await deliverQuotaRecovery({state,target:{parentID:context.sessionID,childID:record.childID},notify:quotaNotifier,now});
           delivered ||= recovered.delivered.length > 0;
         }
         if (delivered) await save();
@@ -336,8 +336,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return s.agent !== 'router' && !descendant(sessions,context.sessionID,s.id); }
-      const knownParentIDs=new Set(state.records.filter(r=>r.rootID===rootID).map(r=>r.parentID));
-      return {content:JSON.stringify({owners,quotaRecoveryPending:pendingQuotaRecovery(state,{parentID:rootID}).filter(entry=>knownParentIDs.has(entry.target.parentID)),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
+      return {content:JSON.stringify({owners,quotaRecoveryPending:pendingQuotaRecovery(state,{parentID:context.sessionID}).filter(entry=>state.records.some(r=>r.rootID===rootID&&r.parentID===entry.target.parentID&&r.childID===entry.target.childID)),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
     })});
   });
   return { dispose: () => workerProgress.dispose(), outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
