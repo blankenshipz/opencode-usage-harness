@@ -30,6 +30,18 @@ class ConfigureTests(unittest.TestCase):
         self.assertIn(('subagent', 'builder'), router_children)
         self.assertIn(('subagent', 'harness-builder'), router_children)
 
+    def test_task_fit_policy_validation(self):
+        models={k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')}
+        def policy(rule):
+            return {'version':1,'enabled':True,'roles':{'builder':[{'ref':'openai/fixture#medium','taskFit':{'implementation':rule}}]}}
+        good={'band':'preferred','evidence_status':'supported','evidence_ref':'fixture-receipt'}
+        self.assertEqual(profile(models,routing_policy=policy(good))['enabled_providers'],['openai'])
+        self.assertEqual(profile(models,routing_policy=policy({'band':'preferred','evidence_status':'provisional'}))['enabled_providers'],['openai'])
+        for rule in [None,{'band':'winner','evidence_status':'supported'}, {'band':'preferred','evidence_status':'supported'}, {**good,'evidence_ref':'private\ntext'}, {**good,'unknown':True}]:
+            with self.assertRaises(ValueError):profile(models,routing_policy=policy(rule))
+        bad=policy(good);bad['roles']['builder'][0]['taskFit']={'invented':good}
+        with self.assertRaises(ValueError):profile(models,routing_policy=bad)
+
     def test_namespace_helper_is_idempotent_and_preserves_hidden_compatibility(self):
         agents = {'router': {'system': 'router', 'permissions': [
             {'action': 'subagent', 'resource': 'builder', 'effect': 'allow'},

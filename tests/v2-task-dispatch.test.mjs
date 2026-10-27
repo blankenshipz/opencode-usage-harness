@@ -43,7 +43,7 @@ async function harness(t, custom, nativeInput, dispatchOptions={}) {
  const ctx={location:{directory:'/project'},agent:{list:async()=>({data:Object.entries(agents).map(([id,a])=>({id,...a}))})},tool:{transform:async fn=>{assert.notEqual(fn.constructor.name,'AsyncFunction','native editor transformations must be synchronous');return fn({get:n=>tools.get(n),update:(n,fn)=>fn(tools.get(n)),add:tool=>tools.set(tool.name,tool)});}}};
  const registry=createRegistry(dir);await registry('/project',async(state,save)=>{setIntent(state,{rootID:'root',taskId:'release',intent,expectedRevision:0,actorSessionID:'root'});await save();});
  const hooks=new Map();ctx.session={hook:async(name,fn)=>{const previous=hooks.get(name);hooks.set(name,async event=>{if(previous)await previous(event);return fn(event);});}};
- const runtime=await installTaskDispatch(ctx,{registry,loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction'],...dispatchOptions});
+ const runtime=await installTaskDispatch(ctx,{registry,loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction'],loadRoutingPolicy:()=>undefined,...dispatchOptions});
  const call=(input,tool='task_dispatch',sessionID='root')=>tools.get(tool).execute(input,{sessionID,agent:'router',progress:async()=>{}});
  return {call,sessions,calls,tools,ctx,dir,registry,rawNative,hooks,runtime};
 }
@@ -98,6 +98,20 @@ test('an existing valid child cannot receive new-assignment capability correctio
   assert.notEqual(error.code,'TASK_DISPATCH_CAPABILITY_MISMATCH');assert.match(error.message,/continuation must be the same role/);return true;
  });
  assert.equal(h.calls.length,1);
+});
+test('local task-fit floor survives failed advisory telemetry before native dispatch',async t=>{
+ const policy={version:1,enabled:true,roles:{builder:[{ref:'anthropic/fixture-opus#high',taskFit:{implementation:{band:'preferred',evidence_status:'supported',evidence_ref:'fixture-receipt'}}}]}};
+ let reads=0;const h=await harness(t,undefined,undefined,{loadRoutingPolicy:()=>policy,loadQuota:async()=>{reads++;throw new Error('fixture telemetry unavailable');}});
+ await assert.rejects(h.call({...base,routing:{complexity:'complex',risk:'high',taskType:'implementation'}}),error=>error.code==='ROUTING_TASK_FIT_UNAVAILABLE');
+ assert.equal(reads,1);assert.equal(h.calls.length,0);
+ await h.registry('/project',async state=>assert.equal(state.records.length,0));
+});
+test('invalid task classification or local fit policy never falls through to execution',async t=>{
+ let reads=0;const h=await harness(t,undefined,undefined,{loadQuota:async()=>{reads++;return {};}});
+ await assert.rejects(h.call({...base,routing:{complexity:'standard',risk:'normal',taskType:'invented'}}),/invalid routing assessment/);
+ assert.equal(reads,0);assert.equal(h.calls.length,0);
+ const broken=await harness(t,undefined,undefined,{loadRoutingPolicy:()=>{throw Object.assign(new Error('ROUTING_POLICY_INVALID'),{code:'ROUTING_POLICY_INVALID'});}});
+ await assert.rejects(broken.call(base),error=>error.code==='ROUTING_POLICY_INVALID');assert.equal(broken.calls.length,0);
 });
 test('fresh built-in callers retain the stock subagent arguments and original executor',async t=>{
  const h=await harness(t);const stock={agent:'builder',description:'Inspect files',prompt:'Inspect the current files',background:false};

@@ -1,4 +1,4 @@
-import { readRoutingQuota, selectDispatchModel, modelReference } from './dispatch-routing.mjs';
+import { readRoutingQuota, readRoutingPolicy, selectDispatchModel, modelReference, TASK_TYPES } from './dispatch-routing.mjs';
 import { observeAdmission, convergenceAdvice, userActions, recordProgress, normalizeProgressEvidence } from './convergence.mjs';
 import { checkpointSchema, normalizeCheckpoint, beginCheckpoint, acknowledgeTaskReview, normalizeReviewAcknowledgement, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
@@ -49,7 +49,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   checkpoint: checkpointSchema,
   compact: {type:'boolean'}, resetModel: {type:'boolean'},
   workReview: {type:'object',additionalProperties:false,properties:{hypothesis:{type:'string',minLength:1,maxLength:500},evidenceReference:{type:'string',minLength:1,maxLength:500}},required:['hypothesis','evidenceReference']},
-  routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']},reviewOf:{type:'string',minLength:3,maxLength:240}},required:['complexity','risk']},
+  routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']},taskType:{type:'string',enum:TASK_TYPES},reviewOf:{type:'string',minLength:3,maxLength:240}},required:['complexity','risk']},
   recovery: { type: 'object', additionalProperties: false, properties: {
     kind: { type: 'string', enum: ['scope_changed','inputs_changed','authorization_changed'] }, scope: { type: 'string', minLength: 1, maxLength: 160 },
     inputs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 160 } },
@@ -102,7 +102,7 @@ export function taskWorkStatus(state,rootID,taskId) {
   const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
-export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, now = Date.now, loadQuota = readRoutingQuota } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -183,7 +183,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const checkpoint = normalizeCheckpoint(input.checkpoint);
       const review = input.workReview === undefined ? undefined : normalizeReviewAcknowledgement(input.workReview);
       if (input.compact !== undefined && typeof input.compact !== 'boolean') throw new Error('task-dispatch: invalid compact');
-      if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk) || (input.routing.reviewOf !== undefined && !modelReference(input.routing.reviewOf)))) throw new Error('task-dispatch: invalid routing assessment');
+      if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk) || (input.routing.taskType !== undefined && !TASK_TYPES.includes(input.routing.taskType)) || (input.routing.reviewOf !== undefined && !modelReference(input.routing.reviewOf)))) throw new Error('task-dispatch: invalid routing assessment');
       if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
@@ -230,8 +230,13 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const writes = paths(input, agent);
       // Optional planning telemetry is advisory only. Read it after all local
       // assignment validation so an impossible request has no quota side effect.
+      const routingPolicy = loadRoutingPolicy();
       let quota;
-      if (input.routing) { try { quota = await loadQuota(ctx); } catch { /* unknown pace: retain configured model; guard still fails closed */ } }
+      if (input.routing) { try { quota = await loadQuota(ctx); } catch (error) {
+        if (error?.code === 'ROUTING_POLICY_INVALID') throw error;
+        // Unknown telemetry never erases the local task-fit policy.
+      } }
+      quota = { ...(quota ?? {}), routingPolicy: routingPolicy ?? quota?.routingPolicy };
       const token = crypto.randomUUID();
       const admission = await registry(workspace, async (state, save) => {
         const sessions = await loadSessions(), rootID = lineage(sessions,context.sessionID);

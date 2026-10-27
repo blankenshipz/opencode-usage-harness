@@ -5,12 +5,83 @@ import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
 import { readSelectedClaudeUsage } from './anthropic-subscription.mjs';
 import { canonicalHarnessRole, harnessRoleIDs } from './agent-mode.mjs';
 
-export async function readRoutingQuota(ctx) {
-  let policy;
-  try { policy = JSON.parse(readFileSync(path.join(managedConfigRoot, 'routing-policy.json'), 'utf8')); }
-  catch (error) { if (error.code !== 'ENOENT') throw new Error('routing: invalid policy file'); }
-  const catalog = ctx ? (await ctx.model.list()).data : undefined;
-  const quota = await readProviderQuotas({ providers: catalogProviders(catalog), readClaude: () => readSelectedClaudeUsage(ctx) });
+export const TASK_TYPES = Object.freeze(['general','exploration','mechanical','implementation','debugging','architecture','testing','review']);
+const TASK_TYPE_SET = new Set(TASK_TYPES);
+function policyError() { return Object.assign(new Error('ROUTING_POLICY_INVALID: routing policy is invalid'), { code: 'ROUTING_POLICY_INVALID' }); }
+function taskFitError() { return Object.assign(new Error('ROUTING_TASK_FIT_UNAVAILABLE: no supported-preferred candidate is available for this task'), { code: 'ROUTING_TASK_FIT_UNAVAILABLE' }); }
+function isRecord(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+export function validateTaskFitPolicy(policy) {
+  if (!isRecord(policy)) throw policyError();
+  if (policy.version !== 1 || (policy.enabled !== undefined && typeof policy.enabled !== 'boolean') || !isRecord(policy.roles)) throw policyError();
+  for (const candidates of Object.values(policy.roles)) {
+    if (!Array.isArray(candidates)) throw policyError();
+    for (const candidate of candidates) {
+      if (!isRecord(candidate) || typeof candidate.ref!=='string' || !/^(openai|anthropic)\/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+$/.test(candidate.ref) || (candidate.enabled !== undefined && typeof candidate.enabled !== 'boolean')) throw policyError();
+      if (candidate.taskFit === undefined) continue;
+      if (!isRecord(candidate.taskFit)) throw policyError();
+      for (const [taskType, rule] of Object.entries(candidate.taskFit)) {
+        if (!TASK_TYPE_SET.has(taskType) || !isRecord(rule)
+          || !['preferred','acceptable'].includes(rule.band)
+          || !['provisional','supported'].includes(rule.evidence_status)
+          || Object.keys(rule).some(key=>!['band','evidence_status','evidence_ref'].includes(key))) throw policyError();
+        if (rule.evidence_ref !== undefined && (typeof rule.evidence_ref !== 'string' || !rule.evidence_ref.trim() || rule.evidence_ref.length > 240 || /[\r\n\0]/.test(rule.evidence_ref))) throw policyError();
+        if (rule.band === 'preferred' && rule.evidence_status === 'supported' && rule.evidence_ref === undefined) throw policyError();
+      }
+    }
+  }
+  return policy;
+}
+export function taskTypeFor(input) {
+  if (input?.routing?.taskType !== undefined) return TASK_TYPE_SET.has(input.routing.taskType) ? input.routing.taskType : 'general';
+  const role = canonicalHarnessRole(input?.agent) ?? input?.agent;
+  return ({ scout:'exploration', 'quick-builder':'mechanical', builder:'implementation', 'builder-high':'implementation', 'deep-debugger':'debugging', 'deep-debugger-high':'debugging', architect:'architecture', reviewer:'review' })[role] ?? 'general';
+}
+function candidateFit(candidate, taskType) {
+  const rule = candidate?.taskFit?.[taskType];
+  const preferred = rule?.band === 'preferred' && rule?.evidence_status === 'supported' && typeof rule?.evidence_ref === 'string' && rule.evidence_ref.trim().length > 0;
+  return { band: preferred ? 'preferred' : 'acceptable', evidenceStatus: preferred ? 'supported' : (rule?.evidence_status === 'supported' ? 'supported' : 'provisional'), reason: preferred ? 'supported_preferred' : 'acceptable_or_provisional' };
+}
+function storedTaskFit(value) {
+  if (!isRecord(value) || !TASK_TYPE_SET.has(value.taskType) || !['preferred','acceptable'].includes(value.band)
+    || !['provisional','supported'].includes(value.evidenceStatus)
+    || !['supported_preferred','acceptable_or_provisional','continuation_affinity','no_supported_preference'].includes(value.reason)) return undefined;
+  return {taskType:value.taskType,band:value.band,evidenceStatus:value.evidenceStatus,reason:value.reason};
+}
+function taskFitContext({ input, policy }) {
+  if (policy?.version !== 1 || policy?.enabled !== true) return {taskType:taskTypeFor(input),supportedPreferred:[],strict:false};
+  const role=canonicalHarnessRole(input.agent) ?? input.agent;
+  const candidates=policy?.roles?.[input.agent] ?? policy?.roles?.[role];
+  const taskType=taskTypeFor(input);
+  const supportedPreferred=Array.isArray(candidates) ? candidates.filter(c=>isRecord(c) && c.enabled!==false && modelReference(c.ref) && candidateFit(c,taskType).band==='preferred').map(c=>c.ref) : [];
+  const strict=Boolean(input.routing && (input.routing.complexity==='complex' || input.routing.risk==='high') && supportedPreferred.length);
+  return {taskType,supportedPreferred,strict};
+}
+function selectedTaskFit({ input, policy, ref }) {
+  const role=canonicalHarnessRole(input.agent) ?? input.agent;
+  const candidates=policy?.roles?.[input.agent] ?? policy?.roles?.[role];
+  const candidate=Array.isArray(candidates) && candidates.find(c=>isRecord(c) && c.enabled!==false && c.ref===ref);
+  if (!candidate) return undefined;
+  const fit=candidateFit(candidate,taskTypeFor(input));
+  return {taskType:taskTypeFor(input),band:fit.band,evidenceStatus:fit.evidenceStatus,reason:fit.reason};
+}
+
+export function readRoutingPolicy({ readFile = readFileSync, policyPath = path.join(managedConfigRoot, 'routing-policy.json') } = {}) {
+  try {
+    return validateTaskFitPolicy(JSON.parse(readFile(policyPath, 'utf8')));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return undefined;
+    if (error?.code === 'ROUTING_POLICY_INVALID') throw error;
+    throw policyError();
+  }
+}
+
+export async function readRoutingQuota(ctx, { readPolicy=readRoutingPolicy, readQuota=readProviderQuotas } = {}) {
+  const policy=readPolicy();
+  let catalog;
+  try { catalog = ctx ? (await ctx.model.list()).data : undefined; } catch {}
+  let quota;
+  try { quota = await readQuota({ providers: catalogProviders(catalog), readClaude: () => readSelectedClaudeUsage(ctx) }); }
+  catch { quota={version:1,checked_at:new Date().toISOString(),pools:{}}; }
   return { ...quota, routingPolicy: policy, catalog };
 }
 export function modelReference(ref) {
@@ -43,20 +114,25 @@ export function selectDispatchModel({input,agent,agents,record,child,quota}) {
   let selected=override??configured, source=override?'explicit_override':'configured_role';
   // Never reinterpret an admitted generation or change its provider on retry.
   if (!override && record?.routing?.selected) {
-    return {selected:record.routing.selected,configured,observed,source:'continuation_affinity',pace,modelOverride:override};
+    const persistedFit=storedTaskFit(record.routing.taskFit);
+    return {selected:record.routing.selected,configured,observed,source:'continuation_affinity',pace,modelOverride:override,...(persistedFit ? {taskFit:persistedFit} : {})};
   }
   const decision = !override && chooseCandidate({input, quota});
   if (decision) return {selected:decision.ref,configured,observed,source:decision.reason,pace:decision.pace,
     modelOverride:override,behaviorProfile:decision.profile,reviewOf:input.routing?.reviewOf ?? null,
-    poolPacing:decision.pacing};
+    poolPacing:decision.pacing,taskFit:decision.taskFit,explanation:decision.explanation};
+  const fitContext=!override && taskFitContext({input,policy:quota?.routingPolicy});
+  if (fitContext?.strict && !fitContext.supportedPreferred.includes(configured)) throw taskFitError();
   const role=canonicalHarnessRole(input.agent);
   if (!override && input.routing?.complexity==='routine' && input.routing?.risk==='normal' && pace==='ahead' && ['builder','deep-debugger'].includes(role)) {
     const fast=modelReference(agents.find(a=>harnessRoleIDs('quick-builder').includes(a.id??a.name))?.model);
     // Never cross providers as a pacing fallback. The worker retains its role,
     // permissions, ownership and required capabilities; only inference changes.
-    if (fast && configured && fast.split('/')[0]===configured.split('/')[0]) {selected=fast;source='pace_routine';}
+    if (fast && configured && fast.split('/')[0]===configured.split('/')[0]
+      && (!fitContext?.strict || fitContext.supportedPreferred.includes(fast))) {selected=fast;source='pace_routine';}
   }
-  return {selected,configured,observed,source,pace,modelOverride:override};
+  const fallbackFit=!override && selectedTaskFit({input,policy:quota?.routingPolicy,ref:selected});
+  return {selected,configured,observed,source,pace,modelOverride:override,...(!override ? {taskFit:fallbackFit ?? {taskType:taskTypeFor(input),band:'acceptable',evidenceStatus:'provisional',reason:'no_supported_preference'}} : {})};
 }
 
 
@@ -119,6 +195,7 @@ export function chooseCandidate({input,quota}) {
   const role=canonicalHarnessRole(input.agent) ?? input.agent;
   const candidates=policy.roles?.[input.agent] ?? policy.roles?.[role];
   if (!Array.isArray(candidates)) return;
+  const fitContext=taskFitContext({input,policy});
   const reserve=Number.isFinite(policy.reservePercent)?Math.max(0,Math.min(10,policy.reservePercent)):2;
   const author=modelReference(input.routing.reviewOf), authorProvider=author?.split('/')[0];
   const choices=candidates.flatMap((c,index)=>{
@@ -126,14 +203,28 @@ export function chooseCandidate({input,quota}) {
     // Role candidates are explicitly approved capability peers, not price-ranked.
     const state=candidateState(c,quota,reserve);if(!state)return [];
     const independent=Boolean(authorProvider && c.ref.split('/')[0]!==authorProvider);
-    return [{...c,...state,index,independent}];
+    const fit=candidateFit(c,fitContext.taskType);
+    return [{...c,...state,index,independent,fit}];
   });
-  if(!choices.length)return;
+  if(!choices.length) return;
+  const eligible=fitContext.strict ? choices.filter(c=>c.fit.band==='preferred') : choices;
+  if (!eligible.length) return;
   // For requested independent review, prefer a capable different family when
   // its pool is healthy; a depleted pool never wins solely for diversity.
-  choices.sort((a,b)=>(Number(a.pressure)-Number(b.pressure))
+  const routine=input.routing?.complexity==='routine' && input.routing?.risk==='normal';
+  eligible.sort((a,b)=>(Number(a.pressure)-Number(b.pressure))
+    || (routine ? 0 : (a.fit.band===b.fit.band ? 0 : a.fit.band==='preferred' ? -1 : 1))
     || ((b.independent&&b.pace!=='ahead'?40:0)+b.score)-((a.independent&&a.pace!=='ahead'?40:0)+a.score)
     || a.index-b.index);
-  const chosen=choices[0];
-  return {...chosen,profile:policy.profiles?.[chosen.profile] ?? chosen.profile,reason:authorProvider&&chosen.independent?'cross_family_review':'subscription_pool_selection'};
+  const chosen=eligible[0];
+  const pressureTradeoff=!routine && chosen.fit.band==='acceptable' && choices.some(c=>c.fit.band==='preferred' && c.pressure) && !chosen.pressure;
+  const explanation=fitContext.strict ? 'protected_task_fit_floor'
+    : pressureTradeoff ? 'healthy_acceptable_over_pressured_preferred'
+    : routine ? 'routine_quota_balance'
+    : chosen.fit.band==='preferred' ? 'supported_task_fit_preference'
+    : fitContext.supportedPreferred.length ? 'acceptable_when_preferred_ineligible'
+    : 'no_supported_preference_quota_balance';
+  return {...chosen,profile:policy.profiles?.[chosen.profile] ?? chosen.profile,reason:authorProvider&&chosen.independent?'cross_family_review':'subscription_pool_selection',
+    taskFit:{taskType:fitContext.taskType,band:chosen.fit.band,evidenceStatus:chosen.fit.evidenceStatus,reason:chosen.fit.reason},
+    explanation};
 }

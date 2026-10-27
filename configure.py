@@ -9,6 +9,27 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+TASK_TYPES = {'general','exploration','mechanical','implementation','debugging','architecture','testing','review'}
+
+
+def validate_task_fit(candidate):
+    if 'taskFit' not in candidate:
+        return
+    rules = candidate['taskFit']
+    if not isinstance(rules, dict) or not set(rules).issubset(TASK_TYPES):
+        raise ValueError('invalid candidate task-fit policy')
+    for rule in rules.values():
+        if (not isinstance(rule, dict) or not set(rule).issubset({'band','evidence_status','evidence_ref'})
+                or rule.get('band') not in ('preferred','acceptable')
+                or rule.get('evidence_status') not in ('provisional','supported')):
+            raise ValueError('invalid candidate task-fit rule')
+        ref = rule.get('evidence_ref')
+        if 'evidence_ref' in rule and (not isinstance(ref, str) or not ref.strip() or len(ref) > 240 or any(c in ref for c in '\r\n\0')):
+            raise ValueError('invalid task-fit evidence reference')
+        if rule['band'] == 'preferred' and rule['evidence_status'] == 'supported' and ref is None:
+            raise ValueError('supported task-fit preference requires evidence reference')
+
+
 NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','deep-debugger','deep-debugger-high','architect','reviewer','maximum','maximum-max')
 ROLES = {
     'router': ('STRONG', True, True),
@@ -94,6 +115,7 @@ def profile(models, package_root=ROOT, routing_policy=None):
                 ref = candidate.get('ref')
                 if not isinstance(ref, str) or not re.fullmatch(r'(openai|anthropic)/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+', ref):
                     raise ValueError('routing candidates must be discovered subscription model variants')
+                validate_task_fit(candidate)
                 if routing_policy.get('enabled') is True and candidate.get('enabled', True) is not False:
                     provider = ref.split('/')[0]
                     if provider not in providers:

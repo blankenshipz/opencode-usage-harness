@@ -6,102 +6,222 @@
     "scout": [
       {
         "ref": "openai/gpt-6-luna#low",
-        "profile": "openai-luna"
+        "profile": "openai-luna",
+        "taskFit": {
+          "exploration": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-haiku-5-5#low",
-        "profile": "claude-haiku"
+        "profile": "claude-haiku",
+        "taskFit": {
+          "exploration": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ],
     "quick-builder": [
       {
         "ref": "openai/gpt-6-luna#medium",
-        "profile": "openai-luna"
+        "profile": "openai-luna",
+        "taskFit": {
+          "mechanical": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-haiku-5-5#medium",
-        "profile": "claude-haiku"
+        "profile": "claude-haiku",
+        "taskFit": {
+          "mechanical": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ],
     "builder": [
       {
         "ref": "openai/gpt-6.1-sol#medium",
-        "profile": "openai-sol"
+        "profile": "openai-sol",
+        "taskFit": {
+          "implementation": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-sonnet-5-5#high",
-        "profile": "claude-sonnet"
+        "profile": "claude-sonnet",
+        "taskFit": {
+          "implementation": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ],
     "builder-high": [
       {
         "ref": "openai/gpt-6.1-sol#high",
-        "profile": "openai-sol"
+        "profile": "openai-sol",
+        "taskFit": {
+          "implementation": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-opus-5-5#medium",
-        "profile": "claude-opus"
+        "profile": "claude-opus",
+        "taskFit": {
+          "implementation": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ],
     "deep-debugger": [
       {
         "ref": "openai/gpt-6.1-sol#medium",
-        "profile": "openai-sol"
+        "profile": "openai-sol",
+        "taskFit": {
+          "debugging": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-opus-5-5#medium",
-        "profile": "claude-opus"
+        "profile": "claude-opus",
+        "taskFit": {
+          "debugging": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ],
     "deep-debugger-high": [
       {
         "ref": "openai/gpt-6.1-sol#high",
-        "profile": "openai-sol"
+        "profile": "openai-sol",
+        "taskFit": {
+          "debugging": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-opus-5-5#high",
-        "profile": "claude-opus"
+        "profile": "claude-opus",
+        "taskFit": {
+          "debugging": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ],
     "architect": [
       {
         "ref": "openai/gpt-6.1-sol#high",
-        "profile": "openai-sol"
+        "profile": "openai-sol",
+        "taskFit": {
+          "architecture": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-opus-5-5#high",
-        "profile": "claude-opus"
+        "profile": "claude-opus",
+        "taskFit": {
+          "architecture": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ],
     "reviewer": [
       {
         "ref": "openai/gpt-6.1-sol#high",
-        "profile": "openai-sol"
+        "profile": "openai-sol",
+        "taskFit": {
+          "review": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-opus-5-5#high",
-        "profile": "claude-opus"
+        "profile": "claude-opus",
+        "taskFit": {
+          "review": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ],
     "maximum": [
       {
         "ref": "openai/gpt-6-astra#high",
-        "profile": "openai-astra"
+        "profile": "openai-astra",
+        "taskFit": {
+          "general": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-fable-5-1#high",
         "profile": "claude-fable",
-        "requiresScopedQuota": true
+        "requiresScopedQuota": true,
+        "taskFit": {
+          "general": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ],
     "coordinator": [
       {
         "ref": "openai/gpt-6.1-sol#medium",
-        "profile": "openai-sol"
+        "profile": "openai-sol",
+        "taskFit": {
+          "general": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       },
       {
         "ref": "anthropic/claude-opus-5-5#medium",
-        "profile": "claude-opus"
+        "profile": "claude-opus",
+        "taskFit": {
+          "general": {
+            "band": "acceptable",
+            "evidence_status": "provisional"
+          }
+        }
       }
     ]
   },

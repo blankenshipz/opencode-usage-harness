@@ -27,7 +27,7 @@ Publishing or installing the toolkit does not make native runtime patches live.
 |---|---|
 | Choose the right level of reasoning | Specialist roles for exploration, implementation, debugging, architecture, and review, mapped to models and efforts you select from your actual catalog. |
 | See whether capacity is running out or going unused | Independent OpenAI/Codex and Claude quota views, reset times, pacing, and model-scoped limits where exposed; missing data stays unknown. |
-| Choose between subscription pools | Opt-in selection among approved model/effort candidates for new work, with continuation affinity and optional cross-family review. |
+| Combine model strengths with quota pacing | Task-specific, evidence-backed preferences among approved model/effort peers; independent quota balancing, sticky continuations and optional cross-family review. |
 | Keep large files from crowding the main agent's context | A 350-line broad-read threshold, focused worker summaries, targeted reads, and reasoned one-use exceptions. |
 | Keep delegated work connected to the task | Shared task intent, scoped worker ownership, resumption, and recorded acceptance evidence. |
 | Understand what your agents accomplished | Workload metrics for usage, observed execution time, retries and reported acceptance, with overlap and unknowns called out. |
@@ -157,16 +157,40 @@ unavailable pool is not retried through another provider. `reviewOf` requests a
 meaningful independent peer review only when the policy has a healthy capable
 peer; the harness never creates an automatic review.
 
-### Model families and independent review
+### Task fit, model families and independent review
 
-Candidate policies can attach behavior-profile guidance to a model choice and use
-`reviewOf` to prefer a healthy, approved peer from the other family. That lets a
-Claude reviewer check OpenAI work, or an OpenAI reviewer check Claude work, when
-independent review is justified. Profiles are task guidance, not measured proof
-that one family is always better at implementation, planning or review. Choose
-capability peers from the actual catalog and judge them by accepted outcomes,
-corrections and total usage. A single-family setup keeps the same workflow without
-requiring a second reviewer or subscription.
+Selection combines **task fit → suitable model/effort peers → independent quota
+pace**. An optional `routing.taskType` classifies exploration, mechanical changes,
+implementation, debugging, architecture, testing, review or general work. Older
+callers infer a task type from the harness role. Tool capabilities remain separate:
+a file-only reviewer still cannot execute a requested test.
+
+Each exact candidate reference can declare a task-specific `preferred` or
+`acceptable` band. Only `preferred` rules marked `supported` with an evidence
+reference affect the quality preference; missing or provisional rules remain
+neutral. A reference records an operator-reviewed claim, not automatic proof.
+The shipped example and the initial live policy keep unproven pairs acceptable
+and provisional rather than inventing a winner for a provider family.
+
+| Work | How fit and quota combine |
+|---|---|
+| Routine, normal risk | Quota pace chooses among approved adequate peers. |
+| Standard, normal risk | A healthy supported-preferred candidate wins over acceptable peers; pressure or unavailability can justify an acceptable healthy peer for new work. |
+| Complex or high risk | Declared supported-preferred candidates set the fit floor. Spare quota cannot silently substitute an acceptable model. If selection cannot meet the floor, the router reports `ROUTING_TASK_FIT_UNAVAILABLE`; an exact preferred configured model may still go through normal financial admission. |
+| Meaningful independent review | Prefer another family within the eligible fit/health group, without automatically creating a review. |
+| Explicit model or admitted continuation | Manual selection or recorded affinity wins; financial and native permission gates still apply. |
+
+The local fit policy is retained when quota reads fail. Invalid policy raises a
+sanitized error instead of falling through silently. Routing status records the
+task type, effective band, evidence status and decision explanation without copying
+private evidence references. See [policy configuration and examples](docs/NATIVE-AND-MULTI-POOL.md#task-fit-preferences).
+
+Candidate behavior-profile guidance remains useful alongside these rules. Judge
+strengths per model version, reasoning effort and task type using accepted results,
+repairs, confirmed review findings, user corrections, elapsed time and actual quota
+observations. The harness does not automatically promote a preference or learn a
+brand ranking from self-reported success; evidence-based policy updates remain
+explicit. A single-family setup uses the same rules and needs no second subscription.
 
 ### Quota monitoring: shared view, provider-specific evidence
 
@@ -218,7 +242,7 @@ its original role, permissions and ownership.
 
 With an enabled candidate policy, fresh work can instead choose among explicitly
 approved model/effort peers using account and matching model-scoped pressure.
-The selector compares each provider’s own windows; quota percentages are never
+Within the task-fit rules above, the selector compares each provider’s own windows; quota percentages are never
 added together. It favors healthy, approved capability peers, considers the
 limiting applicable weekly window and its reset, and applies a configurable
 reserve (2% by default). More useful work can go to the pool further behind pace

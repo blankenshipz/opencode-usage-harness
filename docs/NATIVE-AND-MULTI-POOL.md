@@ -99,6 +99,65 @@ clients may consume allowance between observations. The harness does not launch
 work merely to drain a pool, escalate tiers solely for consumption, move admitted
 workers between providers, or retry a denial through another subscription.
 
+## Task-fit preferences
+
+Policy version 1 accepts an optional `taskFit` map on each candidate. The rule
+belongs to that exact `provider/model#effort` reference, rather than the whole
+provider family or every reasoning setting. Existing policies without the field
+retain quota-based peer selection.
+
+The keys are `general`, `exploration`, `mechanical`, `implementation`, `debugging`,
+`architecture`, `testing` and `review`. The dispatcher accepts optional
+`routing.taskType`; otherwise the role supplies a backward-compatible default.
+Maximum/coordinator default to `general`. Requirements and risk must be classified
+honestly, and native tool permissions still determine what the worker can do.
+
+A schematic candidate rule is:
+
+```json
+{
+  "ref": "openai/<discovered-model>#<supported-effort>",
+  "taskFit": {
+    "debugging": {
+      "band": "preferred",
+      "evidence_status": "supported",
+      "evidence_ref": "your-reviewed-validation-receipt"
+    }
+  }
+}
+```
+
+Replace the model/effort placeholders with catalog references. Only a
+`supported` + `preferred` rule with a nonblank evidence reference establishes a
+preference. The reference is bounded to 240 characters with no newlines; it is
+kept in private configuration and is not read, uploaded or copied into routing
+status. It declares reviewed evidence; the router does not independently verify
+that receipt. `acceptable` and `provisional` rules may omit the reference.
+Malformed rule types, unknown task types or invalid supported preference evidence
+fail with `ROUTING_POLICY_INVALID`.
+
+Routine normal-risk work balances approved adequate peers by quota. Standard
+normal-risk work ranks healthy pools first, then supported task-fit preference,
+then independent-review and quota preferences within that group. A healthy
+acceptable peer can therefore replace a pressured or unavailable preferred peer
+for a fresh assignment. Complex or high-risk work restricts automatic selection
+to supported-preferred candidates when any are declared for that role/task.
+If none can be selected, configured fallback must itself be an exact preferred
+reference or the dispatcher raises `ROUTING_TASK_FIT_UNAVAILABLE`. This never
+approves spending or replaces an admitted worker. Explicit model overrides still
+pass through the normal financial/native gates, and continuations retain their
+admitted choice and fit explanation.
+
+Local policy validation runs separately from advisory telemetry. A failed quota
+read cannot erase a fit floor; unknown pools retain their normal admission
+limitations. The selected route records sanitized `taskFit` metadata and a small
+decision explanation. The initial example and live policy use neutral acceptable,
+provisional rules because provider-specific comparative evidence is not yet
+established. Use ordinary accepted work to review preferences; there is no
+automatic training, preference promotion, extra benchmark call or token-burning
+job. Update policy and the compatible plugin artifacts together at an idle point;
+older plugin revisions do not implement these optional preference rules.
+
 ## Reviews and behavior profiles
 
 Set `routing.reviewOf` to the admitted model reference only when the task calls

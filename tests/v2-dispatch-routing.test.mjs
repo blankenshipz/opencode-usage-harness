@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {selectDispatchModel,quotaPace,modelReference} from '../plugins/v2/dispatch-routing.mjs';
+import {selectDispatchModel,quotaPace,modelReference,validateTaskFitPolicy,taskTypeFor,readRoutingPolicy,readRoutingQuota} from '../plugins/v2/dispatch-routing.mjs';
 const agent={id:'builder',model:{providerID:'openai',id:'balanced',variant:'medium'}};
 const agents=[agent,{id:'quick-builder',model:{providerID:'openai',id:'fast',variant:'low'}}];
 const quota={checked_at:new Date().toISOString(),buckets:[{windows:[{pace_delta:60,remaining_percent:34}]}]};
@@ -168,4 +168,83 @@ test('required scoped quota needs a current matching meter',()=>{
 test('one available pool with an unknown reset falls back to the configured role',()=>{
  const q=multi();delete q.pools.anthropic;q.pools.openai.windows=[{scope:'account',used_percent:20,remaining_percent:80}];
  assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'openai/balanced#medium');
+});
+
+function fitPolicy() {
+ return {version:1,enabled:true,roles:{builder:[
+  {ref:'openai/sol#medium',taskFit:{implementation:{band:'preferred',evidence_status:'supported',evidence_ref:'benchmark-42'}}},
+  {ref:'anthropic/sonnet#high',taskFit:{implementation:{band:'acceptable',evidence_status:'supported'}}}
+ ]}};
+}
+test('standard work ranks supported fit ahead of larger healthy spare quota, while routine balances quota',()=>{
+ const q=multi();q.routingPolicy=fitPolicy();q.pools.openai=pool('openai',-5);q.pools.anthropic=pool('anthropic',-50);
+ const standard=selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q});
+ assert.equal(standard.selected,'openai/sol#medium');
+ assert.equal(standard.explanation,'supported_task_fit_preference');
+ assert.deepEqual(standard.taskFit,{taskType:'implementation',band:'preferred',evidenceStatus:'supported',reason:'supported_preferred'});
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'routine',risk:'normal'}},quota:q}).selected,'anthropic/sonnet#high');
+});
+test('a healthy acceptable route can replace a pressured preferred route for standard new work',()=>{
+ const q=multi();q.routingPolicy=fitPolicy();q.pools.openai=pool('openai',20);q.pools.anthropic=pool('anthropic',0);
+ const result=selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q});
+ assert.equal(result.selected,'anthropic/sonnet#high');
+ assert.equal(result.explanation,'healthy_acceptable_over_pressured_preferred');
+});
+test('complex/high-risk work rejects lower fit but permits an exact preferred configured fallback',()=>{
+ const q=multi();q.routingPolicy=fitPolicy();q.pools.openai.availability='unavailable';
+ const input={agent:'builder',routing:{complexity:'complex',risk:'high'}};
+ assert.throws(()=>selectDispatchModel({...base,input,quota:q}),error=>error.code==='ROUTING_TASK_FIT_UNAVAILABLE');
+ const configured={id:'builder',model:'openai/sol#medium'};
+ const fallback=selectDispatchModel({...base,agent:configured,input,quota:q});
+ assert.equal(fallback.selected,'openai/sol#medium');
+ assert.deepEqual(fallback.taskFit,{taskType:'implementation',band:'preferred',evidenceStatus:'supported',reason:'supported_preferred'});
+});
+test('provisional preferred is neutral and task type inference remains backward compatible',()=>{
+ const q=multi();q.routingPolicy=fitPolicy();q.routingPolicy.roles.builder[0].taskFit.implementation={band:'preferred',evidence_status:'provisional'};
+ q.pools.openai=pool('openai',-5);q.pools.anthropic=pool('anthropic',-50);
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'anthropic/sonnet#high');
+ assert.equal(taskTypeFor({agent:'scout',routing:{}}),'exploration');
+ assert.equal(taskTypeFor({agent:'harness-builder-high',routing:{}}),'implementation');
+ assert.equal(taskTypeFor({agent:'deep-debugger-high',routing:{}}),'debugging');
+ assert.equal(taskTypeFor({agent:'reviewer',routing:{}}),'review');
+});
+test('task-fit policy validation rejects malformed evidence without leaking it',()=>{
+ const valid={version:1,enabled:true,roles:{builder:[{ref:'openai/sol#medium',taskFit:{}}]}};
+ const badEvidence=structuredClone(valid);badEvidence.roles.builder[0].taskFit.implementation={band:'preferred',evidence_status:'supported',evidence_ref:'secret\nraw'};
+ const badType=structuredClone(valid);badType.roles.builder[0].taskFit.unknown={band:'acceptable',evidence_status:'provisional'};
+ assert.throws(()=>validateTaskFitPolicy(badEvidence),error=>error.code==='ROUTING_POLICY_INVALID' && !error.message.includes('secret'));
+ assert.throws(()=>validateTaskFitPolicy(badType),error=>error.code==='ROUTING_POLICY_INVALID');
+ assert.throws(()=>readRoutingPolicy({readFile:()=>'{bad json'}),error=>error.code==='ROUTING_POLICY_INVALID' && !error.message.includes('json'));
+});
+test('disabled preferred candidates do not restrict selection, and continuations retain admitted fit metadata',()=>{
+ const q=multi();q.routingPolicy=fitPolicy();q.routingPolicy.roles.builder[0].enabled=false;
+ q.pools.openai.availability='unavailable';
+ const input={agent:'builder',routing:{complexity:'complex',risk:'high'}};
+ assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'anthropic/sonnet#high');
+ const admitted={selected:'openai/sol#medium',taskFit:{taskType:'implementation',band:'preferred',evidenceStatus:'supported',reason:'supported_preferred'}};
+ const continued=selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'routine',risk:'normal',taskType:'mechanical'}},quota:q,record:{routing:admitted},child:{model:admitted.selected}});
+ assert.deepEqual(continued.taskFit,admitted.taskFit);
+});
+test('disabled policy is neutral, and task fit outranks cross-family review affinity',()=>{
+ const q=multi();q.routingPolicy={...fitPolicy(),enabled:false};q.pools.openai=pool('openai',-5);q.pools.anthropic=pool('anthropic',-50);
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'openai/balanced#medium');
+ q.routingPolicy={version:1,enabled:true,roles:{reviewer:[
+  {ref:'openai/sol#high',taskFit:{review:{band:'preferred',evidence_status:'supported',evidence_ref:'review-evidence'}}},
+  {ref:'anthropic/opus#high',taskFit:{review:{band:'acceptable',evidence_status:'supported'}}}
+ ]}};
+ q.pools.openai=pool('openai',0);q.pools.anthropic=pool('anthropic',0);
+ assert.equal(selectDispatchModel({...base,input:{agent:'reviewer',routing:{complexity:'standard',risk:'normal',reviewOf:'openai/sol#medium'}},quota:q}).selected,'openai/sol#high');
+});
+test('policy is retained when catalog or telemetry reads fail',async()=>{
+ const policy=fitPolicy();
+ const catalogFailure=await readRoutingQuota({model:{list:async()=>{throw new Error('offline');}}},{readPolicy:()=>policy});
+ assert.equal(catalogFailure.routingPolicy,policy);assert.deepEqual(catalogFailure.pools,{});
+ const telemetryFailure=await readRoutingQuota({model:{list:async()=>({data:catalog})}},{readPolicy:()=>policy,readQuota:async()=>{throw new Error('offline');}});
+ assert.equal(telemetryFailure.routingPolicy,policy);assert.deepEqual(telemetryFailure.pools,{});
+});
+
+test('policy reader rejects unsupported or malformed provider references',()=>{
+ for (const ref of ['other/model#high','openai/nested/model#high','anthropic/model','openai/model#bad effort']) {
+  assert.throws(()=>readRoutingPolicy({readFile:()=>JSON.stringify({version:1,enabled:true,roles:{builder:[{ref}]}})}),error=>error.code==='ROUTING_POLICY_INVALID' && !error.message.includes(ref));
+ }
 });
