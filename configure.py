@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prepare an isolated OpenCode V2 profile; never migrate or start a service."""
 import argparse
+import copy
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','deep-debugger','deep-debugger-high','architect','reviewer','maximum','maximum-max')
 ROLES = {
     'router': ('STRONG', True, True),
     'coordinator': ('BALANCED', True, True),
@@ -19,6 +21,51 @@ ROLES = {
     'reviewer': ('STRONG', False, True),
     'maximum': ('MAXIMUM', False, False),
 }
+
+def visible_role(role):
+    return f'harness-{role}'
+
+def namespace_harness_agents(agents):
+    """Return a config with visible harness IDs and exact-ID compatibility aliases.
+
+    This is intentionally a pure transformation for an already customized live
+    config: models, prompts, permissions, modes, and existing hidden flags are
+    copied. Existing IDs remain valid for persisted sessions; only new aliases
+    are added. High-effort roles keep their configured hidden state.
+    """
+    result = copy.deepcopy(agents)
+    for role in NAMESPACED_ROLES:
+        old = result.get(role)
+        if not isinstance(old, dict):
+            continue
+        visible = visible_role(role)
+        if visible not in result:
+            alias = copy.deepcopy(old)
+            if role in ('builder-high','deep-debugger-high','maximum-max'):
+                alias['hidden'] = bool(old.get('hidden', True))
+            else:
+                alias['hidden'] = False
+            result[visible] = alias
+        old['hidden'] = True
+        guidance = ('\nUse visible harness-* IDs for new handoffs. When continuing an existing worker, '
+                    'pass its exact stored agent ID and sessionID; never rename or adopt it.')
+        for agent_id in (role, visible):
+            if guidance not in result[agent_id].get('system', ''):
+                result[agent_id]['system'] = result[agent_id].get('system', '') + guidance
+        for agent_id in (role, visible):
+            permissions = result[agent_id].setdefault('permissions', [])
+            existing = {(entry.get('action'), entry.get('resource'), entry.get('effect')) for entry in permissions}
+            expanded = []
+            for entry in permissions:
+                expanded.append(entry)
+                if entry.get('action') == 'subagent' and entry.get('resource') in NAMESPACED_ROLES:
+                    alias = {**entry, 'resource': visible_role(entry['resource'])}
+                    key = (alias.get('action'), alias.get('resource'), alias.get('effect'))
+                    if key not in existing:
+                        expanded.append(alias)
+                        existing.add(key)
+            permissions[:] = expanded
+    return result
 
 def profile(models, package_root=ROOT, routing_policy=None):
     if not isinstance(models, dict):
@@ -59,11 +106,17 @@ def profile(models, package_root=ROOT, routing_policy=None):
                  {'action':'large_file_allow_direct','resource':'*','effect':'deny' if readonly else 'allow'},
                  {'action':'task_dispatch','resource':'*','effect':'allow' if delegate else 'deny'}]
         if delegate:
-            rules += [{'action':'subagent','resource':child,'effect':'allow'} for child in ROLES if child != 'router' and (role == 'router' or child != 'coordinator')]
+            children = [child for child in ROLES if child != 'router' and (role == 'router' or child != 'coordinator')]
+            rules += [{'action':'subagent','resource':child_id,'effect':'allow'}
+                      for child in children for child_id in (child, visible_role(child))]
         if readonly:
             rules += [{'action':a,'resource':'*','effect':'deny'} for a in ('shell','edit')]
-        agents[role] = {'description':role.replace('-',' '), 'mode':'primary' if role == 'router' else 'all',
-            'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf'], 'permissions':rules}
+        identity_guidance = ('\nUse visible harness-* IDs for new handoffs. When continuing an existing worker, '
+                             'pass its exact stored agent ID and sessionID; never rename or adopt it.')
+        definition = {'description':f'harness {role.replace("-", " ")}', 'mode':'primary' if role == 'router' else 'all',
+            'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance, 'permissions':rules}
+        agents[visible_role(role)] = definition
+        agents[role] = {**definition, 'description':role.replace('-', ' '), 'hidden':True}
     for builtin in ('build','plan','general','explore'):
         agents[builtin] = {'disabled':False, 'permissions':[
             {'action':action,'resource':'*','effect':'deny'} for action in
@@ -82,7 +135,7 @@ def profile(models, package_root=ROOT, routing_policy=None):
     for command in ('pwd','git status*','git diff*','git log*','npm test*','npm run test*','pytest*','python3 -m pytest*','go test*','gofmt *'):
         permissions.append({'action':'shell','resource':command,'effect':'allow'})
     return {'$schema':'https://opencode.ai/v2/config.json','enabled_providers':providers,'experimental':{'policies':[{'effect':'deny','action':'provider.use','resource':'*'}]+[{'effect':'allow','action':'provider.use','resource':provider} for provider in providers]},'share':'disabled','update':'disable',
-        'default_agent':'router','model':models['STRONG'],'permissions':permissions,'agents':agents,
+        'default_agent':'harness-router','model':models['STRONG'],'permissions':permissions,'agents':agents,
         'plugins':[(package_root/'plugins/v2'/p).resolve().as_uri() for p in ('subscription-guard','model-status','task-outcomes','large-file-context')]}
 
 def main():

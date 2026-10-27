@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRegistry, runtimeSessions, lineage } from './dispatch-registry.mjs';
 import { statePath } from './paths.mjs';
+import { canonicalHarnessRole } from './agent-mode.mjs';
 const validID=x=>typeof x==='string'&&/^[A-Za-z0-9_-]{1,160}$/.test(x);
 const label=x=>typeof x==='string'&&/^[a-z][a-z0-9-]{0,63}$/.test(x)&&!/^sk-/.test(x)?x:'check';
 const digest=x=>crypto.createHash('sha256').update(JSON.stringify(x)).digest('hex');
@@ -12,7 +13,7 @@ export function summarizeCheckpoint(record,actor) {
   if(record.scope!=='checkpoint'||!validID(record.sessionId))return null;
   const checks=(record.results??[]).filter(x=>['passed','failed','blocked'].includes(x.status)).map(x=>({id:label(x.id),status:x.status})).slice(0,12).sort((a,b)=>a.id.localeCompare(b.id));
   if(!checks.length&&!['completed','blocked','failed'].includes(record.status)&&record.progressState!=='waiting_dependency')return null;
-  const role=roles.has(actor)?actor:'worker', blocker=kinds.has(record.blocker?.kind)?record.blocker.kind:null;
+  const canonical=canonicalHarnessRole(actor); const role=roles.has(canonical??actor)?(canonical??actor):'worker', blocker=kinds.has(record.blocker?.kind)?record.blocker.kind:null;
   const urgent=record.progressState==='needs_user_action'||record.status==='failed'||(record.status==='blocked'&&blocker!=='implementation');
   const status=['completed','blocked','failed','in_progress'].includes(record.status)?record.status:'in_progress';
   const activity=record.progressState==='waiting_dependency'?'waiting on assigned worker':record.progressState==='needs_user_action'?'needs user action':record.status==='in_progress'?'working':null;

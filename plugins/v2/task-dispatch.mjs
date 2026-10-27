@@ -10,7 +10,7 @@ import { packageRoot } from './paths.mjs';
 import { createWorkerProgress } from './worker-progress.mjs';
 import { admissionDenial, denialAdvice, receipt, suppression } from './denial-recovery.mjs';
 import { quotaRecoveryReceipt, enqueueQuotaRecovery, deliverQuotaRecovery, pendingQuotaRecovery, quotaRecoverySyntheticInput } from './quota-recovery.mjs';
-import { guardNativeDispatch, isHarnessDispatchInput, isNativeAgent } from './agent-mode.mjs';
+import { guardNativeDispatch, isHarnessDispatchInput, isNativeAgent, canonicalHarnessRole } from './agent-mode.mjs';
 // Eligibility is not a permission grant: the native executor still owns authorization and depth.
 export function hasCapability(agent, capability) {
   const rules = agent.permissions ?? [], action = capability === 'delegate' ? 'subagent' : capability;
@@ -195,7 +195,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       if (input.operation === 'coordinate') required.add('delegate');
       // Known executable requests cannot masquerade as file-only scouting.
       if (input.operation !== 'coordinate' && /\b(?:git history|commit history|git\s+(?:log|show|status|diff|rev-parse))\b/i.test(input.prompt)) required.add('shell');
-      if (input.agent === 'coordinator' && (input.operation !== 'coordinate' || !required.has('delegate'))) throw new Error('task-dispatch: coordinator requires operation coordinate and terminal-worker delegation');
+      const role = canonicalHarnessRole(input.agent) ?? input.agent;
+      if (role === 'coordinator' && (input.operation !== 'coordinate' || !required.has('delegate'))) throw new Error('task-dispatch: coordinator requires operation coordinate and terminal-worker delegation');
       const missing = [...required].filter(c => !hasCapability(agent,c));
       if (missing.length) throw new Error(`task-dispatch: ${input.agent} cannot perform ${missing.join(', ')}; use builder for executable inspection/implementation`);
       const writes = paths(input, agent), token = crypto.randomUUID();
@@ -217,7 +218,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           }
         }
         const intent = getIntent(state,rootID,input.taskId);
-        const summaryOnly = input.taskId === 'large-file-summary' && input.operation === 'inspect' && input.agent === 'scout' && input.requiredCapabilities.length === 0;
+        const summaryOnly = input.taskId === 'large-file-summary' && input.operation === 'inspect' && role === 'scout' && input.requiredCapabilities.length === 0;
         if (intent) bindIntent(state,{rootID,taskId:input.taskId,intentRevision:input.intentRevision,checkIds:input.checkIds});
         else if (!summaryOnly && !record && !input.sessionID) throw new Error('task-intent: register the user outcome with task_intent before a new handoff; then pass intentRevision and checkIds');
         const requested = input.sessionID ?? record?.childID;
@@ -242,10 +243,10 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         if (denied) throw new Error(`task-dispatch: admission remains denied (${denied.category}). ${denialAdvice(denied.category)} Inspect task_dispatch_status for the receipt.`);
         // Include pre-upgrade tasks and all descendants, even when a parent failed quota admission.
         const busy = sessions.filter(s => s.active && s.directory === workspace && s.id !== requested && s.id !== context.sessionID && !descendant(sessions,context.sessionID,s.id));
-        if (input.agent === 'coordinator' && !requested) {
-          const duplicate = sessions.find(s => s.id !== requested && s.agent === 'coordinator' && lineage(sessions,s.id) === rootID && !descendant(sessions,context.sessionID,s.id) && (s.active || sessions.some(child => child.active && descendant(sessions,child.id,s.id))));
+        if (role === 'coordinator' && !requested) {
+          const duplicate = sessions.find(s => s.id !== requested && canonicalHarnessRole(s.agent) === 'coordinator' && lineage(sessions,s.id) === rootID && !descendant(sessions,context.sessionID,s.id) && (s.active || sessions.some(child => child.active && descendant(sessions,child.id,s.id))));
           if (duplicate) throw new Error(`task-dispatch: coordinator ${duplicate.id} already owns this task; resume it using its original parent, do not create another`);
-          const pending = state.records.find(r => r.key !== key && r.rootID === rootID && r.agent === 'coordinator' && (r.inFlight || sessions.some(s => s.active && (s.id === r.childID || descendant(sessions,s.id,r.childID)))));
+          const pending = state.records.find(r => r.key !== key && r.rootID === rootID && canonicalHarnessRole(r.agent) === 'coordinator' && (r.inFlight || sessions.some(s => s.active && (s.id === r.childID || descendant(sessions,s.id,r.childID)))));
           if (pending) throw new Error(`task-dispatch: coordinator ownership already reserved for ${pending.childID ?? pending.workKey}`);
         }
         if (writes.length) {
@@ -372,7 +373,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID);const awaiting=r.state==='running'&&!native?.active;return {...r,key:undefined,recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,nativeExecution:{active:!!native?.active,lastIdleOutcome:native?.lastIdleOutcome},workCheckpoint:checkpointStatus(r,now()),verificationAttempt:r.attemptIntentRevision===getIntent(state,rootID,r.taskId)?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
-      function agentsForStatus(s) { return s.agent !== 'router' && !descendant(sessions,context.sessionID,s.id); }
+      function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }
       const knownParentIDs=new Set(state.records.filter(r=>r.rootID===rootID).map(r=>r.parentID));
       return {content:JSON.stringify({owners,quotaRecoveryPending:pendingQuotaRecovery(state,{parentID:rootID}).filter(entry=>knownParentIDs.has(entry.target.parentID)),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
     })});

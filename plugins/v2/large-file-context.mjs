@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { shellReads as legacyShellReads } from '../large-file-context/core.mjs';
-import { isNativeAgent } from './agent-mode.mjs';
+import { isNativeAgent, canonicalHarnessRole } from './agent-mode.mjs';
 
 const LIMIT = 350;
 const SUMMARY_LIMIT = 6000;
@@ -208,11 +208,11 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
           description: `Router/coordinator only: ask a fresh foreground scout to summarize a large file using targeted native reads of at most ${LIMIT} lines. Leaf agents should use explicit bounded native reads or ask their parent for a summary.`,
           input: { type: 'object', additionalProperties: false, properties: { path: { type: 'string' }, question: { type: 'string', minLength: 1, maxLength: 2000 } }, required: ['path', 'question'] },
           execute: async (input, context) => {
-            if (!delegatingAgents.has(context.agent)) return denial(`large-file-context: ${context.agent ?? 'this agent'} cannot create a nested scout; do not retry this tool. Use an explicit bounded native read (limit <= ${LIMIT}) or ask a router or coordinator to request large_file_summary.`);
+            if (!delegatingAgents.has(canonicalHarnessRole(context.agent))) return denial(`large-file-context: ${context.agent ?? 'this agent'} cannot create a nested scout; do not retry this tool. Use an explicit bounded native read (limit <= ${LIMIT}) or ask a router or coordinator to request large_file_summary.`);
             if (!nativeSubagent) return denial(`large-file-context: native subagent tool is unavailable. Use an explicit bounded native read (limit <= ${LIMIT}) or ask the parent to summarize the file.`);
             const check = await preflight(input, context);
             if (check.kind !== 'large') return denial(`large_file_summary is only for a file that exceeds the direct-read limit; use an explicit bounded native read (limit <= ${LIMIT}).`);
-            const result = await nativeSubagent({ taskId: 'large-file-summary', workKey: `summary-${input.path}`.slice(0,160), operation: 'inspect', requiredCapabilities: [], agent: 'scout', description: 'Summarize large file', background: false,
+            const result = await nativeSubagent({ taskId: 'large-file-summary', workKey: `summary-${input.path}`.slice(0,160), operation: 'inspect', requiredCapabilities: [], agent: context.agent === `harness-${canonicalHarnessRole(context.agent)}` ? 'harness-scout' : 'scout', description: 'Summarize large file', background: false,
               prompt: `Analyze ${JSON.stringify(input.path)} for this question: ${input.question}\nUse only native read calls with explicit offset and limit <= ${LIMIT}. Do not use file attachments, shell dumps, edits, or subagents. Return concise findings with file:line references in at most ${SUMMARY_LIMIT} characters.` }, context);
             const output = String(result?.output?.output ?? result?.content ?? '');
             if (!output || output.length > SUMMARY_LIMIT) return denial(`large-file-context: scout did not return a bounded summary. Use explicit bounded native reads (limit <= ${LIMIT}) or retry through the router or coordinator with a narrower question.`);
@@ -224,7 +224,7 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
           description: `Record one direct read of an unchanged large file. The reason is retained for audit context; the grant expires after 60 seconds and is consumed before the native read starts. Explicit bounded native reads (limit <= ${LIMIT}) remain available.`,
           input: { type: 'object', additionalProperties: false, properties: { path: { type: 'string' }, reason: { type: 'string', minLength: 8, maxLength: 1000 } }, required: ['path', 'reason'] },
           execute: async (input, context) => {
-            if (READ_ONLY_AGENTS.has(context.agent)) return denial(`large-file-context: ${context.agent} cannot request a direct-read exception. Use an explicit bounded native read (limit <= ${LIMIT}) or ask the parent for an approved exception.`);
+            if (READ_ONLY_AGENTS.has(canonicalHarnessRole(context.agent))) return denial(`large-file-context: ${context.agent} cannot request a direct-read exception. Use an explicit bounded native read (limit <= ${LIMIT}) or ask the parent for an approved exception.`);
             if (input.path.startsWith('~')) return denial(`large-file-context: direct grants do not support tilde paths. Use an explicit bounded native read (limit <= ${LIMIT}) with a literal path.`);
             // Native preflight remains the permission boundary. A failed or non-text
             // native result cannot be converted into a direct grant.

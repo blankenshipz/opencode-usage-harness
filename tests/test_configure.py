@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from configure import profile
+from configure import profile, namespace_harness_agents
 
 class ConfigureTests(unittest.TestCase):
     def test_roles_and_safe_public_defaults(self):
@@ -22,6 +22,32 @@ class ConfigureTests(unittest.TestCase):
             self.assertIn({'action':'task_*','resource':'*','effect':'deny'},p['agents'][name]['permissions'])
         self.assertIn({'action':'edit','resource':'*','effect':'deny'},p['agents']['plan']['permissions'])
         self.assertIn({'action':'edit','resource':'~/.opencode/plan/*','effect':'allow'},p['agents']['plan']['permissions'])
+        self.assertEqual(p['default_agent'], 'harness-router')
+        for role in ('router','builder','quick-builder','reviewer'):
+            self.assertFalse(p['agents'][f'harness-{role}'].get('hidden', False))
+            self.assertTrue(p['agents'][role]['hidden'])
+        router_children = {(r['action'], r['resource']) for r in p['agents']['harness-router']['permissions']}
+        self.assertIn(('subagent', 'builder'), router_children)
+        self.assertIn(('subagent', 'harness-builder'), router_children)
+
+    def test_namespace_helper_is_idempotent_and_preserves_hidden_compatibility(self):
+        agents = {'router': {'system': 'router', 'permissions': [
+            {'action': 'subagent', 'resource': 'builder', 'effect': 'allow'},
+            {'action': 'subagent', 'resource': '*', 'effect': 'deny'}]},
+            'builder': {'system': 'builder', 'permissions': []},
+            'builder-high': {'system': 'high', 'hidden': True, 'permissions': []},
+            'unrelated': {'system': 'untouched'}}
+        migrated = namespace_harness_agents(agents)
+        self.assertTrue(migrated['router']['hidden'])
+        self.assertFalse(migrated['harness-router']['hidden'])
+        self.assertTrue(migrated['builder-high']['hidden'])
+        self.assertTrue(migrated['harness-builder-high']['hidden'])
+        self.assertEqual(migrated['harness-router']['permissions'][:2], [
+            {'action': 'subagent', 'resource': 'builder', 'effect': 'allow'},
+            {'action': 'subagent', 'resource': 'harness-builder', 'effect': 'allow'}])
+        again = namespace_harness_agents(migrated)
+        self.assertEqual(again, migrated)
+        self.assertEqual(again['unrelated'], agents['unrelated'])
     def test_explicit_pool_policy_enables_only_declared_providers(self):
         models={k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')}
         p=profile(models,routing_policy={'version':1,'enabled':True,'roles':{'builder':[{'ref':'anthropic/fixture#high'}]}})

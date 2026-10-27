@@ -164,6 +164,15 @@ test('concurrent coordinators reserve one owner even with different work keys',a
  const results=await Promise.allSettled([h.call({...input,workKey:'first'}),h.call({...input,workKey:'replacement'})]);
  assert.equal(results.filter(x=>x.status==='fulfilled').length,1);assert.equal(h.calls.length,1);
 });
+test('prefixed coordinator shares duplicate ownership guard and old child IDs stay exact',async t=>{
+ const h=await harness(t);const original=h.ctx.agent.list;
+ h.ctx.agent.list=async()=>({data:(await original()).data.flatMap(a=>a.id==='coordinator'||a.id==='builder'?[a,{...a,id:`harness-${a.id}`}]:[a])});
+ const input={...base,agent:'harness-coordinator',operation:'coordinate',requiredCapabilities:['delegate'],background:true,writePaths:[]};
+ await h.call(input);
+ await assert.rejects(h.call({...input,agent:'coordinator',workKey:'replacement'}),/coordinator.*already|ownership already/);
+ h.sessions.push({id:'old-child',parentID:'root',agent:'builder',directory:'/project',active:false});
+ await assert.rejects(h.call({...base,agent:'harness-builder',sessionID:'old-child'}),/same role and a direct child/);
+});
 test('writers have disjoint ownership; deployment waits for existing writers',async t=>{
  const h=await harness(t);await h.call({...base,background:true});
  await assert.rejects(h.call({...base,workKey:'again',writePaths:['backend/api']}),/overlapping/);

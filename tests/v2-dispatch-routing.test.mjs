@@ -71,6 +71,12 @@ test('routine single-pool pacing uses that role provider rather than another sub
  q.pools.anthropic=pool('anthropic',0);q.pools.openai=pool('openai',40);
  assert.equal(selectDispatchModel({...base,agent:a,agents:[a,fast],input,quota:q}).selected,'anthropic/sonnet#high');
 });
+test('prefixed visible roles retain canonical pacing and old policy keys',()=>{
+ const q={...multi()}; delete q.routingPolicy;
+ const a={id:'harness-builder',model:'openai/sol#medium'},fast={id:'harness-quick-builder',model:'openai/fast#low'};
+ const input={agent:'harness-builder',routing:{complexity:'routine',risk:'normal'}};
+ assert.equal(selectDispatchModel({...base,agent:a,agents:[a,fast],input,quota:{...q,pools:{openai:pool('openai',20)}}}).selected,'openai/fast#low');
+});
 test('cross-family review is optional and a single healthy pool remains useful',()=>{
  const q=multi();delete q.pools.openai;q.catalog=q.catalog.filter(m=>m.providerID==='anthropic');
  const result=selectDispatchModel({...base,agent:{model:'anthropic/opus#high'},input:{agent:'reviewer',routing:{complexity:'complex',risk:'high',reviewOf:'anthropic/sonnet#high'}},quota:q});

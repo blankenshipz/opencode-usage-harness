@@ -19,10 +19,17 @@ also waits while a registered harness writer is active in the workspace; this
 is not a comprehensive lock on all native filesystem edits. Resume managed work with its recorded `taskId`/`workKey` through
 `task_dispatch`; start a fresh native chat for independent stock work.
 
-Use the harness roles and `task_dispatch` when the task needs durable ownership,
+Use the visible `harness-*` roles (for example `harness-router` and
+`harness-builder`) and `task_dispatch` when the task needs durable ownership,
 write-path accounting, checkpoints, routing metadata, review evidence or sticky
 continuations. Native eligibility is not a permission grant: OpenCode remains
 the authority for tools, model access and approvals.
+
+The generated profile keeps the historical unprefixed role IDs as hidden
+compatibility aliases. Existing sessions and task records retain their exact
+stored agent ID; resume those workers with that same ID. New handoffs should
+use the visible prefixed ID. Role policy and safety checks understand both IDs,
+while ownership and receipt identity remain exact.
 
 ## Enabling multi-pool routing
 
@@ -90,7 +97,7 @@ consume the same allowance between observation and dispatch. Quota pace is
 advisory and helps choose among already eligible candidates; it never invents
 work, lowers a task's minimum capability, or triggers an automatic review.
 
-The default root router is unchanged. Enabling a policy does not replace native
+The default root agent is `harness-router`. Enabling a policy does not replace native
 permissions, financial admission, account identity checks or provider-specific
 OAuth requirements. See [Claude subscription setup](CLAUDE-SUBSCRIPTION.md),
 [usage controls](USAGE-CONTROLS.md), and [subscription pools](SUBSCRIPTION-POOLS.md)

@@ -113,6 +113,11 @@ review evidence and continuations. The built-in agents can still be useful for a
 small independent task or a fresh native chat when that durable contract is not
 needed.
 
+Configured harness agents are shown with `harness-` names, such as
+`harness-router` and `harness-builder`. Historical unprefixed IDs remain hidden
+compatibility aliases so existing sessions can resume with their exact stored
+agent identity; new handoffs should use the visible prefixed names.
+
 ### One pool or multiple pools
 
 **One subscription is enough.** Use OpenAI only, Claude only, or both:

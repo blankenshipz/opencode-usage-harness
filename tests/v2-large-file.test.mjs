@@ -78,6 +78,12 @@ test('summary delegates through the native executor and caps its result', async 
   await denied(oversized.tools.get('large_file_summary').execute({ path: oversized.file, question: 'Summarize.' }, oversized.context), /bounded summary/);
 });
 
+test('prefixed coordinator delegates to a prefixed scout', async () => {
+  const h = await harness({ agent: 'harness-coordinator' });
+  await h.tools.get('large_file_summary').execute({ path: h.file, question: 'Where is the declaration?' }, h.context);
+  assert.equal(h.calls.find(c => c.kind === 'subagent').input.agent, 'harness-scout');
+});
+
 test('leaf summaries give bounded-read or parent guidance without nested delegation', async () => {
   const h = await harness({ agent: 'scout' });
   const result = await h.tools.get('large_file_summary').execute({ path: h.file, question: 'Where is the declaration?' }, h.context);
@@ -114,4 +120,12 @@ test('native read results become plain JSON while preserving content and metadat
   assert.equal(Object.getPrototypeOf(result.output), Object.prototype);
   assert.equal(result.content, 'native content');
   assert.deepEqual(result.metadata, { retained: true });
+});
+
+test('prefixed read-only and leaf roles retain large-file restrictions', async () => {
+  const reviewer = await harness({ agent: 'harness-reviewer' });
+  await denied(reviewer.tools.get('large_file_allow_direct').execute({ path: reviewer.file, reason: 'Need the whole file' }, reviewer.context), /cannot request a direct-read exception/);
+  const scout = await harness({ agent: 'harness-scout' });
+  await denied(scout.tools.get('large_file_summary').execute({ path: scout.file, question: 'Summarize this' }, scout.context), /cannot create a nested scout/);
+  assert.equal(scout.calls.some(call => call.kind === 'subagent'), false);
 });

@@ -2,6 +2,16 @@
 // deliberately exact: configured harness roles must opt in through the
 // harness dispatch path instead of matching by a descriptive name.
 const nativeAgents = new Set(['build', 'plan', 'general', 'explore']);
+const harnessRoles = ['router', 'coordinator', 'scout', 'quick-builder', 'builder', 'builder-high', 'deep-debugger', 'deep-debugger-high', 'architect', 'reviewer', 'maximum', 'maximum-max'];
+const roleAliases = new Map(harnessRoles.flatMap(role => [[role, role], [`harness-${role}`, role]]));
+
+// Role semantics may follow the visible alias, but persisted session and
+// dispatch identities must remain the exact configured ID.
+export const canonicalHarnessRole = agent => roleAliases.get(agent);
+export const harnessRoleIDs = role => {
+  const canonical = canonicalHarnessRole(role);
+  return canonical ? [canonical, `harness-${canonical}`] : [];
+};
 
 export const isNativeAgent = agent => typeof agent === 'string' && nativeAgents.has(agent);
 

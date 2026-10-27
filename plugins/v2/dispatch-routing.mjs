@@ -3,6 +3,7 @@ import path from 'node:path';
 import { managedConfigRoot } from './paths.mjs';
 import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
 import { readSelectedClaudeUsage } from './anthropic-subscription.mjs';
+import { canonicalHarnessRole, harnessRoleIDs } from './agent-mode.mjs';
 
 export async function readRoutingQuota(ctx) {
   let policy;
@@ -46,8 +47,9 @@ export function selectDispatchModel({input,agent,agents,record,child,quota}) {
   const decision = !override && chooseCandidate({input, quota});
   if (decision) return {selected:decision.ref,configured,observed,source:decision.reason,pace:decision.pace,
     modelOverride:override,behaviorProfile:decision.profile,reviewOf:input.routing?.reviewOf ?? null};
-  if (!override && input.routing?.complexity==='routine' && input.routing?.risk==='normal' && pace==='ahead' && ['builder','deep-debugger'].includes(input.agent)) {
-    const fast=modelReference(agents.find(a=>(a.id??a.name)==='quick-builder')?.model);
+  const role=canonicalHarnessRole(input.agent);
+  if (!override && input.routing?.complexity==='routine' && input.routing?.risk==='normal' && pace==='ahead' && ['builder','deep-debugger'].includes(role)) {
+    const fast=modelReference(agents.find(a=>harnessRoleIDs('quick-builder').includes(a.id??a.name))?.model);
     // Never cross providers as a pacing fallback. The worker retains its role,
     // permissions, ownership and required capabilities; only inference changes.
     if (fast && configured && fast.split('/')[0]===configured.split('/')[0]) {selected=fast;source='pace_routine';}
@@ -86,7 +88,8 @@ function candidateState(candidate, quota, reserve) {
 export function chooseCandidate({input,quota}) {
   const policy=quota?.routingPolicy;
   if (policy?.version!==1 || policy.enabled!==true || !input.routing) return;
-  const candidates=policy.roles?.[input.agent];
+  const role=canonicalHarnessRole(input.agent) ?? input.agent;
+  const candidates=policy.roles?.[input.agent] ?? policy.roles?.[role];
   if (!Array.isArray(candidates)) return;
   const reserve=Number.isFinite(policy.reservePercent)?Math.max(0,Math.min(10,policy.reservePercent)):2;
   const author=modelReference(input.routing.reviewOf), authorProvider=author?.split('/')[0];
