@@ -5,6 +5,8 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { validateFinancial } from '../../config/guard-validation.mjs';
+import { anthropicPackage, assertAnthropicOverrides, assertAnthropicBaseURL, assertAnthropicHTTPURL,
+  assertAnthropicCredential } from './anthropic-subscription.mjs';
 import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
 import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
 import { createRegistry } from './dispatch-registry.mjs';
@@ -16,7 +18,12 @@ const quotaEnvironment = env => Object.fromEntries([
 const codexURL = 'https://chatgpt.com/backend-api/codex';
 const oauthMethods = new Set(['chatgpt-browser', 'chatgpt-headless']);
 const officialPackages = new Set(['@opencode/ai/providers/openai', '@opencode/ai/providers/openai/responses']);
+const allowedProviders = new Set(['openai', 'anthropic']);
 const quotaTimeout = 25000;
+const anthropicUsageURL = 'https://api.anthropic.com/api/oauth/usage';
+const anthropicUsageTimeout = 10000;
+const anthropicUsageCacheMs = 30000;
+const anthropicUsageCacheLimit = 16;
 const execFileAsync = promisify(execFile);
 const quotaErrorCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'EAGAIN', 'EMFILE', 'ENFILE',
   'ENOMEM', 'E2BIG', 'ETIMEDOUT', 'ENOBUFS', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER']);
@@ -89,7 +96,16 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     appendFileSync(path.join(telemetry, `${file}.jsonl`), JSON.stringify(value) + '\n', { mode: 0o600 });
   }, env = process.env, now = () => new Date().toISOString(), recordCompletion = value => persistCompletion({
     database: statePath('telemetry', 'completions.sqlite3'), value, python: env.HARNESS_PYTHON || 'python3', env,
-  }), registry = createRegistry() } = {}) {
+  }), registry = createRegistry(), readAnthropicUsage = async access => {
+    let response;
+    try {
+      response = await fetch(anthropicUsageURL, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(anthropicUsageTimeout),
+        headers: { authorization: `Bearer ${access}`, 'anthropic-beta': 'oauth-2025-04-20' } });
+      if (!response.ok) throw new Error('status');
+      return await response.json();
+    } catch { throw new Error('Subscription guard: Anthropic usage verification failed.'); }
+  } } = {}) {
+  const anthropicUsageCache = new Map();
   async function quota(operation) {
     const started = performance.now();
     try {
@@ -101,7 +117,23 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     }
   }
   async function verify(ctx, event) {
-    if (event.model?.providerID !== 'openai') throw new Error('Subscription guard: OpenAI only.');
+    if (!allowedProviders.has(event.model?.providerID)) throw new Error('Subscription guard: supported providers are OpenAI and Anthropic only.');
+    if (event.model.providerID === 'anthropic') return verifyAnthropic(ctx);
+    return verifyOpenAI(ctx);
+  }
+  async function inventory(ctx) {
+    let models;
+    try { models = (await ctx.model.list()).data; }
+    catch { throw new Error('Subscription guard: effective model inventory unavailable.'); }
+    if (!Array.isArray(models)) throw new Error('Subscription guard: effective model inventory unavailable.');
+    for (const model of models) {
+      if (!allowedProviders.has(model.providerID)) throw new Error('Subscription guard: supported providers are OpenAI and Anthropic only.');
+      const assertion = model.providerID === 'openai' ? assertOverrides : assertAnthropicOverrides;
+      assertion(model);
+      for (const variant of model.variants ?? []) assertion(variant);
+    }
+  }
+  async function verifyOpenAI(ctx) {
     // The V2 config provider runs AFTER local plugins. A provider transform cannot
     // certify the final registry: read the effective provider on every request.
     let provider;
@@ -110,15 +142,7 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     if (!provider || !officialPackages.has(provider.package))
       throw new Error('Subscription guard: custom OpenAI credentials/endpoint/SDK overrides are forbidden.');
     assertOverrides(provider);
-    let models;
-    try { models = (await ctx.model.list()).data; }
-    catch { throw new Error('Subscription guard: effective model inventory unavailable.'); }
-    if (!Array.isArray(models)) throw new Error('Subscription guard: effective model inventory unavailable.');
-    for (const model of models) {
-      if (model.providerID !== 'openai') throw new Error('Subscription guard: OpenAI only.');
-      assertOverrides(model);
-      for (const variant of model.variants ?? []) assertOverrides(variant);
-    }
+    await inventory(ctx);
     if (env.OPENAI_API_KEY || env.OPENAI_BASE_URL)
       throw new Error('Subscription guard: API key/base URL present; use the clean opencode launcher.');
     const connection = await ctx.integration.connection.active('openai');
@@ -133,6 +157,34 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
       throw new Error('Subscription guard: OpenCode and quota telemetry must use the same ChatGPT account.');
     validateFinancial(readJSON(path.join(managedConfigRoot, 'financial-verification.json')));
     await quota('check');
+  }
+  async function verifyAnthropic(ctx) {
+    let provider;
+    try { provider = (await ctx.provider.get({ providerID: 'anthropic' })).data; }
+    catch { throw new Error('Subscription guard: effective Anthropic provider unavailable.'); }
+    if (!provider || provider.package !== anthropicPackage)
+      throw new Error('Subscription guard: custom Anthropic credentials/endpoint/SDK overrides are forbidden.');
+    assertAnthropicOverrides(provider);
+    await inventory(ctx);
+    if (env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_BASE_URL)
+      throw new Error('Subscription guard: Anthropic API credentials/base URL present; use the clean opencode launcher.');
+    const connection = await ctx.integration.connection.active('anthropic');
+    const credential = await ctx.integration.connection.resolve(connection);
+    assertAnthropicCredential(connection, credential);
+    const access = credential.access;
+    if (typeof access !== 'string' || access.length === 0)
+      throw new Error('Subscription guard: Anthropic Claude Code OAuth access is unavailable.');
+    const timestamp = Date.parse(now());
+    for (const [key, entry] of anthropicUsageCache) if (entry.expiresAt <= timestamp) anthropicUsageCache.delete(key);
+    const cached = anthropicUsageCache.get(access);
+    if (cached && cached.expiresAt > timestamp) return;
+    let usage;
+    try { usage = await readAnthropicUsage(access); }
+    catch { throw new Error('Subscription guard: Anthropic usage verification failed.'); }
+    if (usage?.extra_usage?.is_enabled !== false)
+      throw new Error('Subscription guard: Anthropic usage credits must be disabled before inference.');
+    if (anthropicUsageCache.size >= anthropicUsageCacheLimit) anthropicUsageCache.clear();
+    anthropicUsageCache.set(access, { expiresAt: timestamp + anthropicUsageCacheMs });
   }
   return {
     id: 'subscription.guard',
@@ -164,11 +216,10 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
       const steps = new Map();
       await ctx.provider.transform(editor => {
         const provider = editor.get('openai')?.provider;
-        if (!provider) return; // A missing provider cannot produce a model request.
         // Throwing here makes Core disable this plugin AND all its request hooks.
         // Drop an unsafe early definition instead; the request hooks check the
         // final inventory, including the later config-provider overlay.
-        try {
+        if (provider) try {
           if (!officialPackages.has(provider.package)) throw new Error('unsafe package');
           assertOverrides(provider);
         } catch { editor.remove('openai'); }
@@ -180,7 +231,8 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
       }));
       await ctx.session.hook('model.request', async event => {
         await guarded(event,async()=>{
-          if (event.baseURL !== undefined) verifyEndpoint(event.baseURL);
+          if (event.model?.providerID === 'openai' && event.baseURL !== undefined) verifyEndpoint(event.baseURL);
+          if (event.model?.providerID === 'anthropic' && event.baseURL !== undefined) assertAnthropicBaseURL(event.baseURL);
           await verify(ctx, event);
           append('requests', { checked_at: now(), session: event.sessionID, agent: event.agent,
             model: event.model.id, provider: event.model.providerID,
@@ -190,10 +242,18 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
       // Validate the resolved transport as well: a later plugin or provider setting can
       // rewrite baseURL after model.request. HTTP and WS are both possible in V2.
       await ctx.session.hook('http.request', async event => {
-        await guarded(event,async()=>{await verify(ctx, event);verifyEndpoint(event.request.url);});
+        await guarded(event,async()=>{
+          await verify(ctx, event);
+          if (event.model?.providerID === 'anthropic') assertAnthropicHTTPURL(event.request.url);
+          else verifyEndpoint(event.request.url);
+        });
       });
       await ctx.session.hook('experimental.ws.handshake', async event => {
-        await guarded(event,async()=>{await verify(ctx, event);verifyEndpoint(event.url.replace(/^wss:/, 'https:'));});
+        await guarded(event,async()=>{
+          await verify(ctx, event);
+          if (event.model?.providerID === 'anthropic') throw new Error('Subscription guard: Anthropic WebSocket transport is forbidden.');
+          verifyEndpoint(event.url.replace(/^wss:/, 'https:'));
+        });
       });
       const controller = new AbortController();
       void (async () => {

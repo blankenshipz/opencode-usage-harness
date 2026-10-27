@@ -1,0 +1,315 @@
+diff --git a/src/credentials.ts b/src/credentials.ts
+index b6d621b..5348388 100644
+--- a/src/credentials.ts
++++ b/src/credentials.ts
+@@ -1,4 +1,3 @@
+-import { execSync } from "node:child_process"
+ import {
+   chmodSync,
+   existsSync,
+@@ -6,7 +5,7 @@ import {
+   readFileSync,
+   writeFileSync,
+ } from "node:fs"
+-import { homedir, tmpdir } from "node:os"
++import { homedir } from "node:os"
+ import { dirname, join } from "node:path"
+ import {
+   PRIMARY_SERVICE,
+@@ -412,42 +411,12 @@ export async function refreshViaOAuth(
+ }
+ 
+ function refreshViaCli(configDir?: string, requireConfigDir = false): boolean {
+-  if (requireConfigDir && !configDir) {
+-    log("refresh_cli_skipped", {
+-      source: "cli",
+-      reason: "configDir unknown for suffixed account",
+-    })
+-    return false
+-  }
+-
+-  const env = {
+-    ...process.env,
+-    TERM: "dumb",
+-    ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
+-  }
+-
+-  const maxAttempts = 2
+-  for (let i = 0; i < maxAttempts; i++) {
+-    log("refresh_started", { source: "cli", attempt: i + 1, configDir })
+-    try {
+-      execSync("claude -p . --model haiku", {
+-        timeout: 60_000,
+-        encoding: "utf-8",
+-        env,
+-        stdio: "ignore",
+-        cwd: tmpdir(),
+-      })
+-      log("refresh_success", { source: "cli" })
+-      return true
+-    } catch (err) {
+-      log("refresh_failed", {
+-        source: "cli",
+-        attempt: i + 1,
+-        error: err instanceof Error ? err.message : String(err),
+-      })
+-    }
+-  }
+-  log("refresh_cli_exhausted", { source: "cli", configDir })
++  log("refresh_cli_skipped", {
++    source: "cli",
++    reason: requireConfigDir && !configDir
++      ? "configDir unknown for suffixed account"
++      : "subscription-only mode",
++  })
+   return false
+ }
+ 
+@@ -900,41 +869,10 @@ async function refreshBorrowedAccount(
+ }
+ 
+ function tryFallbackAccount(excludeSource: string): ClaudeCredentials | null {
+-  const now = Date.now()
+-  const candidates = allAccounts.filter((a) => a.source !== excludeSource)
+-
+-  // Accounts whose in-memory credentials are still valid can be borrowed
+-  // directly — no keychain read needed. A 401 on a borrowed token is
+-  // handled by the existing reload-and-retry fetch path.
+-  for (const account of candidates) {
+-    if (account.credentials.expiresAt > now + 60_000) {
+-      log("refresh_fallback_account", {
+-        failedSource: excludeSource,
+-        usedSource: account.source,
+-      })
+-      return account.credentials
+-    }
+-  }
+-
+-  // Last resort: live-read the stale-looking ones too — another process
+-  // (e.g. the Claude CLI in a different terminal) may have refreshed their
+-  // keychain entry since we last read it.
+-  for (const account of candidates) {
+-    let fresh: ClaudeCredentials | null = null
+-    try {
+-      fresh = refreshAccount(account.source, account.configDir)
+-    } catch {
+-      continue
+-    }
+-    if (fresh && fresh.expiresAt > now + 60_000) {
+-      account.credentials = fresh
+-      log("refresh_fallback_account", {
+-        failedSource: excludeSource,
+-        usedSource: account.source,
+-      })
+-      return fresh
+-    }
+-  }
++  log("refresh_fallback_skipped", {
++    failedSource: excludeSource,
++    reason: "subscription-only mode",
++  })
+   return null
+ }
+ 
+diff --git a/src/provider.ts b/src/provider.ts
+index 1040e5d..57ae4dd 100644
+--- a/src/provider.ts
++++ b/src/provider.ts
+@@ -1,24 +1,15 @@
+ import crypto from "node:crypto"
+ import {
+-  addExcludedBeta,
+   getExcludedBetas,
+   getModelBetas,
+-  getNextBetaToExclude,
+-  isLongContextError,
+-  LONG_CONTEXT_BETAS,
+ } from "./betas.ts"
+ import {
+-  forceRefreshActiveAccount,
+   getAccountBySource,
+   getActiveAccount,
+-  getActiveRefreshFailureKind,
+   getCachedCredentials,
+   getCredentialsWithBackoff,
+-  reloadCredentialsFromSource,
+-  type ClaudeAccount,
+   type ClaudeCredentials,
+ } from "./credentials.ts"
+-import { fetchWithRetry } from "./http.ts"
+ import { log } from "./logger.ts"
+ import { getUserAgent } from "./model-config.ts"
+ import { transformBody, transformResponseStream } from "./transforms.ts"
+@@ -96,7 +87,7 @@ export function buildRequestHeaders(
+  * whichever account happens to be process-wide active. Omit it and the active
+  * account is used, which is the single-account case.
+  */
+-const resolveAccount = (source?: string): ClaudeAccount | null =>
++const resolveAccount = (source?: string) =>
+   source === undefined ? getActiveAccount() : getAccountBySource(source)
+ 
+ function modelFromBody(body: string): string {
+@@ -139,7 +130,7 @@ export async function prepareClaudeRequest(
+ }
+ 
+ async function sendRequest(request: Request, send: Fetch): Promise<Response> {
+-  return fetchWithRetry(
++  return send(
+     request.url,
+     {
+       method: request.method,
+@@ -147,8 +138,6 @@ async function sendRequest(request: Request, send: Fetch): Promise<Response> {
+       body: await request.clone().text(),
+       signal: request.signal,
+     },
+-    3,
+-    send,
+   )
+ }
+ 
+@@ -159,70 +148,9 @@ export async function finishClaudeResponse(
+   source?: string,
+   send: Fetch = fetch,
+ ): Promise<Response> {
+-  const modelID = modelFromBody(await request.clone().text())
+-  const account = resolveAccount(source)
+-  let token =
+-    request.headers.get("authorization")?.replace(/^Bearer /i, "") ?? ""
+-  const sendWithToken = (
+-    currentToken: string,
+-    excludedBetas = getExcludedBetas(modelID),
+-  ) => {
+-    const incoming = new Headers(request.headers)
+-    incoming.set(
+-      "anthropic-beta",
+-      (incoming.get("anthropic-beta") ?? "")
+-        .split(",")
+-        .map((value) => value.trim())
+-        .filter((value) => value && !excludedBetas.has(value))
+-        .join(","),
+-    )
+-    const clean = new Request(request.clone(), { headers: incoming })
+-    const headers = buildRequestHeaders(
+-      clean,
+-      {},
+-      currentToken,
+-      modelID,
+-      excludedBetas,
+-    )
+-    return sendRequest(new Request(clean, { headers }), send)
+-  }
+-
+-  let response = initial
+-
+-  for (let attempt = 0; response.status === 401 && attempt < 2; attempt++) {
+-    let candidate: ClaudeCredentials | null =
+-      reloadCredentialsFromSource(account)
+-    if (!candidate || candidate.accessToken === token)
+-      candidate = await forceRefreshActiveAccount(undefined, account)
+-    if (!candidate || candidate.accessToken === token) break
+-    token = candidate.accessToken
+-    log("auth_recovery_retry", { modelID, attempt: attempt + 1 })
+-    response = await sendWithToken(token)
+-  }
+-
+-  if (response.status === 429) {
+-    const rotated = reloadCredentialsFromSource(account)
+-    if (rotated && rotated.accessToken !== token) {
+-      token = rotated.accessToken
+-      log("rate_limit_token_changed", { modelID })
+-      response = await sendWithToken(token)
+-    } else if (getActiveRefreshFailureKind(account) === "transient") {
+-      log("fetch_credentials_transient_exhausted", { modelID })
+-    }
+-  }
+-
+-  for (let attempt = 0; attempt < LONG_CONTEXT_BETAS.length; attempt++) {
+-    if (response.status !== 400 && response.status !== 429) break
+-    if (!isLongContextError(await response.clone().text())) break
+-    const beta = getNextBetaToExclude(modelID)
+-    if (!beta) break
+-    addExcludedBeta(modelID, beta)
+-    response = await sendWithToken(token, getExcludedBetas(modelID))
+-  }
++  if (!initial.ok) return initial
+ 
+-  if (!response.ok)
+-    log("fetch_error_response", { status: response.status, modelID })
+-  return response.status === 401 ? response : transformResponseStream(response)
++  return transformResponseStream(initial)
+ }
+ 
+ /** Standalone transport used by existing integration checks. */
+diff --git a/src/vendor-hardening.test.ts b/src/vendor-hardening.test.ts
+new file mode 100644
+index 0000000..e9ac497
+--- /dev/null
++++ b/src/vendor-hardening.test.ts
+@@ -0,0 +1,67 @@
++import assert from "node:assert/strict"
++import { readFile } from "node:fs/promises"
++import { describe, it } from "node:test"
++import { finishClaudeResponse } from "./provider.ts"
++
++const credentialsSource = new URL("./credentials.ts", import.meta.url)
++
++describe("subscription-only hardening", () => {
++  it("does not spawn Claude CLI inference or borrow another account", async () => {
++    const source = await readFile(credentialsSource, "utf8")
++    assert.doesNotMatch(source, /from ["']node:child_process["']/)
++    assert.doesNotMatch(source, /execSync|claude -p|--model haiku/)
++    assert.match(
++      source,
++      /function tryFallbackAccount\(excludeSource: string\): ClaudeCredentials \| null \{[\s\S]*?return null\n\}/,
++    )
++    assert.doesNotMatch(
++      source.match(
++        /function tryFallbackAccount\(excludeSource: string\): ClaudeCredentials \| null \{([\s\S]*?)\n\}/,
++      )?.[1] ?? "",
++      /allAccounts|refreshAccount\(/,
++    )
++  })
++
++  it("returns denied responses without retrying", async () => {
++    const request = new Request("https://api.anthropic.com/v1/messages", {
++      method: "POST",
++      headers: { authorization: "Bearer selected-token" },
++      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [] }),
++    })
++    for (const status of [400, 401, 429]) {
++      let calls = 0
++      const initial = new Response("denied", { status })
++      const result = await finishClaudeResponse(
++        request,
++        initial,
++        undefined,
++        async () => {
++          calls++
++          return new Response("unexpected retry")
++        },
++      )
++      assert.equal(calls, 0, `status ${status} must not retry`)
++      assert.equal(result, initial, `status ${status} must return initial response`)
++    }
++  })
++
++  it("sends rate-limit responses exactly once", async () => {
++    for (const status of [429, 529]) {
++      let calls = 0
++      const transport = async () => {
++        calls++
++        return new Response("rate limited", { status })
++      }
++      const request = new Request("https://api.anthropic.com/v1/messages", {
++        method: "POST",
++        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [] }),
++      })
++      const result = await (await import("./provider.ts")).claudeSubscriptionFetch(
++        "selected-token",
++        transport,
++      )(request)
++      assert.equal(calls, 1, `status ${status} must send exactly once`)
++      assert.equal(result.status, status)
++    }
++  })
++})

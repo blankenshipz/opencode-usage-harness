@@ -164,11 +164,12 @@ tokens are not free by assumption, and model names do not establish cost. Retain
 receipts and tests support acceptance; metric counts alone do not prove correctness
 or savings.
 
-The supported profile keeps OpenAI-only access, ChatGPT OAuth/account checks and
-financial admission separate from optimization. Quota pressure never authorizes
+The default generated profile keeps OpenAI-only access. An opt-in Anthropic
+subscription admission path is also available; see [Claude connection setup](docs/CLAUDE-SUBSCRIPTION.md).
+ChatGPT OAuth/account checks and financial admission remain separate from optimization. Quota pressure never authorizes
 purchased credits, API-key inference or an automatic paid/provider fallback.
 Compression and context diagnostics are model-family-neutral middleware; that does
-not mean other subscription providers are enabled or validated today.
+not enable additional subscription providers automatically.
 
 ## What works today
 
@@ -212,7 +213,8 @@ The next milestones are:
   across pools. Advisory slot counts alone are insufficient.
 - **Add subscription adapters one at a time.** Verify supported authentication,
   model/effort discovery, quota telemetry, and no metered fallback for each provider.
-  Claude and other subscriptions are candidates, not currently supported adapters.
+  Claude has an opt-in authentication/financial admission adapter; its automatic
+  quota pacing and task routing remain future work. Other providers remain candidates.
 - **Validate usage improvements in ordinary work.** Compare accepted results, cumulative
   work, effective models, compaction outcomes and actual quota deltas. Model-step
   thresholds are reassessment points, not hard spending limits.

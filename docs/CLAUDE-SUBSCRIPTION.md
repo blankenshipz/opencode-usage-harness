@@ -1,0 +1,88 @@
+# Optional Claude subscription connection
+
+The default generated profile and automatic routing remain Codex-only. This
+adapter allows a manually selected Anthropic model after an installation owner
+explicitly adds Anthropic to both native provider policy and enabled_providers.
+It does not change model assignments or pool routing.
+
+This path uses the third-party griffinmartin/opencode-claude-auth plugin 3.0.0,
+with its Claude Code subscription OAuth method. Anthropic prohibits third-party
+subscription credential reuse; installing this adapter does not change eligibility
+or guarantee continued service. See the current OpenCode provider documentation:
+https://opencode.ai/docs/providers/#anthropic
+
+## Authentication and financial admission
+
+Install the official Claude Code for the host architecture, and sign in with
+`claude auth login --claudeai`. Import it through OpenCode's Anthropic integration
+using **Import Claude Code subscription**. Never select the API-key method.
+The adapter checks the active connection is OAuth, its method ID is `claude-code`,
+and its metadata identifies the reviewed plugin. API-key credentials, custom
+provider packages, custom endpoints, and Anthropic credential environment overrides
+are rejected. The service must run with its clean managed environment.
+
+Before inference the guard queries Anthropic's native OAuth usage endpoint using
+the same selected access token. It requires `extra_usage.is_enabled` to be exactly
+false. Missing data, an enabled value, failed authentication, timeout or network
+failure blocks inference. Successful proof is cached briefly in memory. This is
+an internal account endpoint, not a guaranteed public API; a schema change fails
+closed and may require an adapter update. The provider's included-usage limits
+remain the final hard stop. This check does not calculate per-model quota pacing.
+
+Max's monthly API credits are separate from subscription usage credits. Neither
+an API credit balance nor permission to consume it is implied by this connection.
+Only the subscription OAuth path is admitted. OpenAI keeps its own existing
+account-matching, financial-verification and Codex quota checks; exhausted Codex
+allowance does not block a separately admitted Claude request.
+
+## Managed plugin artifact
+
+Pin an exact built plugin and dependencies; a Git checkout alone lacks its dist
+output. Verify the directory entrypoint in an isolated matching OpenCode runtime.
+Native OpenCode 2 configured plugin paths must be directories. Do not blindly
+install a moving latest tag into a running custom release.
+
+Apply the companion hash-pinned managed patch before enabling this plugin in a
+subscription-only harness. It removes hidden Claude CLI generation during token
+refresh, automatic borrowing of another account, and response retries that run
+outside the harness's admission hooks. Ordinary OAuth refresh for the selected
+account remains. Failed inference responses are returned to the caller for explicit
+recovery. Preserve the package license and original commit provenance.
+
+Back up config, artifacts and release manifest; include the managed entrypoint
+and its complete payload receipt in startup integrity verification. At idle, load
+the adapter and verify the guard and authentication plugin are active, the provider
+catalog contains only OpenAI and Anthropic, and the actual models are discoverable.
+Keep existing sessions, project permissions and default agents unchanged.
+
+Validation uses fake credentials and fake account/provider responses for negative
+cases. A small authorized live subscription request can then confirm the selected
+model works; do not exhaust quota or buy credits to test a boundary.
+
+## Explicit opt-in configuration
+
+Preserve existing policies and agent definitions. In the native V2 profile, set
+`enabled_providers` to `["openai", "anthropic"]` and retain deny-by-default rules:
+
+```json
+{
+  "experimental": {
+    "policies": [
+      { "effect": "deny", "action": "provider.use", "resource": "*" },
+      { "effect": "allow", "action": "provider.use", "resource": "openai" },
+      { "effect": "allow", "action": "provider.use", "resource": "anthropic" }
+    ]
+  }
+}
+```
+
+Install both the updated guard helper and the patched authentication artifact.
+Discover model IDs and variants from the running catalog; do not infer subscription
+entitlement from a catalog entry alone. The provider registry may contain a built-in
+OpenCode entry even when policy excludes its models. Verify the effective model
+catalog and request admission, not registry names alone.
+
+The managed integration was verified on custom OpenCode 2.0.30 with a completed
+Claude Haiku 5.5 / low subscription response. Catalog visibility is not a claim
+that every listed model has been exercised. Future Claude quota pacing and automatic
+cross-subscription routing remain separate work.

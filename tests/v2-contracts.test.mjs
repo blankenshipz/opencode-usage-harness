@@ -19,7 +19,7 @@ function harness(plugin, connection = { type: 'credential', method: 'oauth' },
       for (const event of events) { if (signal.aborted) break; yield event; }
     } }) },
   };
-  ctx.provider.get = async () => ({ data: inventory.provider });
+  ctx.provider.get = async ({ providerID }) => ({ data: inventory.providers?.[providerID] ?? inventory.provider });
   return plugin.setup(ctx).then(cleanup => ({ tools, hooks, transforms, cleanup }));
 }
 
@@ -177,7 +177,7 @@ test('V2 hooks reject unsafe effective registry even when a later config transfo
     assert.deepEqual(g.writes, []); assert.deepEqual(g.runs, []); h.cleanup();
   }
   for (const models of [
-    [{ providerID: 'anthropic', id: 'not-allowed' }],
+    [{ providerID: 'other', id: 'not-allowed' }],
     [{ providerID: 'openai', id: 'override', settings: { apiKey: 'placeholder' } }],
     [{ providerID: 'openai', id: 'override', variants: [{ headers: { Authorization: 'placeholder' } }] }],
   ]) {
@@ -187,11 +187,11 @@ test('V2 hooks reject unsafe effective registry even when a later config transfo
   }
 });
 
-test('V2 denies provider switching before reading credentials, quota, or telemetry', async () => {
+test('V2 denies unsupported provider switching before reading credentials, quota, or telemetry', async () => {
   const g = guard(); const h = await harness(g.plugin);
-  await assert.rejects(h.hooks.get('model.request')(event('anthropic')), /OpenAI only/);
-  await assert.rejects(h.hooks.get('http.request')({ model: event('anthropic').model, request: { url: 'https://chatgpt.com/backend-api/codex' } }), /OpenAI only/);
-  await assert.rejects(h.hooks.get('experimental.ws.handshake')({ model: event('anthropic').model, url: 'wss://chatgpt.com/backend-api/codex' }), /OpenAI only/);
+  await assert.rejects(h.hooks.get('model.request')(event('other')), /supported providers/);
+  await assert.rejects(h.hooks.get('http.request')({ model: event('other').model, request: { url: 'https://chatgpt.com/backend-api/codex' } }), /supported providers/);
+  await assert.rejects(h.hooks.get('experimental.ws.handshake')({ model: event('other').model, url: 'wss://chatgpt.com/backend-api/codex' }), /supported providers/);
   assert.deepEqual(g.reads, []); assert.deepEqual(g.writes, []); assert.deepEqual(g.runs, []);
   h.cleanup();
 });
