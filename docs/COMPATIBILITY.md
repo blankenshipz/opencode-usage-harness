@@ -1,8 +1,14 @@
 # Runtime compatibility
 
-The toolkit does not bundle OpenCode, OpenChamber, or their binaries. The reference runtime is upstream OpenCode 2.0.18 plus `compat/opencode-2.0.18-required-plugins.patch`. Its exact source archive and patch hashes are in `compat/runtime.json`.
+The toolkit does not bundle OpenCode, OpenChamber, or their binaries. The original reference runtime is upstream OpenCode 2.0.18 plus `compat/opencode-2.0.18-required-plugins.patch`. Its exact source archive and patch hashes are in `compat/runtime.json`.
 
 The patch enforces required-plugin presence on guarded model-request paths and rejects sessionless generation where the guards cannot run. A plain version string or an environment variable alone does not prove this enforcement. Stock OpenCode must not be advertised as providing the same fail-closed behavior.
+
+The later managed 2.0.30 recovery patch has a separate hash-pinned custom baseline;
+see [recovery release and activation](recovery-release.md). It does not apply
+interchangeably to the original 2.0.18 source. Claude integration was verified on
+that managed runtime; see [Claude setup](CLAUDE-SUBSCRIPTION.md). This does not
+certify a fresh stock runtime for either provider.
 
 ## Building a compatible runtime (advanced)
 
@@ -31,6 +37,10 @@ The build script deletes the chosen output directory, so it must be a dedicated 
 
 The patch was checked against pristine files from the checksum-pinned source archive during extraction. The original installation ran the patched runtime on macOS x64. The portable source release is tested with offline fixtures, not a new model-backed end-to-end run on every platform. Linux and Apple Silicon runtime builds need their own integration validation. Automatic binary releases and a fully automated runtime builder are future work.
 
-Before enabling inference in a new installation, verify that absent/failed required plugins block a model request, that only the intended OpenAI provider is available, and that auth is ChatGPT OAuth with no API-key/base-URL override. Use local fake-provider negative tests first; never use a paid request to test a financial guard.
+Before enabling inference in a new installation, verify that absent/failed required plugins block a model request, that only the intended subscription providers are available, and that authentication
+uses their guarded subscription OAuth paths with no API-key/base-URL override.
+OpenAI requires matching Codex account and financial/quota verification; Claude
+requires the reviewed adapter and disabled usage credits. A Claude-only profile
+does not require Codex CLI. Use local fake-provider negative tests first; never use a paid request to test a financial guard.
 
 OpenChamber is an optional UI. Install and configure it separately against the same backend and state. The toolkit does not modify launchd/systemd, relay pairing, passwords, or listening addresses.

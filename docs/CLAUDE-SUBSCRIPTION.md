@@ -29,7 +29,10 @@ false. Missing data, an enabled value, failed authentication, timeout or network
 failure blocks inference. Successful proof is cached briefly in memory. This is
 an internal account endpoint, not a guaranteed public API; a schema change fails
 closed and may require an adapter update. The provider's included-usage limits
-remain the final hard stop. This check does not calculate per-model quota pacing.
+remain the final hard stop. This admission check is separate from the advisory
+quota normalizer and opt-in candidate router, which expose account and model-scoped
+pacing when usable window data is present. Missing recognized session/weekly
+durations are inferred and labeled; they are not reported provider guarantees.
 
 Max's monthly API credits are separate from subscription usage credits. Neither
 an API credit balance nor permission to consume it is implied by this connection.
@@ -54,7 +57,8 @@ recovery. Preserve the package license and original commit provenance.
 Back up config, artifacts and release manifest; include the managed entrypoint
 and its complete payload receipt in startup integrity verification. At idle, load
 the adapter and verify the guard and authentication plugin are active, the provider
-catalog contains only OpenAI and Anthropic, and the actual models are discoverable.
+effective model catalog contains only the providers you enabled (Anthropic alone
+or Anthropic and OpenAI), and the actual models are discoverable.
 Keep existing sessions, project permissions and default agents unchanged.
 
 Validation uses fake credentials and fake account/provider responses for negative
@@ -63,8 +67,10 @@ model works; do not exhaust quota or buy credits to test a boundary.
 
 ## Explicit opt-in configuration
 
-Preserve existing policies and agent definitions. In the native V2 profile, set
-`enabled_providers` to `["openai", "anthropic"]` and retain deny-by-default rules:
+Preserve existing policies and agent definitions. For a two-pool native V2
+profile, set `enabled_providers` to `["openai", "anthropic"]` and retain
+deny-by-default rules. For Claude only, use `["anthropic"]` and omit the OpenAI
+allow rule:
 
 ```json
 {
