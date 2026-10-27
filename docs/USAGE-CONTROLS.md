@@ -99,3 +99,18 @@ claiming savings. Multi-provider live adapters and quota reservations remain fut
 work. Routing references are model-family-neutral, but the current live guard and
 quota adapter remain ChatGPT OAuth/Codex-only. Native API integration needs the
 required-plugin runtime patch; stock OpenCode is not certified by these unit tests.
+
+## Capability validation and real denials
+
+Match the assignment to tools before dispatch. `harness-reviewer`, scout and
+architect are file-reading roles without shell execution. Requested tests or an
+executable review require a shell-capable worker; preserve any explicit provider,
+model and supported effort choice regardless of the worker role.
+
+`TASK_DISPATCH_CAPABILITY_MISMATCH` identifies invalid role selection before this
+call starts a child or attempts native execution. For a new, unadmitted assignment,
+the parent may correct the role within the authorized scope and run the normal
+admission path. Do not remove required capabilities or relax permissions. This is
+not a recovery route around a previous denial: native permission, provider and
+financial denials remain blocking, recorded owners retain their exact identity,
+and continuing an existing child still requires its stored agent and parent.

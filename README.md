@@ -75,7 +75,11 @@ The generated profile in [configure.py](configure.py) maps roles as follows:
 
 Only the router and coordinator delegate; other roles are terminal workers.
 Shell-capable roles still obey native command permissions. Assign executable checks
-to a capable worker rather than expecting a read-only reviewer to run them.
+to a capable worker rather than expecting a read-only reviewer to run them. A preflight
+`TASK_DISPATCH_CAPABILITY_MISMATCH` means a new assignment selected an incapable
+role. The parent corrects that assignment while preserving the requested model
+and scope; the normal permission, ownership and financial checks still run. This
+diagnostic neither clears a prior denial nor permits replacing an existing worker.
 
 **Selection is task → role → configured model and effort.** The parent is instructed
 to choose the smallest capable worker, accounting for complexity, risk, prior

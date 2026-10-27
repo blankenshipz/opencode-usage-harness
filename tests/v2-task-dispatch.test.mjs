@@ -30,7 +30,7 @@ test('status neither reconciles nor delivers or exposes another root recovery',a
  assert.equal(JSON.stringify(status).includes('other-child'),false);
  await h.registry('/project',async state=>{const other=state.records.find(r=>r.key==='other');assert.equal(other.state,'compacting');assert.equal(other.compactionOutcome,undefined);assert.equal(state.quotaRecoveryOutbox[0].deliveredAt,undefined);});
 });
-async function harness(t, custom, nativeInput) {
+async function harness(t, custom, nativeInput, dispatchOptions={}) {
  const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'dispatch-test-'));t.after(()=>fsp.rm(dir,{recursive:true,force:true}));
  const sessions=[{id:'root',agent:'router',directory:'/project',active:true}];const calls=[];const tools=new Map();
  const native={name:'subagent',description:'Native subagent',input:nativeInput??{type:'object',properties:{agent:{type:'string'},description:{type:'string'},prompt:{type:'string'},model:{type:'string'},sessionID:{type:'string'},background:{type:'boolean'}},required:['agent','description','prompt']},execute:async(input,context)=>{
@@ -43,7 +43,7 @@ async function harness(t, custom, nativeInput) {
  const ctx={location:{directory:'/project'},agent:{list:async()=>({data:Object.entries(agents).map(([id,a])=>({id,...a}))})},tool:{transform:async fn=>{assert.notEqual(fn.constructor.name,'AsyncFunction','native editor transformations must be synchronous');return fn({get:n=>tools.get(n),update:(n,fn)=>fn(tools.get(n)),add:tool=>tools.set(tool.name,tool)});}}};
  const registry=createRegistry(dir);await registry('/project',async(state,save)=>{setIntent(state,{rootID:'root',taskId:'release',intent,expectedRevision:0,actorSessionID:'root'});await save();});
  const hooks=new Map();ctx.session={hook:async(name,fn)=>{const previous=hooks.get(name);hooks.set(name,async event=>{if(previous)await previous(event);return fn(event);});}};
- const runtime=await installTaskDispatch(ctx,{registry,loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction']});
+ const runtime=await installTaskDispatch(ctx,{registry,loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction'],...dispatchOptions});
  const call=(input,tool='task_dispatch',sessionID='root')=>tools.get(tool).execute(input,{sessionID,agent:'router',progress:async()=>{}});
  return {call,sessions,calls,tools,ctx,dir,registry,rawNative,hooks,runtime};
 }
@@ -67,6 +67,37 @@ test('native and wrapper both reject incapable Git history routing before native
  await assert.rejects(h.call({...base,operation:'coordinate',agent:'coordinator',requiredCapabilities:['shell','delegate']},tool),/cannot perform shell/);
  await assert.rejects(h.call({agent:'builder'},tool),/taskId/);
  }assert.equal(h.calls.length,0);
+});
+test('capability mismatch is a structured preflight failure with no quota, native, or registry side effect',async t=>{
+ let quotaReads=0;const h=await harness(t,undefined,undefined,{loadQuota:async()=>{quotaReads++;return {};}});
+ const list=h.ctx.agent.list;h.ctx.agent.list=async()=>({data:[...(await list()).data,{...(await list()).data.find(agent=>agent.id==='scout'),id:'harness-reviewer'}]});
+ let before;await h.registry('/project',async state=>{before=JSON.stringify(state);});
+ await assert.rejects(h.call({...base,operation:'inspect',agent:'harness-reviewer',requiredCapabilities:['shell'],writePaths:[],routing:{complexity:'routine',risk:'normal'},model:'anthropic/fixture-opus#high'}),error=>{
+  assert.equal(error.code,'TASK_DISPATCH_CAPABILITY_MISMATCH');assert.equal(error.category,'assignment_validation');assert.match(error.message,/TASK_DISPATCH_CAPABILITY_MISMATCH/);assert.match(error.message,/cannot perform shell/);assert.match(error.message,/not native permission denial/);return true;
+ });
+ assert.equal(quotaReads,0);assert.equal(h.calls.length,0);
+ await h.registry('/project',async state=>assert.equal(JSON.stringify(state),before));
+ const accepted=await h.call({...base,routing:{complexity:'routine',risk:'normal'},model:'anthropic/fixture-opus#high'});
+ assert.equal(accepted.content,'OK');assert.equal(quotaReads,1);assert.equal(h.calls.length,1);assert.equal(h.calls[0].model,'anthropic/fixture-opus#high');
+});
+test('capability mismatch cannot reclassify or recover an existing native denial',async t=>{
+ let attempts=0;const h=await harness(t,async(input,context,sessions)=>{
+  attempts++;const id=input.sessionID??'ses_denied';if(!sessions.some(session=>session.id===id))sessions.push({id,parentID:'root',agent:'builder',directory:'/project',active:false});
+  await context.progress({sessionID:id,status:'running'});throw new Error('Subagent denied: builder');
+ });
+ await assert.rejects(h.call(base),/Subagent denied/);assert.equal(attempts,1);
+ for(const continuation of [{sessionID:'ses_denied'},{}]) await assert.rejects(h.call({...base,agent:'scout',operation:'inspect',requiredCapabilities:['shell'],writePaths:[],...continuation}),error=>{
+  assert.notEqual(error.code,'TASK_DISPATCH_CAPABILITY_MISMATCH');assert.match(error.message,/continuation must be the same role|remains denied/);return true;
+ });
+ await h.registry('/project',async state=>{assert.equal(state.records[0].childID,'ses_denied');assert.equal(state.records[0].denial.category,'native_permission');});
+ await assert.rejects(h.call({...base,sessionID:'ses_denied'}),/remains denied \(native_permission\)/);assert.equal(attempts,1);
+});
+test('an existing valid child cannot receive new-assignment capability correction',async t=>{
+ const h=await harness(t);const first=await h.call({...base,background:true});const id=first.metadata.sessionID;
+ await assert.rejects(h.call({...base,agent:'scout',operation:'inspect',requiredCapabilities:['shell'],writePaths:[],sessionID:id}),error=>{
+  assert.notEqual(error.code,'TASK_DISPATCH_CAPABILITY_MISMATCH');assert.match(error.message,/continuation must be the same role/);return true;
+ });
+ assert.equal(h.calls.length,1);
 });
 test('fresh built-in callers retain the stock subagent arguments and original executor',async t=>{
  const h=await harness(t);const stock={agent:'builder',description:'Inspect files',prompt:'Inspect the current files',background:false};

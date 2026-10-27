@@ -24,6 +24,10 @@ export function hasCapability(agent, capability) {
 }
 const string = (value, name) => { if (typeof value !== 'string' || !value.trim() || value.length > 160 || /[\r\n\0]/.test(value)) throw new Error(`task-dispatch: valid ${name} is required`); return value; };
 const operations = ['inspect', 'implement', 'deploy', 'coordinate'];
+const capabilityMismatch = (agent, missing) => Object.assign(
+  new Error(`task-dispatch: TASK_DISPATCH_CAPABILITY_MISMATCH: ${agent} cannot perform ${missing.join(', ')}; assignment validation failure; not native permission denial. No child was launched and no native execution, permission, or provider admission was attempted for this dispatch. Correct a new, unadmitted assignment by selecting an eligible role within the authorized scope; preserve any explicitly requested model. This does not clear previous denials; do not drop required capabilities, loosen permissions, or replace/resume an existing child under another role.`),
+  { code: 'TASK_DISPATCH_CAPABILITY_MISMATCH', category: 'assignment_validation' },
+);
 function recovery(sessions, workerID, callerID, records) {
   const worker = sessions.find(s => s.id === workerID);
   let direct = worker; const seen = new Set();
@@ -180,12 +184,11 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const review = input.workReview === undefined ? undefined : normalizeReviewAcknowledgement(input.workReview);
       if (input.compact !== undefined && typeof input.compact !== 'boolean') throw new Error('task-dispatch: invalid compact');
       if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk) || (input.routing.reviewOf !== undefined && !modelReference(input.routing.reviewOf)))) throw new Error('task-dispatch: invalid routing assessment');
-      // Optional planning telemetry never substitutes for mandatory financial admission.
-      let quota;
-      if (input.routing) { try { quota = await loadQuota(ctx); } catch { /* unknown pace: retain configured model; guard still fails closed */ } }
       if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
+      if (input.model !== undefined && !modelReference(input.model)) throw new Error('task-dispatch: invalid explicit model reference');
+      if (input.resetModel !== undefined && typeof input.resetModel !== 'boolean') throw new Error('task-dispatch: invalid resetModel');
       const catalog = await ctx.agent.list(), agents = catalog.data ?? catalog;
       const agent = agents.find(a => (a.id ?? a.name) === input.agent);
       if (!agent || agent.disabled) throw new Error(`task-dispatch: role ${input.agent} is unavailable`);
@@ -198,8 +201,38 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const role = canonicalHarnessRole(input.agent) ?? input.agent;
       if (role === 'coordinator' && (input.operation !== 'coordinate' || !required.has('delegate'))) throw new Error('task-dispatch: coordinator requires operation coordinate and terminal-worker delegation');
       const missing = [...required].filter(c => !hasCapability(agent,c));
-      if (missing.length) throw new Error(`task-dispatch: ${input.agent} cannot perform ${missing.join(', ')}; use builder for executable inspection/implementation`);
-      const writes = paths(input, agent), token = crypto.randomUUID();
+      if (missing.length) {
+        // Capability correction is only safe before an assignment has an owner.
+        // This lookup deliberately does not reconcile, save, admit, or read quota.
+        const existing = await registry(workspace, async state => {
+          const sessions = await loadSessions(), rootID = lineage(sessions,context.sessionID);
+          const key = `${rootID}\0${input.taskId}\0${input.workKey}`;
+          const record = state.records.find(item => item.key === key);
+          const requested = input.sessionID ?? record?.childID;
+          const child = requested && sessions.find(session => session.id === requested);
+          const owner = requested && state.records.find(item => item.childID === requested);
+          if (requested) {
+            if (!child || child.parentID !== context.sessionID || child.agent !== input.agent)
+              return { message:`task-dispatch: continuation must be the same role and a direct child of this parent. Recovery: ${JSON.stringify(recovery(sessions,requested,context.sessionID,state.records))}` };
+            if (owner && owner.key !== key)
+              return { message:`task-dispatch: child belongs to taskId ${owner.taskId}, workKey ${owner.workKey}; retain that ownership identity` };
+            if (record?.childID && record.childID !== requested)
+              return { message:'task-dispatch: workKey already owns another child; resume that child' };
+          }
+          if (record?.denial)
+            return { message:`task-dispatch: admission remains denied (${record.denial.category}). ${denialAdvice(record.denial.category)} Inspect task_dispatch_status for the receipt.` };
+          if (record || owner || child)
+            return { message:`task-dispatch: existing assignment ${input.taskId}/${input.workKey} already has recorded ownership; preserve its child and role identity.` };
+        });
+        if (existing) throw new Error(existing.message);
+        throw capabilityMismatch(input.agent, missing);
+      }
+      const writes = paths(input, agent);
+      // Optional planning telemetry is advisory only. Read it after all local
+      // assignment validation so an impossible request has no quota side effect.
+      let quota;
+      if (input.routing) { try { quota = await loadQuota(ctx); } catch { /* unknown pace: retain configured model; guard still fails closed */ } }
+      const token = crypto.randomUUID();
       const admission = await registry(workspace, async (state, save) => {
         const sessions = await loadSessions(), rootID = lineage(sessions,context.sessionID);
         const historical=sessions.find(s=>s.id===context.sessionID)?.canonicalSessionID ?? sessions.find(s=>s.id===rootID)?.canonicalSessionID;
