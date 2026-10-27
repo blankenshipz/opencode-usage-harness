@@ -118,7 +118,7 @@ export function normalizeClaudeQuota(raw, { now = Date.now(), maxAgeMs = DEFAULT
   add('session', raw.five_hour);
   add('weekly_all', raw.seven_day);
   for (const [index, item] of (Array.isArray(raw.limits) ? raw.limits : []).entries()) {
-    const kind = item?.kind === 'weekly_scoped' || item?.scope || item?.model || item?.display_name ? 'weekly_scoped' : item?.kind;
+    const kind = ['session','weekly_all','weekly_scoped'].includes(item?.kind) ? item.kind : item?.scope || item?.model || item?.display_name ? 'weekly_scoped' : item?.kind;
     if (kind === 'session' || kind === 'weekly_all' || kind === 'weekly_scoped') add(kind, item, index);
   }
   pool.windows = windows.map(({ _key, ...w }) => w);

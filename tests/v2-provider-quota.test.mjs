@@ -68,3 +68,8 @@ test('live inactive limit metadata does not deny a valid paid account', () => {
   assert.equal(result.windows[0].is_active, false);
   assert.equal(result.windows.at(-1).used_percent, 100);
 });
+
+test('explicit account-window kind takes precedence over scope/display metadata',()=>{
+ const result=normalizeClaudeQuota({extra_usage:{is_enabled:false},limits:[{kind:'session',scope:{account:'selected'},display_name:'Current session',utilization:1,resets_at:new Date(Date.now()+3600000).toISOString()}]});
+ assert.equal(result.windows[0].kind,'session');assert.equal(result.windows[0].scope,'account');assert.equal(result.availability,'available');assert.equal(result.windows[0].used_percent,1);
+});
