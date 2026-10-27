@@ -134,14 +134,29 @@ export function normalizeClaudeQuota(raw, { now = Date.now(), maxAgeMs = DEFAULT
   return pool;
 }
 
-export async function readProviderQuotas({ readCodex, readClaude, now = Date.now(), timeoutMs = 25_000 } = {}) {
-  const codexReader = readCodex ?? (() => readCodexQuota({ timeoutMs }));
-  const claudeReader = readClaude ?? (async () => { throw Object.assign(new Error('selected Claude OAuth usage adapter unavailable'), { code: 'ADAPTER_UNAVAILABLE' }); });
-  const [openai, anthropic] = await Promise.all([
-    Promise.resolve().then(async () => { try { return normalizeCodexQuota(await codexReader(), { now }); } catch (error) { return { ...basePool('openai', now), availability: 'unknown', reason: errorReason(error) }; } }),
-    Promise.resolve().then(async () => { try { return normalizeClaudeQuota(await claudeReader(), { now }); } catch (error) { return { ...basePool('anthropic', now), availability: 'unknown', reason: error.code === 'ADAPTER_UNAVAILABLE' ? 'adapter_unavailable' : errorReason(error) }; } }),
-  ]);
-  return { version: 1, checked_at: iso(now), pools: { openai, anthropic } };
+// Only readers for the enabled catalog providers run. An absent subscription
+// must not add a CLI dependency, network request, or timeout to another pool.
+export function catalogProviders(catalog) {
+  if (!Array.isArray(catalog)) throw new Error('subscription quota: model catalog unavailable');
+  // The supported V2 ctx.model.list delegates to Model.available (enabled only).
+  return [...new Set(catalog.filter(model => model && model.enabled !== false).map(model => model.providerID).filter(id => ['openai','anthropic'].includes(id)))];
+}
+export async function readProviderQuotas({ readCodex, readClaude, providers = ['openai','anthropic'], now, timeoutMs = 25_000 } = {}) {
+  const clock = () => now ?? Date.now();
+  const readers = {
+    openai: readCodex ?? (() => readCodexQuota({ timeoutMs })),
+    anthropic: readClaude ?? (async () => { throw Object.assign(new Error('selected Claude OAuth usage adapter unavailable'), { code: 'ADAPTER_UNAVAILABLE' }); }),
+  };
+  if (!Array.isArray(providers) || providers.some(id => !Object.hasOwn(readers,id))) throw new Error('subscription quota: unsupported provider selection');
+  const pools = Object.fromEntries(await Promise.all([...new Set(providers)].map(async provider => {
+    try {
+      const raw = await readers[provider]();
+      return [provider,(provider === 'openai' ? normalizeCodexQuota : normalizeClaudeQuota)(raw,{now:clock()})];
+    } catch(error) {
+      return [provider,{...basePool(provider,clock()),reason:error?.code === 'ADAPTER_UNAVAILABLE' ? 'adapter_unavailable' : errorReason(error)}];
+    }
+  })));
+  return { version:1,checked_at:iso(clock()),pools };
 }
 
 export async function readCodexQuota({ timeoutMs = 25_000 } = {}) {

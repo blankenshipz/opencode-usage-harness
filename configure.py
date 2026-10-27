@@ -21,21 +21,36 @@ ROLES = {
 }
 
 def profile(models, package_root=ROOT, routing_policy=None):
+    if not isinstance(models, dict):
+        raise ValueError('models must be a tier-reference object')
     for tier in ('FAST', 'BALANCED', 'STRONG', 'MAXIMUM'):
-        if not isinstance(models.get(tier), str) or not re.fullmatch(r'openai/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+', models[tier]):
-            raise ValueError(f'{tier} must be an actual discovered openai/model#variant reference')
-    providers = ['openai']
+        if not isinstance(models.get(tier), str) or not re.fullmatch(r'(openai|anthropic)/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+', models[tier]):
+            raise ValueError(f'{tier} must be an actual discovered openai or anthropic model#variant reference')
+    providers = []
+    for tier in ('FAST', 'BALANCED', 'STRONG', 'MAXIMUM'):
+        provider = models[tier].split('/', 1)[0]
+        if provider not in providers:
+            providers.append(provider)
     if routing_policy is not None:
-        if routing_policy.get('version') != 1 or not isinstance(routing_policy.get('roles'), dict):
+        if not isinstance(routing_policy, dict) or routing_policy.get('version') != 1 or not isinstance(routing_policy.get('roles'), dict):
             raise ValueError('routing policy must use version 1 and explicit role candidates')
+        if 'enabled' in routing_policy and not isinstance(routing_policy['enabled'], bool):
+            raise ValueError('routing policy enabled must be a boolean')
         for candidates in routing_policy['roles'].values():
-            if not isinstance(candidates, list): raise ValueError('routing role candidates must be lists')
+            if not isinstance(candidates, list):
+                raise ValueError('routing role candidates must be lists')
             for candidate in candidates:
-                ref = candidate.get('ref', '')
-                if not re.fullmatch(r'(openai|anthropic)/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+', ref):
+                if not isinstance(candidate, dict):
+                    raise ValueError('routing candidates must be objects')
+                if 'enabled' in candidate and not isinstance(candidate['enabled'], bool):
+                    raise ValueError('routing candidate enabled must be a boolean')
+                ref = candidate.get('ref')
+                if not isinstance(ref, str) or not re.fullmatch(r'(openai|anthropic)/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+', ref):
                     raise ValueError('routing candidates must be discovered subscription model variants')
-                provider = ref.split('/')[0]
-                if provider not in providers: providers.append(provider)
+                if routing_policy.get('enabled') is True and candidate.get('enabled', True) is not False:
+                    provider = ref.split('/')[0]
+                    if provider not in providers:
+                        providers.append(provider)
     prompts = json.loads((package_root/'config/instructions.json').read_text())
     agents = {}
     for role, (tier, delegate, readonly) in ROLES.items():
@@ -79,20 +94,27 @@ def main():
     a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
     result=profile(json.loads(a.models.read_text()),routing_policy=routing)
     directory=a.state_dir.expanduser().resolve()/'config';target=directory/'opencode.json'
-    if target.exists() and not a.replace:
+    replacing = target.exists()
+    if replacing and not a.replace:
         p.error('profile exists; use --replace only after reviewing changes')
     directory.mkdir(parents=True,exist_ok=True,mode=0o700)
     if target.exists():
         backup=target.with_name(f'opencode.backup-{time.time_ns()}.json');backup.write_bytes(target.read_bytes());backup.chmod(0o600)
     target.write_text(json.dumps(result,indent=2)+'\n');target.chmod(0o600)
+    policy_path=directory/'routing-policy.json'
     if routing is not None:
-        policy_path=directory/'routing-policy.json'
         if policy_path.exists():
             policy_path.with_name(f'routing-policy.backup-{time.time_ns()}.json').write_bytes(policy_path.read_bytes())
         policy_path.write_text(json.dumps(routing,indent=2)+'\n');policy_path.chmod(0o600)
+    elif policy_path.exists():
+        policy_path.with_name(f'routing-policy.backup-{time.time_ns()}.json').write_bytes(policy_path.read_bytes())
+        policy_path.unlink()
     financial=directory/'financial-verification.json'
-    if not financial.exists():
+    if 'openai' in result['enabled_providers'] and not financial.exists():
         financial.write_text(json.dumps({'auto_top_up_off':False,'automatic_reload_off':False,'purchased_credit_balance_ui':None,'verified_at':None},indent=2)+'\n');financial.chmod(0o600)
-    print(f'Prepared {target}; no service started. Financial verification is required before inference.')
+    requirements=[]
+    if 'openai' in result['enabled_providers']: requirements.append('OpenAI OAuth/account and financial verification')
+    if 'anthropic' in result['enabled_providers']: requirements.append('reviewed Claude OAuth adapter and disabled usage credits')
+    print(f'Prepared {target}; no service started. Required before inference: '+ '; '.join(requirements)+'.')
 
 if __name__=='__main__':main()

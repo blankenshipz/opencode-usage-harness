@@ -26,8 +26,17 @@ the authority for tools, model access and approvals.
 
 ## Enabling multi-pool routing
 
-The public generated profile is OpenAI-only. Multi-provider routing requires an
-explicit, reviewed policy and the separate provider setup. Prepare it with:
+Tier references determine the provider allowlist. All-OpenAI tiers produce an
+OpenAI-only profile; all-Anthropic tiers produce a Claude-only profile. Mixed
+tiers enable both. Four tiers do not require four different models. No routing
+policy is required for single-pool operation.
+
+A policy can add approved candidates within one pool or across pools; only
+an enabled policy's enabled candidates add providers. Quota reads use the enabled
+runtime catalog and do not contact an absent provider. Cross-family review is
+optional; same-family review works normally with one subscription.
+
+Prepare a profile with an optional reviewed policy and separate provider setup:
 
 ```sh
 python3 configure.py --models /absolute/path/to/models.json \
@@ -35,7 +44,8 @@ python3 configure.py --models /absolute/path/to/models.json \
 ```
 
 The example policy is [`config/routing-policy.example.json`](../config/routing-policy.example.json).
-It is disabled by default, lists candidates per harness role, and uses actual
+It is a disabled illustrative two-provider policy; remove unneeded candidates
+and use IDs discovered in your own catalog. It lists candidates per role and uses
 `provider/model#effort` catalog references. Candidates are capability peers in
 the approved role; they are not ranked by API price, raw token counts or
 provider brand. The policy may include OpenAI and Anthropic, but Claude also
@@ -63,7 +73,9 @@ candidate from another provider family when available. This is a routing hint,
 not an automatic review: the parent must create and accept the review, and no
 review is generated merely because another pool has capacity.
 
-Behavior profiles are provisional for version-specific model families. Measure
+Behavior profiles are version-specific. The example policy marks every profile
+`example_unvalidated`; replace its model references and record your own evidence.
+No example claims measured capability or savings for another installation. Measure
 accepted validation, confirmed review findings, repairs, user corrections,
 elapsed time and observed quota windows. Do not infer behavior from provider
 stereotypes, equal effort labels or API prices. Keep the task acceptance contract
@@ -83,3 +95,17 @@ permissions, financial admission, account identity checks or provider-specific
 OAuth requirements. See [Claude subscription setup](CLAUDE-SUBSCRIPTION.md),
 [usage controls](USAGE-CONTROLS.md), and [subscription pools](SUBSCRIPTION-POOLS.md)
 for the related boundaries.
+
+## Changing back to one pool
+
+Supply all four tier references from the retained provider, then run
+`configure.py --models /absolute/path/to/models.json --replace` without
+`--routing-policy`. This backs up the prior generated profile and any existing
+managed routing policy, then removes that policy so it cannot silently restore
+old dual-pool routing. It does not delete account credentials or change a running
+service; review and activate the generated profile separately.
+
+Claude-only admission requires its reviewed OAuth adapter and disabled usage
+credits; no Codex login or OpenAI financial-verification file is required. OpenAI
+admission still requires its own OAuth/account and financial checks. Unknown quota
+in an enabled pool never authorizes inference through a different provider.

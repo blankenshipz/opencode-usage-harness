@@ -1,5 +1,8 @@
 import unittest
+import json
 from pathlib import Path
+import subprocess
+import tempfile
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from configure import profile
@@ -27,8 +30,67 @@ class ConfigureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             profile(models,routing_policy={'version':1,'roles':{'builder':[{'ref':'paid/fixture#high'}]}})
 
-    def test_models_must_be_explicit_openai_variants(self):
-        for invalid in ('other/model#medium','openai/model','openai/model#'):
+    def test_tiers_can_be_openai_anthropic_or_mixed(self):
+        tiers = ('FAST','BALANCED','STRONG','MAXIMUM')
+        self.assertEqual(profile({k:'anthropic/fixture#medium' for k in tiers})['enabled_providers'], ['anthropic'])
+        self.assertEqual(profile({k:('openai/fixture#medium' if k == 'FAST' else 'anthropic/fixture#medium') for k in tiers})['enabled_providers'], ['openai','anthropic'])
+
+    def test_disabled_policy_does_not_activate_candidate_provider(self):
+        models={k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')}
+        policy={'version':1,'enabled':False,'roles':{'builder':[{'ref':'anthropic/fixture#high'}]}}
+        self.assertEqual(profile(models,routing_policy=policy)['enabled_providers'], ['openai'])
+        policy['enabled']=True
+        policy['roles']['builder'][0]['enabled']=False
+        self.assertEqual(profile(models,routing_policy=policy)['enabled_providers'], ['openai'])
+
+    def test_malformed_policy_is_value_error(self):
+        models={k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')}
+        for policy in (
+            None,
+            {'version':1,'roles':{'builder':[None]}},
+            {'version':1,'roles':{'builder':[{}]}},
+            {'version':1,'enabled':'yes','roles':{}},
+        ):
+            if policy is not None:
+                with self.assertRaises(ValueError):
+                    profile(models,routing_policy=policy)
+
+    def test_models_must_be_explicit_subscription_variants(self):
+        for invalid in ('other/model#medium','openai/model','openai/model#','anthropic/model#'):
             with self.assertRaises(ValueError):profile({k:invalid for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
+
+    def test_replace_without_policy_backs_up_and_removes_stale_policy(self):
+        tiers = ('FAST','BALANCED','STRONG','MAXIMUM')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            models=root/'models.json'; models.write_text(json.dumps({k:'openai/fixture#medium' for k in tiers}))
+            state=root/'state'; config=state/'config'; config.mkdir(parents=True)
+            (config/'opencode.json').write_text('{}')
+            (config/'routing-policy.json').write_text('{"version": 1, "enabled": true}')
+            financial=config/'financial-verification.json'; financial.write_text('{"verified_at":"kept"}')
+            subprocess.run([sys.executable, 'configure.py', '--models', str(models), '--state-dir', str(state), '--replace'], check=True)
+            self.assertFalse((config/'routing-policy.json').exists())
+            backups=list(config.glob('routing-policy.backup-*.json'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_text(), '{"version": 1, "enabled": true}')
+            self.assertEqual(financial.read_text(), '{"verified_at":"kept"}')
+
+    def test_orphaned_policy_is_backed_up_without_existing_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); state=root/'state'; config=state/'config';config.mkdir(parents=True)
+            models=root/'models.json';models.write_text(json.dumps({k:'anthropic/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')}))
+            (config/'routing-policy.json').write_text('{"version":1,"enabled":true}')
+            subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(state)],check=True,capture_output=True)
+            self.assertFalse((config/'routing-policy.json').exists())
+            self.assertEqual(len(list(config.glob('routing-policy.backup-*.json'))),1)
+
+    def test_anthropic_only_profile_does_not_create_financial_placeholder(self):
+        tiers = ('FAST','BALANCED','STRONG','MAXIMUM')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            models=root/'models.json'; models.write_text(json.dumps({k:'anthropic/fixture#medium' for k in tiers}))
+            state=root/'state'
+            subprocess.run([sys.executable, 'configure.py', '--models', str(models), '--state-dir', str(state)], check=True)
+            self.assertFalse((state/'config'/'financial-verification.json').exists())
 
 if __name__=='__main__':unittest.main()

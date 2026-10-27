@@ -1,9 +1,11 @@
 # Optional Claude subscription connection
 
-The default generated profile and automatic routing remain Codex-only. This
-adapter allows a manually selected Anthropic model after an installation owner
-explicitly adds Anthropic to both native provider policy and enabled_providers.
-It does not change model assignments or pool routing.
+Claude can be the only subscription pool or an additional pool beside Codex.
+For Claude-only configuration, map FAST/BALANCED/STRONG/MAXIMUM to discovered
+`anthropic/model#variant` references. The generator enables only Anthropic;
+Codex CLI, an OpenAI login and OpenAI financial verification are not required.
+The Claude OAuth adapter below must still be installed and configured separately.
+An optional enabled routing policy adds only its enabled candidate providers.
 
 This path uses the third-party griffinmartin/opencode-claude-auth plugin 3.0.0,
 with its Claude Code subscription OAuth method. Anthropic prohibits third-party
@@ -94,6 +96,6 @@ currently selected Claude OAuth usage endpoint and reports the independent
 Anthropic windows and scoped Fable limit when present.
 
 The routing policy is separately opt-in. It does not add Claude candidates to
-the default OpenAI-only profile, and it does not retry a failed Claude request
+an OpenAI-only profile, and it does not retry a failed Claude request
 through another provider. See [native and multi-pool routing](NATIVE-AND-MULTI-POOL.md)
 for candidate, continuation and review behavior.

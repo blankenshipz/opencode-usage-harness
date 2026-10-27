@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { validateFinancial } from '../../config/guard-validation.mjs';
 import { anthropicPackage, assertAnthropicOverrides, assertAnthropicBaseURL, assertAnthropicHTTPURL,
   assertAnthropicCredential, fetchAnthropicUsage, readSelectedClaudeUsage } from './anthropic-subscription.mjs';
-import { readProviderQuotas } from './provider-quota.mjs';
+import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
 import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
 import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
 import { createRegistry } from './dispatch-registry.mjs';
@@ -224,6 +224,7 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
         name: 'subscription_quota', description: 'Read independent OpenAI and Claude subscription windows and scoped limits. Advisory pacing only; no inference, credential output or paid fallback.',
         input: { type: 'object', properties: {}, additionalProperties: false },
         execute: async () => ({ content: JSON.stringify(await readProviderQuotas({
+          providers: catalogProviders((await ctx.model.list()).data),
           readCodex: async () => JSON.parse(await quota('read')),
           readClaude: () => readSelectedClaudeUsage(ctx, readAnthropicUsage),
         })) }),

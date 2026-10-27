@@ -1,15 +1,15 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { managedConfigRoot } from './paths.mjs';
-import { readProviderQuotas } from './provider-quota.mjs';
+import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
 import { readSelectedClaudeUsage } from './anthropic-subscription.mjs';
 
 export async function readRoutingQuota(ctx) {
   let policy;
   try { policy = JSON.parse(readFileSync(path.join(managedConfigRoot, 'routing-policy.json'), 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw new Error('routing: invalid policy file'); }
-  const quota = await readProviderQuotas({ readClaude: ctx ? () => readSelectedClaudeUsage(ctx) : undefined });
   const catalog = ctx ? (await ctx.model.list()).data : undefined;
+  const quota = await readProviderQuotas({ providers: catalogProviders(catalog), readClaude: () => readSelectedClaudeUsage(ctx) });
   return { ...quota, routingPolicy: policy, catalog };
 }
 export function modelReference(ref) {
@@ -17,10 +17,10 @@ export function modelReference(ref) {
   if (!ref || typeof ref !== 'object') return;
   return modelReference(`${ref.providerID}/${ref.id}${ref.variant ? '#'+ref.variant : ''}`);
 }
-export function quotaPace(quota, now=Date.now()) {
-  const checked=Date.parse(quota?.checked_at);
+export function quotaPace(quota, now=Date.now(), provider='openai') {
+  const checked=Date.parse(quota?.pools ? quota.pools[provider]?.checked_at : quota?.checked_at);
   if (!Number.isFinite(checked) || now-checked>120000 || checked>now+5000) return 'unknown';
-  const windows=(quota.buckets ? quota.buckets.flatMap(b=>b.windows??[]) : quota.pools?.openai?.windows??[]).filter(w=>Number.isFinite(w.pace_delta));
+  const windows=(quota.pools ? quota.pools[provider]?.windows?.filter(w=>w.scope==='account')??[] : provider==='openai' ? (quota.buckets??[]).flatMap(b=>b.windows??[]) : []).filter(w=>Number.isFinite(w.pace_delta));
   if (!windows.length) return 'unknown';
   if (windows.some(w=>w.pace_delta>10 || w.remaining_percent<=10)) return 'ahead';
   if (windows.every(w=>w.pace_delta < -10)) return 'behind';
@@ -37,7 +37,7 @@ export function selectDispatchModel({input,agent,agents,record,child,quota}) {
   // sessions have no provenance; their next dispatch adopts the configured role.
   if (!input.resetModel && observed && record?.routing?.selected && observed!==record.routing.selected) override=observed;
   override=explicit??override;
-  const pace=quotaPace(quota);
+  const pace=quotaPace(quota,Date.now(),configured?.split('/')[0]);
   let selected=override??configured, source=override?'explicit_override':'configured_role';
   // Never reinterpret an admitted generation or change its provider on retry.
   if (!override && record?.routing?.selected) {

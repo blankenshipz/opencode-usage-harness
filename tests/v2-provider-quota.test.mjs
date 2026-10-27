@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeClaudeQuota, normalizeCodexQuota, readProviderQuotas } from '../plugins/v2/provider-quota.mjs';
+import { normalizeClaudeQuota, normalizeCodexQuota, readProviderQuotas, catalogProviders } from '../plugins/v2/provider-quota.mjs';
 
 const now = Date.parse('2026-10-26T12:00:00.000Z');
 
@@ -72,4 +72,20 @@ test('live inactive limit metadata does not deny a valid paid account', () => {
 test('explicit account-window kind takes precedence over scope/display metadata',()=>{
  const result=normalizeClaudeQuota({extra_usage:{is_enabled:false},limits:[{kind:'session',scope:{account:'selected'},display_name:'Current session',utilization:1,resets_at:new Date(Date.now()+3600000).toISOString()}]});
  assert.equal(result.windows[0].kind,'session');assert.equal(result.windows[0].scope,'account');assert.equal(result.availability,'available');assert.equal(result.windows[0].used_percent,1);
+});
+
+test('single-pool telemetry never invokes the absent provider reader',async()=>{
+ for(const provider of ['openai','anthropic']) {
+  const calls=[];const result=await readProviderQuotas({providers:[provider],readCodex:async()=>{calls.push('openai');if(provider!=='openai')throw new Error('absent CLI must not run');return {checked_at:new Date().toISOString(),buckets:[]};},readClaude:async()=>{calls.push('anthropic');if(provider!=='anthropic')throw new Error('absent OAuth must not resolve');return {extra_usage:{is_enabled:false}};}});
+  assert.deepEqual(calls,[provider]);assert.deepEqual(Object.keys(result.pools),[provider]);
+ }
+});
+test('unknown enabled pool never triggers another pool reader or fallback',async()=>{
+ const result=await readProviderQuotas({providers:['anthropic'],readClaude:async()=>{throw new Error('private-error');},readCodex:async()=>{assert.fail('must not query Codex');}});
+ assert.equal(result.pools.anthropic.availability,'unknown');assert.equal(result.pools.openai,undefined);assert.ok(!JSON.stringify(result).includes('private-error'));
+});
+
+test('catalog selection deduplicates enabled supported providers and rejects missing inventory',()=>{
+ assert.deepEqual(catalogProviders([{providerID:'anthropic'},{providerID:'anthropic'},{providerID:'openai',enabled:false},{providerID:'other'},null]),['anthropic']);
+ assert.throws(()=>catalogProviders(undefined),/catalog unavailable/);
 });

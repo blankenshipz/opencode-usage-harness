@@ -51,7 +51,8 @@ The behavior below describes the current development branch and its compatible
 V2 agent integration, not everything in the v0.1.0 toolkit release.
 
 The public profile uses four user-supplied tiers: **FAST, BALANCED, STRONG and
-MAXIMUM**. Each maps to an actual `openai/<model-id>#<variant>` reference discovered
+MAXIMUM**. Each maps to an actual `openai/<model-id>#<variant>` or
+`anthropic/<model-id>#<variant>` reference discovered
 in your account's catalog. The variant selects the reasoning effort supported by
 that model. The harness does not assume particular model names, a universal effort
 ladder, or that API prices describe subscription consumption.
@@ -112,11 +113,25 @@ review evidence and continuations. The built-in agents can still be useful for a
 small independent task or a fresh native chat when that durable contract is not
 needed.
 
-### Opt-in multi-provider routing
+### One pool or multiple pools
 
-The public default remains OpenAI-only. To enable comparable OpenAI and Anthropic
-subscription candidates, pass an explicitly reviewed policy to
-`configure.py --routing-policy`; the policy expands enabled providers and is
+**One subscription is enough.** Use OpenAI only, Claude only, or both:
+
+| Your subscriptions | Tier mappings | Enabled providers |
+|---|---|---|
+| ChatGPT/Codex only | All four tiers use discovered `openai/...#variant` references | OpenAI only |
+| Claude only | All four tiers use discovered `anthropic/...#variant` references | Anthropic only |
+| Both | Mix tier references, or opt into approved role candidates | Only providers named by tiers and enabled candidates |
+
+The generator derives provider access from your mappings; it does not require
+OpenAI for a Claude-only profile. You may map several tiers to the same model.
+Native agents, context controls, verification and same-family review work with a
+single pool. Cross-family review is an optional preference and never requires a
+second subscription. Runtime quota tools query only providers in the enabled
+model catalog, so a Claude-only setup does not invoke Codex CLI or read its auth.
+
+To enable quota-aware choice among role candidates, pass an explicitly reviewed policy to
+`configure.py --routing-policy`; only enabled policies and enabled candidates expand provider access. The policy is
 written beside the generated profile. It does not authenticate Claude or make
 Claude eligible by catalog visibility alone. Each role's candidates must be
 actual catalog model/effort references, and Anthropic still requires the guarded
@@ -199,8 +214,8 @@ tokens are not free by assumption, and model names do not establish cost. Retain
 receipts and tests support acceptance; metric counts alone do not prove correctness
 or savings.
 
-The default generated profile keeps OpenAI-only access. An opt-in Anthropic
-subscription admission path is also available; see [Claude connection setup](docs/CLAUDE-SUBSCRIPTION.md).
+The generated profile allows only providers named by its tier mappings and enabled
+routing candidates. OpenAI and Anthropic subscription admission are independent; see [Claude connection setup](docs/CLAUDE-SUBSCRIPTION.md).
 ChatGPT OAuth/account checks and financial admission remain separate from optimization. Quota pressure never authorizes
 purchased credits, API-key inference or an automatic paid/provider fallback.
 Compression and context diagnostics are model-family-neutral middleware; that does
@@ -210,7 +225,8 @@ not enable additional subscription providers automatically.
 
 This is an **experimental project** extracted from a working private installation.
 The standalone installer and utilities are independently usable. Live agent
-integration currently supports **Codex through ChatGPT OAuth** and targets
+integration supports **Codex through ChatGPT OAuth**, with an optional reviewed
+**Claude Code OAuth adapter**, and targets
 **OpenCode 2.0.18 with the supplied required-plugin patch**.
 
 A fresh end-to-end public installation, stock/newer OpenCode versions, and Windows

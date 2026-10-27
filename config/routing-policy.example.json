@@ -108,7 +108,7 @@
   "profiles": {
     "openai-luna": {
       "model": "gpt-6-luna",
-      "evidence_status": "existing_workload",
+      "evidence_status": "example_unvalidated",
       "measure": [
         "accepted_validation",
         "confirmed_review_findings",
@@ -121,7 +121,7 @@
     },
     "openai-sol": {
       "model": "gpt-6.1-sol",
-      "evidence_status": "existing_workload",
+      "evidence_status": "example_unvalidated",
       "measure": [
         "accepted_validation",
         "confirmed_review_findings",
@@ -134,7 +134,7 @@
     },
     "openai-astra": {
       "model": "gpt-6-astra",
-      "evidence_status": "existing_workload",
+      "evidence_status": "example_unvalidated",
       "measure": [
         "accepted_validation",
         "confirmed_review_findings",
@@ -147,7 +147,7 @@
     },
     "claude-haiku": {
       "model": "claude-haiku-5-5",
-      "evidence_status": "provisional",
+      "evidence_status": "example_unvalidated",
       "measure": [
         "accepted_validation",
         "confirmed_review_findings",
@@ -160,7 +160,7 @@
     },
     "claude-sonnet": {
       "model": "claude-sonnet-5-5",
-      "evidence_status": "provisional",
+      "evidence_status": "example_unvalidated",
       "measure": [
         "accepted_validation",
         "confirmed_review_findings",
@@ -173,7 +173,7 @@
     },
     "claude-opus": {
       "model": "claude-opus-5-5",
-      "evidence_status": "provisional",
+      "evidence_status": "example_unvalidated",
       "measure": [
         "accepted_validation",
         "confirmed_review_findings",
@@ -186,7 +186,7 @@
     },
     "claude-fable": {
       "model": "claude-fable-5-1",
-      "evidence_status": "provisional",
+      "evidence_status": "example_unvalidated",
       "measure": [
         "accepted_validation",
         "confirmed_review_findings",

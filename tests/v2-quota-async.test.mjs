@@ -5,10 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createV2Guard } from '../plugins/v2/subscription-guard.mjs';
 
-async function quotaTool(options, name='codex_quota', integration) {
+async function quotaTool(options, name='codex_quota', integration, providers=['openai','anthropic']) {
   let tool;
   const cleanup = await createV2Guard(options).setup({
     integration,
+    model: {list:async()=>({data:providers.map(providerID=>({providerID}))})},
     provider: { transform: async () => {} },
     tool: { transform: async callback => callback({ add: candidate => { if (candidate.name === name) tool = candidate; } }) },
     session: { hook: async () => {} },
@@ -94,4 +95,15 @@ test('combined subscription tool reads independent fake adapters without exposin
   let reads=0;
   const h=await quotaTool({runQuota:async()=>JSON.stringify({checked_at:now,credit_risk:'none',buckets:[{windows:[{used_percent:10,resets_at:reset,duration_minutes:300}]}]}),readAnthropicUsage:async access=>{reads++;assert.equal(access,'fixture-secret');return {checked_at:now,extra_usage:{is_enabled:false},five_hour:{utilization:5,resets_at:reset}};}},'subscription_quota',integration);
   try {const result=(await h.tool.execute({})).content;const data=JSON.parse(result);assert.equal(data.pools.openai.availability,'available');assert.equal(data.pools.anthropic.availability,'available');assert.equal(reads,1);assert.ok(!result.includes('fixture-secret'));} finally {h.cleanup();}
+});
+
+test('Claude-only runtime quota tool does not call Codex or need its credential files',async()=>{
+ let codexCalls=0;
+ const integration={connection:{active:async()=>({type:'credential',method:'oauth'}),resolve:async()=>({type:'oauth',methodID:'claude-code',access:'fixture-secret',metadata:{'opencode-claude-auth/claude-code-oauth':'v1'}})}};
+ const h=await quotaTool({runQuota:async()=>{codexCalls++;throw new Error('Codex is not installed');},readJSON:()=>assert.fail('No Codex auth/financial reads'),readAnthropicUsage:async()=>({extra_usage:{is_enabled:false}})},'subscription_quota',integration,['anthropic']);
+ try{const data=JSON.parse((await h.tool.execute({})).content);assert.deepEqual(Object.keys(data.pools),['anthropic']);assert.equal(codexCalls,0);}finally{h.cleanup();}
+});
+test('OpenAI-only runtime quota tool never resolves Claude OAuth',async()=>{
+ const h=await quotaTool({runQuota:async()=>JSON.stringify({checked_at:new Date().toISOString(),buckets:[]})},'subscription_quota',{connection:{active:async()=>assert.fail('No Claude OAuth lookup')}},['openai']);
+ try{assert.deepEqual(Object.keys(JSON.parse((await h.tool.execute({})).content).pools),['openai']);}finally{h.cleanup();}
 });

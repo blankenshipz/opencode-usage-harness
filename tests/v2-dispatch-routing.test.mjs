@@ -1,25 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {selectDispatchModel,quotaPace,modelReference} from '../plugins/v2/dispatch-routing.mjs';
-const agent={id:'builder',model:{providerID:'demo',id:'balanced',variant:'medium'}};
-const agents=[agent,{id:'quick-builder',model:{providerID:'demo',id:'fast',variant:'low'}}];
+const agent={id:'builder',model:{providerID:'openai',id:'balanced',variant:'medium'}};
+const agents=[agent,{id:'quick-builder',model:{providerID:'openai',id:'fast',variant:'low'}}];
 const quota={checked_at:new Date().toISOString(),buckets:[{windows:[{pace_delta:60,remaining_percent:34}]}]};
-const base={input:{agent:'builder'},agent,agents,record:{},child:{model:{providerID:'demo',id:'strong',variant:'high'}},quota};
+const base={input:{agent:'builder'},agent,agents,record:{},child:{model:{providerID:'openai',id:'strong',variant:'high'}},quota};
 test('continuation supplies configured model rather than inheriting stale child choice',()=>{
- assert.equal(selectDispatchModel(base).selected,'demo/balanced#medium');
+ assert.equal(selectDispatchModel(base).selected,'openai/balanced#medium');
  assert.equal(modelReference('bad model'),undefined);
 });
 test('explicit override persists and a subsequent observed manual switch wins',()=>{
- let r=selectDispatchModel({...base,input:{agent:'builder',model:'demo/strong#high'}});
- assert.equal(r.modelOverride,'demo/strong#high');
- r=selectDispatchModel({...base,record:{modelOverride:r.modelOverride,routing:r},child:{model:'demo/custom#high'}});
- assert.equal(r.selected,'demo/custom#high');
- assert.equal(selectDispatchModel({...base,input:{agent:'builder',resetModel:true},record:{modelOverride:'demo/strong#high'}}).selected,'demo/balanced#medium');
+ let r=selectDispatchModel({...base,input:{agent:'builder',model:'openai/strong#high'}});
+ assert.equal(r.modelOverride,'openai/strong#high');
+ r=selectDispatchModel({...base,record:{modelOverride:r.modelOverride,routing:r},child:{model:'openai/custom#high'}});
+ assert.equal(r.selected,'openai/custom#high');
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',resetModel:true},record:{modelOverride:'openai/strong#high'}}).selected,'openai/balanced#medium');
 });
 test('only explicitly routine normal risk work is paced down within provider',()=>{
- assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'routine',risk:'normal'}}}).selected,'demo/fast#low');
- for (const routing of [{complexity:'complex',risk:'normal'},{complexity:'routine',risk:'high'}]) assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing}}).selected,'demo/balanced#medium');
- assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'routine',risk:'normal'}},agents:[agent,{id:'quick-builder',model:'other/fast#low'}]}).selected,'demo/balanced#medium');
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'routine',risk:'normal'}}}).selected,'openai/fast#low');
+ for (const routing of [{complexity:'complex',risk:'normal'},{complexity:'routine',risk:'high'}]) assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing}}).selected,'openai/balanced#medium');
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'routine',risk:'normal'}},agents:[agent,{id:'quick-builder',model:'other/fast#low'}]}).selected,'openai/balanced#medium');
 });
 test('missing/stale quota and short-window pressure are handled conservatively',()=>{
  assert.equal(quotaPace(null),'unknown');
@@ -61,4 +61,18 @@ test('Fable scoped exhaustion does not exclude ordinary Claude routes',()=>{
 test('reset clears override metadata but cannot reroute an admitted generation',()=>{
  const result=selectDispatchModel({...base,quota:multi(),input:{agent:'builder',resetModel:true,routing:{complexity:'standard',risk:'normal'}},record:{modelOverride:'openai/sol#medium',routing:{selected:'openai/sol#medium'}},child:{model:'openai/sol#medium'}});
  assert.equal(result.selected,'openai/sol#medium');assert.equal(result.modelOverride,undefined);assert.equal(result.source,'continuation_affinity');
+});
+
+test('routine single-pool pacing uses that role provider rather than another subscription',()=>{
+ const q=multi();q.pools.anthropic=pool('anthropic',20);q.pools.openai=pool('openai',-40);delete q.routingPolicy;
+ const a={id:'builder',model:'anthropic/sonnet#high'},fast={id:'quick-builder',model:'anthropic/haiku#medium'};
+ const input={agent:'builder',routing:{complexity:'routine',risk:'normal'}};
+ assert.equal(selectDispatchModel({...base,agent:a,agents:[a,fast],input,quota:q}).selected,'anthropic/haiku#medium');
+ q.pools.anthropic=pool('anthropic',0);q.pools.openai=pool('openai',40);
+ assert.equal(selectDispatchModel({...base,agent:a,agents:[a,fast],input,quota:q}).selected,'anthropic/sonnet#high');
+});
+test('cross-family review is optional and a single healthy pool remains useful',()=>{
+ const q=multi();delete q.pools.openai;q.catalog=q.catalog.filter(m=>m.providerID==='anthropic');
+ const result=selectDispatchModel({...base,agent:{model:'anthropic/opus#high'},input:{agent:'reviewer',routing:{complexity:'complex',risk:'high',reviewOf:'anthropic/sonnet#high'}},quota:q});
+ assert.equal(result.selected,'anthropic/opus#high');assert.equal(result.source,'subscription_pool_selection');
 });
