@@ -5,7 +5,7 @@
   "upstream_commit": "4a397d95ce443c8d56c44ea2a350710f235dbcfd",
   "staged_baseline_commit": "ba80573ca11e3c310502ef3c205da449193dc4e3",
   "patched_commit": "62ece9e131d61e4c2d790410befd5cc63e0435dc",
-  "patch_sha256": "ee67cf2fa18a79f9f4a1ce986a361e953149a13586c46c496ba6ff46631a6cf2",
+  "patch_sha256": "af1198015cc5876149a7ae8dbe3816bb60b1ce209933e2b717e3976205acefe7",
   "original_sha256": {
     "src/credentials.ts": "fb56c1b63e475a908feacefdf80332255b67630e6595e9a70587aea89882a093",
     "src/provider.ts": "38897d94d54193a250e8d4aac904baaa7a3565165d96e8d3ada946a8f3f220ab"
@@ -13,7 +13,10 @@
   "patched_sha256": {
     "src/credentials.ts": "68bd2fd9498a10a2bd3531b6215f5431a3df3e6b93043b7ff2519488a021e18b",
     "src/provider.ts": "32dc63434f8934701ad914ad66da3c73f8f2383ac64e7495e833d91a466ea665",
-    "src/vendor-hardening.test.ts": "8f28b6471a3d5196fad32acf7ef492f876e9739b6ab5ed2ab4032fba144aaaf5"
+    "src/vendor-hardening.test.ts": "8f28b6471a3d5196fad32acf7ef492f876e9739b6ab5ed2ab4032fba144aaaf5",
+    "src/model-config.ts": "06e92f85183b457af6d7ec552bf7a607f76903a77693a2d2aa0fbc7b4e6a6db7",
+    "src/betas.test.ts": "0986e1c1b06946f44ff178337fe6f454cf7a373db49e48d1ddd6b32d74197703",
+    "src/transforms.test.ts": "0e0caae339daa63c16a9b329d5c9dfa00db0b4f3d7afd138a669d2a014413df6"
   },
   "scope": [
     "CLI refresh is disabled and never spawns Claude inference.",

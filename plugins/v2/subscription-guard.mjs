@@ -6,7 +6,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { validateFinancial } from '../../config/guard-validation.mjs';
 import { anthropicPackage, assertAnthropicOverrides, assertAnthropicBaseURL, assertAnthropicHTTPURL,
-  assertAnthropicCredential } from './anthropic-subscription.mjs';
+  assertAnthropicCredential, fetchAnthropicUsage, readSelectedClaudeUsage } from './anthropic-subscription.mjs';
+import { readProviderQuotas } from './provider-quota.mjs';
 import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
 import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
 import { createRegistry } from './dispatch-registry.mjs';
@@ -20,8 +21,6 @@ const oauthMethods = new Set(['chatgpt-browser', 'chatgpt-headless']);
 const officialPackages = new Set(['@opencode/ai/providers/openai', '@opencode/ai/providers/openai/responses']);
 const allowedProviders = new Set(['openai', 'anthropic']);
 const quotaTimeout = 25000;
-const anthropicUsageURL = 'https://api.anthropic.com/api/oauth/usage';
-const anthropicUsageTimeout = 10000;
 const anthropicUsageCacheMs = 30000;
 const anthropicUsageCacheLimit = 16;
 const execFileAsync = promisify(execFile);
@@ -96,15 +95,7 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     appendFileSync(path.join(telemetry, `${file}.jsonl`), JSON.stringify(value) + '\n', { mode: 0o600 });
   }, env = process.env, now = () => new Date().toISOString(), recordCompletion = value => persistCompletion({
     database: statePath('telemetry', 'completions.sqlite3'), value, python: env.HARNESS_PYTHON || 'python3', env,
-  }), registry = createRegistry(), readAnthropicUsage = async access => {
-    let response;
-    try {
-      response = await fetch(anthropicUsageURL, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(anthropicUsageTimeout),
-        headers: { authorization: `Bearer ${access}`, 'anthropic-beta': 'oauth-2025-04-20' } });
-      if (!response.ok) throw new Error('status');
-      return await response.json();
-    } catch { throw new Error('Subscription guard: Anthropic usage verification failed.'); }
-  } } = {}) {
+  }), registry = createRegistry(), readAnthropicUsage = fetchAnthropicUsage } = {}) {
   const anthropicUsageCache = new Map();
   async function quota(operation) {
     const started = performance.now();
@@ -228,6 +219,14 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
         name: 'codex_quota', description: 'Read actual Codex quota windows, reset times, pacing and credit risk (30-second cache). No inference or spending.',
         input: { type: 'object', properties: {}, additionalProperties: false },
         execute: async () => ({ content: await quota('read') }),
+      }));
+      await ctx.tool.transform(editor => editor.add({
+        name: 'subscription_quota', description: 'Read independent OpenAI and Claude subscription windows and scoped limits. Advisory pacing only; no inference, credential output or paid fallback.',
+        input: { type: 'object', properties: {}, additionalProperties: false },
+        execute: async () => ({ content: JSON.stringify(await readProviderQuotas({
+          readCodex: async () => JSON.parse(await quota('read')),
+          readClaude: () => readSelectedClaudeUsage(ctx, readAnthropicUsage),
+        })) }),
       }));
       await ctx.session.hook('model.request', async event => {
         await guarded(event,async()=>{

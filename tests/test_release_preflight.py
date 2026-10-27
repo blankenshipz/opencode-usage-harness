@@ -85,7 +85,7 @@ class StagedReleaseTests(unittest.TestCase):
             HOME:process.argv[3], PATH:'/usr/bin:/bin', LANG:'C',
             OPENAI_API_KEY:'fixture-secret-never-forward', ANTHROPIC_API_KEY:'fixture-secret-never-forward'
           }}).setup({provider:{transform:async()=>{}},
-            tool:{transform:async cb=>cb({add:t=>{tool=t}})},
+            tool:{transform:async cb=>cb({add:t=>{if(t.name==='codex_quota')tool=t}})},
             session:{hook:async()=>{}},event:{subscribe:()=>({async *[Symbol.asyncIterator](){}})}});
           try {
             const keys = JSON.parse((await tool.execute({})).content);

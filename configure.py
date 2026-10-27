@@ -20,10 +20,22 @@ ROLES = {
     'maximum': ('MAXIMUM', False, False),
 }
 
-def profile(models, package_root=ROOT):
+def profile(models, package_root=ROOT, routing_policy=None):
     for tier in ('FAST', 'BALANCED', 'STRONG', 'MAXIMUM'):
         if not isinstance(models.get(tier), str) or not re.fullmatch(r'openai/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+', models[tier]):
             raise ValueError(f'{tier} must be an actual discovered openai/model#variant reference')
+    providers = ['openai']
+    if routing_policy is not None:
+        if routing_policy.get('version') != 1 or not isinstance(routing_policy.get('roles'), dict):
+            raise ValueError('routing policy must use version 1 and explicit role candidates')
+        for candidates in routing_policy['roles'].values():
+            if not isinstance(candidates, list): raise ValueError('routing role candidates must be lists')
+            for candidate in candidates:
+                ref = candidate.get('ref', '')
+                if not re.fullmatch(r'(openai|anthropic)/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+', ref):
+                    raise ValueError('routing candidates must be discovered subscription model variants')
+                provider = ref.split('/')[0]
+                if provider not in providers: providers.append(provider)
     prompts = json.loads((package_root/'config/instructions.json').read_text())
     agents = {}
     for role, (tier, delegate, readonly) in ROLES.items():
@@ -38,14 +50,23 @@ def profile(models, package_root=ROOT):
         agents[role] = {'description':role.replace('-',' '), 'mode':'primary' if role == 'router' else 'all',
             'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf'], 'permissions':rules}
     for builtin in ('build','plan','general','explore'):
-        agents[builtin] = {'disabled':True}
+        agents[builtin] = {'disabled':False, 'permissions':[
+            {'action':action,'resource':'*','effect':'deny'} for action in
+            ('task_*','check_prepare','check_status','harness_health','large_file_*')]}
+        if builtin == 'plan':
+            agents[builtin]['permissions'] += [{'action':'edit','resource':'*','effect':'deny'},
+                {'action':'edit','resource':'~/.opencode/plan/*','effect':'allow'}]
+        if builtin in ('general','explore'):
+            agents[builtin]['permissions'].append({'action':'subagent','resource':'*','effect':'deny'})
+        if builtin == 'explore':
+            agents[builtin]['permissions'].append({'action':'edit','resource':'*','effect':'deny'})
     permissions = [{'action':'*','resource':'*','effect':'ask'}]
-    permissions += [{'action':a,'resource':'*','effect':'allow'} for a in ('read','glob','grep','edit','webfetch','codex_quota','model_status','task_contract','task_intent','task_artifact','task_dispatch_status','task_outcome','large_file_check','large_file_summary')]
+    permissions += [{'action':a,'resource':'*','effect':'allow'} for a in ('read','glob','grep','edit','webfetch','codex_quota','model_status','task_contract','task_intent','task_artifact','task_dispatch_status','task_outcome','large_file_check','large_file_summary','subscription_quota')]
     for action in ('read','edit'):
         permissions += [{'action':action,'resource':p,'effect':'deny'} for p in ('*.env','*.env.*','*auth.json','*.pem','*.key')]
     for command in ('pwd','git status*','git diff*','git log*','npm test*','npm run test*','pytest*','python3 -m pytest*','go test*','gofmt *'):
         permissions.append({'action':'shell','resource':command,'effect':'allow'})
-    return {'$schema':'https://opencode.ai/v2/config.json','enabled_providers':['openai'],'share':'disabled','update':'disable',
+    return {'$schema':'https://opencode.ai/v2/config.json','enabled_providers':providers,'experimental':{'policies':[{'effect':'deny','action':'provider.use','resource':'*'}]+[{'effect':'allow','action':'provider.use','resource':provider} for provider in providers]},'share':'disabled','update':'disable',
         'default_agent':'router','model':models['STRONG'],'permissions':permissions,'agents':agents,
         'plugins':[(package_root/'plugins/v2'/p).resolve().as_uri() for p in ('subscription-guard','model-status','task-outcomes','large-file-context')]}
 
@@ -54,7 +75,9 @@ def main():
     p.add_argument('--models',type=Path,required=True,help='JSON FAST/BALANCED/STRONG/MAXIMUM references from your actual catalog')
     p.add_argument('--state-dir',type=Path,default=Path(os.environ.get('HARNESS_STATE_DIR',str(Path.home()/'.local/state/opencode-usage-harness'))))
     p.add_argument('--replace',action='store_true',help='Back up and replace this generated profile explicitly')
-    a=p.parse_args(); result=profile(json.loads(a.models.read_text()))
+    p.add_argument('--routing-policy',type=Path,help='Explicit reviewed candidate policy; requires separately installed/authenticated subscription plugins')
+    a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
+    result=profile(json.loads(a.models.read_text()),routing_policy=routing)
     directory=a.state_dir.expanduser().resolve()/'config';target=directory/'opencode.json'
     if target.exists() and not a.replace:
         p.error('profile exists; use --replace only after reviewing changes')
@@ -62,6 +85,11 @@ def main():
     if target.exists():
         backup=target.with_name(f'opencode.backup-{time.time_ns()}.json');backup.write_bytes(target.read_bytes());backup.chmod(0o600)
     target.write_text(json.dumps(result,indent=2)+'\n');target.chmod(0o600)
+    if routing is not None:
+        policy_path=directory/'routing-policy.json'
+        if policy_path.exists():
+            policy_path.with_name(f'routing-policy.backup-{time.time_ns()}.json').write_bytes(policy_path.read_bytes())
+        policy_path.write_text(json.dumps(routing,indent=2)+'\n');policy_path.chmod(0o600)
     financial=directory/'financial-verification.json'
     if not financial.exists():
         financial.write_text(json.dumps({'auto_top_up_off':False,'automatic_reload_off':False,'purchased_credit_balance_ui':None,'verified_at':None},indent=2)+'\n');financial.chmod(0o600)

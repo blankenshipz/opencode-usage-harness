@@ -1,4 +1,4 @@
-import { readRoutingQuota, selectDispatchModel } from './dispatch-routing.mjs';
+import { readRoutingQuota, selectDispatchModel, modelReference } from './dispatch-routing.mjs';
 import { observeAdmission, convergenceAdvice, userActions, recordProgress, normalizeProgressEvidence } from './convergence.mjs';
 import { checkpointSchema, normalizeCheckpoint, beginCheckpoint, acknowledgeTaskReview, normalizeReviewAcknowledgement, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
@@ -10,6 +10,7 @@ import { packageRoot } from './paths.mjs';
 import { createWorkerProgress } from './worker-progress.mjs';
 import { admissionDenial, denialAdvice, receipt, suppression } from './denial-recovery.mjs';
 import { quotaRecoveryReceipt, enqueueQuotaRecovery, deliverQuotaRecovery, pendingQuotaRecovery, quotaRecoverySyntheticInput } from './quota-recovery.mjs';
+import { guardNativeDispatch, isHarnessDispatchInput, isNativeAgent } from './agent-mode.mjs';
 // Eligibility is not a permission grant: the native executor still owns authorization and depth.
 export function hasCapability(agent, capability) {
   const rules = agent.permissions ?? [], action = capability === 'delegate' ? 'subagent' : capability;
@@ -44,13 +45,21 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   checkpoint: checkpointSchema,
   compact: {type:'boolean'}, resetModel: {type:'boolean'},
   workReview: {type:'object',additionalProperties:false,properties:{hypothesis:{type:'string',minLength:1,maxLength:500},evidenceReference:{type:'string',minLength:1,maxLength:500}},required:['hypothesis','evidenceReference']},
-  routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']}},required:['complexity','risk']},
+  routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']},reviewOf:{type:'string',minLength:3,maxLength:240}},required:['complexity','risk']},
   recovery: { type: 'object', additionalProperties: false, properties: {
     kind: { type: 'string', enum: ['scope_changed','inputs_changed','authorization_changed'] }, scope: { type: 'string', minLength: 1, maxLength: 160 },
     inputs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 160 } },
     authorization: { type: 'string', minLength: 1, maxLength: 240 }, explanation: { type: 'string', minLength: 1, maxLength: 240 }, reference: { type: 'string', minLength: 1, maxLength: 240 },
   }, required: ['kind','scope','inputs','authorization','explanation','reference'] },
 }, required: ['taskId','workKey','operation','agent','description','prompt','requiredCapabilities'] };
+// Mirrors the stock OpenCode subagent input (see core/tool/plugin/subagent.ts).
+// Keep it separate from the harness schema so built-in callers retain their
+// ordinary tool contract while configured harness roles still validate the
+// durable task fields before dispatch.
+const nativeSubagentSchema = { type:'object', additionalProperties:false, properties:{
+  agent:{type:'string',minLength:1}, description:{type:'string',minLength:1}, prompt:{type:'string',minLength:1},
+  model:{type:'string',minLength:1,description:'Set only when the user explicitly requests a model or variant. Discover its exact provider/model#variant ID.'}, sessionID:{type:'string',minLength:1}, background:{type:'boolean'},
+}, required:['agent','description','prompt'] };
 const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
 const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
 // Native runtime data only exposes the latest compaction.  Keep each observed
@@ -126,6 +135,11 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
     const sessions=await loadSessions();
     const historical=sessions.find(s=>s.id===event.sessionID)?.canonicalSessionID;
     if (historical) throw new Error(`Historical transcript only: continue canonical session ${historical}; no inference admitted for this copy.`);
+    if (isNativeAgent(event.agent)) {
+      const rootID = lineage(sessions,event.sessionID);
+      if (state.records.some(r => r.childID === event.sessionID || (r.rootID === rootID && r.state !== 'completed')))
+        throw new Error('task-dispatch: native mode cannot bypass existing managed task ownership; continue its recorded owner or start an independent fresh native chat.');
+    }
     const owner = state.records.find(r => r.childID === event.sessionID && r.intentRevision);
     if (!owner) return;
     const current = getIntent(state,owner.rootID,owner.taskId);
@@ -147,18 +161,28 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       event.system.push({ type: 'text', text: checkpointReminder });
     }
   });
+  let stockInput = nativeSubagentSchema, stockDescription = 'Launch or resume a native subagent.';
+  if (ctx.session?.hook) await ctx.session.hook('context', async event => {
+    if (!event.tools?.subagent) return;
+    event.tools.subagent.input = isNativeAgent(event.agent) ? structuredClone(stockInput) : schema;
+    if (isNativeAgent(event.agent)) event.tools.subagent.description = stockDescription;
+  });
   await ctx.tool.transform(editor => {
     const native = editor.get('subagent');
     if (!native) throw new Error('task-dispatch: native subagent unavailable');
     const rawExecute = native.execute;
+    // Core may expose an Effect codec (functions), not cloneable JSON. The
+    // pinned-runtime fallback mirrors its supported stock contract.
+    stockInput = structuredClone(native.input?.type === 'object' && native.input?.properties ? native.input : nativeSubagentSchema);
+    stockDescription = native.description ?? stockDescription;
     const dispatch = async (input, context) => {
       const checkpoint = normalizeCheckpoint(input.checkpoint);
       const review = input.workReview === undefined ? undefined : normalizeReviewAcknowledgement(input.workReview);
       if (input.compact !== undefined && typeof input.compact !== 'boolean') throw new Error('task-dispatch: invalid compact');
-      if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk))) throw new Error('task-dispatch: invalid routing assessment');
+      if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk) || (input.routing.reviewOf !== undefined && !modelReference(input.routing.reviewOf)))) throw new Error('task-dispatch: invalid routing assessment');
       // Optional planning telemetry never substitutes for mandatory financial admission.
       let quota;
-      if (input.routing) { try { quota = await loadQuota(); } catch { /* unknown pace: retain configured model; guard still fails closed */ } }
+      if (input.routing) { try { quota = await loadQuota(ctx); } catch { /* unknown pace: retain configured model; guard still fails closed */ } }
       if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
@@ -302,7 +326,20 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       } finally { visible.close(); }
     };
     if (typeof editor.update !== 'function') throw new Error('task-dispatch: native tool transformation unavailable');
-    editor.update('subagent',tool=>{tool.input=schema;tool.description+=`\nOwnership and capability checks apply to this native path too. ${guidance}`;tool.execute=dispatch;});
+    editor.update('subagent',tool=>{
+      // Built-in agents use the stock subagent schema.  Harness roles enter
+      // through task_dispatch (or a harness-shaped call) and retain the full
+      // durable ownership contract.
+      tool.description+=`\nHarness callers use task_dispatch for ownership and capability checks. ${guidance}`;
+      tool.input={type:'object',additionalProperties:false,properties:{...stockInput.properties,...schema.properties},required:stockInput.required ?? ['agent','description','prompt']};
+      tool.execute=async(input,context)=>{
+        if (isNativeAgent(context?.agent) && !isHarnessDispatchInput(input)) {
+          await guardNativeDispatch({ registry, workspace, loadSessions, context, input, lineage });
+          return rawExecute(input,context);
+        }
+        return dispatch(input,context);
+      };
+    });
     editor.add({name:'task_dispatch',description:`Capability-checked durable handoff. ${guidance}`,input:schema,execute:async(input,context)=>{const {output,...rendered}=await dispatch(input,context);return rendered;}});
     editor.add({name:'task_intent',description:'Read or revise the shared user outcome for this root task. Get returns valid root user-message IDs. Only the root goal owner may set; use expectedRevision to avoid overwriting corrections. Never store secret values.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1,maxLength:128},action:{type:'string',enum:['get','set']},expectedRevision:{type:'integer',minimum:0},intent:intentSchema},required:['taskId','action']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
       string(input.taskId,'taskId');

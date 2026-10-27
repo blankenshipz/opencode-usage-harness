@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 ALLOWED={'VERSION','LICENSE','NOTICE','README.md','SECURITY.md','CHANGELOG.md','CONTRIBUTING.md',
-         '.gitignore','package.json','install.py','configure.py','plugins','config','src','bin','tests','scripts','docs','compat','integrations','.github'}
+         '.gitignore','.gitattributes','package.json','install.py','configure.py','plugins','config','src','bin','tests','scripts','docs','compat','integrations','.github'}
 patterns=[re.compile(r'/Users/[a-zA-Z][^/\s"\']+/'),re.compile(r'192\.168\.\d+\.\d+'),
           re.compile(r'\b(?:gh[pousr]_|github_pat_|sk-)[A-Za-z0-9_\-]{20,}'),
           re.compile('-----BEGIN '+r'(?:RSA |EC |OPENSSH )?PRIVATE KEY-----')]

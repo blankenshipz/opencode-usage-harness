@@ -84,5 +84,16 @@ catalog and request admission, not registry names alone.
 
 The managed integration was verified on custom OpenCode 2.0.30 with a completed
 Claude Haiku 5.5 / low subscription response. Catalog visibility is not a claim
-that every listed model has been exercised. Future Claude quota pacing and automatic
-cross-subscription routing remain separate work.
+that every listed model has been exercised. The patched artifact keeps Haiku 5.5
+effort enabled; its legacy Haiku 4.5 compatibility path strips effort because
+that model family does not support it. The standalone `subscription-quota.mjs`
+command reports Claude as `unknown [adapter_unavailable]` because it has no
+OpenCode session context and therefore cannot read the selected OAuth token.
+Inside a running managed session, the `subscription_quota` tool reads the
+currently selected Claude OAuth usage endpoint and reports the independent
+Anthropic windows and scoped Fable limit when present.
+
+The routing policy is separately opt-in. It does not add Claude candidates to
+the default OpenAI-only profile, and it does not retry a failed Claude request
+through another provider. See [native and multi-pool routing](NATIVE-AND-MULTI-POOL.md)
+for candidate, continuation and review behavior.

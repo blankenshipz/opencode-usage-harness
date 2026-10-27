@@ -33,7 +33,7 @@ ROOT_FILES = {
     "install.py", "configure.py",
 }
 ROOT_DIRS = {"plugins", "src", "bin", "config", "compat", "docs", "integrations"}
-IGNORED_ROOT_FILES = {".gitignore"}
+IGNORED_ROOT_FILES = {".gitignore", ".gitattributes"}
 IGNORED_ROOT_DIRS = {".git", ".github", "tests", "scripts"}
 DENIED_PATH_PARTS = {"state", "private", "secrets", "credentials"}
 DENIED_FILE_NAMES = {

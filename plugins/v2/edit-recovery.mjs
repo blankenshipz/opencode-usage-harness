@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { isNativeAgent } from './agent-mode.mjs';
 
 const LIMIT = 256;
 const transient = /\b(?:permission|denied|network|timeout|timed?\s*out|temporar(?:y|ily)|unavailable|econn\w*|eacces)\b/i;
@@ -57,6 +58,7 @@ export async function installEditRecovery(ctx, { fileSystem = fs, maxEntries = L
     editor.update('patch', tool => {
       tool.description = `${tool.description ?? ''}\nAfter a deterministic patch verification failure, correct the patch or refresh changed target content before retrying the same payload.`;
       tool.execute = async (input, context) => {
+        if (isNativeAgent(context?.agent)) return native(input, context);
         const session = sessionKey(context);
         const patchText = input?.patchText;
         if (!session || typeof patchText !== 'string') return native(input, context);

@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { statePath } from './paths.mjs';
 import { compactToolText } from './result-compactor.mjs';
 import { createCompressionDiagnostics } from './compression-diagnostics.mjs';
+import { isNativeAgent } from './agent-mode.mjs';
 
 const digest = text => crypto.createHash('sha256').update(text).digest('hex');
 const key = e => JSON.stringify([e.sessionID, e.messageID, e.id]);
@@ -141,12 +142,14 @@ export async function installContextCompression(ctx, options = {}) {
     } } catch { /* Observer failure only reduces compression coverage. */ }
   })();
   await ctx.tool.hook('execute.before', event => {
+    if (isNativeAgent(event.agent)) return;
     const id = key(event), current = roots.get(id);
     if (current) { current.depth++; return; }
     // Bounded tracking. When busy, skip new roots instead of evicting active ones.
     if (roots.size < 2048) roots.set(id, { tool: event.tool, depth: 1 });
   });
   await ctx.tool.hook('execute.after', async event => {
+    if (isNativeAgent(event.agent)) return;
     const started = Date.now();
     let blockStarted = started;
     const id = key(event), current = roots.get(id);

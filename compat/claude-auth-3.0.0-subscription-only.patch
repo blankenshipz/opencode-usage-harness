@@ -313,3 +313,83 @@ index 0000000..e9ac497
 +    }
 +  })
 +})
+diff --git a/src/betas.test.ts b/src/betas.test.ts
+index ceffb4b..0d977ef 100644
+--- a/src/betas.test.ts
++++ b/src/betas.test.ts
+@@ -87,7 +87,7 @@ describe("betas", () => {
+     )
+   })
+ 
+-  it("getModelOverride sets disableEffort for haiku models", () => {
++  it("getModelOverride sets disableEffort only for legacy haiku 4.5", () => {
+     for (const model of ["claude-haiku-4-5", "claude-haiku-4-5-20251001"]) {
+       const override = getModelOverride(model)
+       assert.ok(override, `${model} should have a model override`)
+@@ -99,6 +99,14 @@ describe("betas", () => {
+     }
+   })
+ 
++  it("getModelOverride leaves haiku 5.5 effort enabled", () => {
++    assert.notEqual(getModelOverride("claude-haiku-5-5")?.disableEffort, true)
++    assert.notEqual(
++      getModelOverride("claude-haiku-5-5-20251001")?.disableEffort,
++      true,
++    )
++  })
++
+   it("getModelOverride does not set disableEffort for non-haiku models", () => {
+     for (const model of [
+       "claude-sonnet-4-6",
+diff --git a/src/model-config.ts b/src/model-config.ts
+index 600402d..d51003d 100644
+--- a/src/model-config.ts
++++ b/src/model-config.ts
+@@ -27,13 +27,13 @@ export const config: ModelConfig = {
+     "context-1m-2025-08-07",
+     "interleaved-thinking-2025-05-14",
+   ],
+-  // NOTE: getModelOverride is first-match-wins. Keep "haiku" ahead of any
+-  // "4-5" add so claude-haiku-4-5 never receives effort. "opus-4-5" is
+-  // more specific than a bare "4-5" would be (sonnet-4-5 still omits
+-  // effort). Pinned by the "effort beta" test in betas.test.ts from
+-  // Claude CLI 2.1.257 intercept traffic.
++  // NOTE: getModelOverride is first-match-wins. Match only legacy Haiku 4.5
++  // here: Haiku 5.5 supports output_config.effort and must preserve it.
++  // "opus-4-5" is more specific than a bare "4-5" would be
++  // (sonnet-4-5 still omits effort). Pinned by the "effort beta" test in
++  // betas.test.ts from Claude CLI 2.1.257 intercept traffic.
+   modelOverrides: {
+-    haiku: {
++    "haiku-4-5": {
+       exclude: ["effort-2025-11-24"],
+       disableEffort: true,
+     },
+diff --git a/src/transforms.test.ts b/src/transforms.test.ts
+index f49fd4d..b26a27c 100644
+--- a/src/transforms.test.ts
++++ b/src/transforms.test.ts
+@@ -585,6 +585,23 @@ describe("transforms", () => {
+     )
+   })
+ 
++  it("transformBody preserves effort for haiku 5.5", () => {
++    for (const effort of ["low", "medium", "high"]) {
++      const input = JSON.stringify({
++        model: "claude-haiku-5-5",
++        output_config: { effort },
++        messages: [{ role: "user", content: "test" }],
++      })
++
++      const output = transformBody(input)
++      const parsed = JSON.parse(output as string) as {
++        output_config?: { effort?: string }
++      }
++
++      assert.equal(parsed.output_config?.effort, effort)
++    }
++  })
++
+   it("transformBody handles haiku without effort-related fields", () => {
+     const input = JSON.stringify({
+       model: "claude-haiku-4-5",

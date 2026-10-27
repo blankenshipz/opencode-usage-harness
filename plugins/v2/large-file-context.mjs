@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { shellReads as legacyShellReads } from '../large-file-context/core.mjs';
+import { isNativeAgent } from './agent-mode.mjs';
 
 const LIMIT = 350;
 const SUMMARY_LIMIT = 6000;
@@ -148,6 +149,7 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
           // a plain JSON result, so use the equivalent structural public contract.
           tool.output = readOutput;
           tool.execute = async (input, context) => {
+            if (isNativeAgent(context?.agent)) return callNativeRead(input, context);
             const grant = await takeGrant(input, context);
             if (grant) {
               const result = await callNativeRead(input, context);
@@ -171,6 +173,7 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
         });
         if (shell) editor.update('shell', tool => {
           tool.execute = async (input, context) => {
+            if (isNativeAgent(context?.agent)) return shell.execute(input, context);
             const command = input.command;
             if (typeof command !== 'string') return shell.execute(input, context);
             let reads;

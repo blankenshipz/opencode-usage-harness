@@ -35,6 +35,14 @@ test('351 lines route broad reads but keep bounded ranges usable for scouts', as
   await denied(h.tools.get('read').execute({ path: h.file, limit: 351 }, h.context), /limit from 1/);
 });
 
+test('built-in native agents bypass optional large-file read and shell wrappers', async () => {
+  const h = await harness(); const native = { ...h.context, agent: 'build' };
+  await h.tools.get('read').execute({ path: h.file }, native);
+  await h.tools.get('shell').execute({ command: `cat '${h.file}'` }, native);
+  assert.deepEqual(h.calls.filter(call => call.kind === 'read').map(call => call.input), [{ path: h.file }]);
+  assert.equal(h.calls.filter(call => call.kind === 'shell').length, 1);
+});
+
 test('direct grant keeps reason, skips questions, expires and is consumed once concurrently', async () => {
   let time = 100; const h = await harness({ now: () => time }); const permit = h.tools.get('large_file_allow_direct');
   await permit.execute({ path: h.file, reason: 'Need complete function context.' }, h.context);

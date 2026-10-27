@@ -1,0 +1,201 @@
+{
+  "version": 1,
+  "enabled": false,
+  "reservePercent": 2,
+  "roles": {
+    "scout": [
+      {
+        "ref": "openai/gpt-6-luna#low",
+        "profile": "openai-luna"
+      },
+      {
+        "ref": "anthropic/claude-haiku-5-5#low",
+        "profile": "claude-haiku"
+      }
+    ],
+    "quick-builder": [
+      {
+        "ref": "openai/gpt-6-luna#medium",
+        "profile": "openai-luna"
+      },
+      {
+        "ref": "anthropic/claude-haiku-5-5#medium",
+        "profile": "claude-haiku"
+      }
+    ],
+    "builder": [
+      {
+        "ref": "openai/gpt-6.1-sol#medium",
+        "profile": "openai-sol"
+      },
+      {
+        "ref": "anthropic/claude-sonnet-5-5#high",
+        "profile": "claude-sonnet"
+      }
+    ],
+    "builder-high": [
+      {
+        "ref": "openai/gpt-6.1-sol#high",
+        "profile": "openai-sol"
+      },
+      {
+        "ref": "anthropic/claude-opus-5-5#medium",
+        "profile": "claude-opus"
+      }
+    ],
+    "deep-debugger": [
+      {
+        "ref": "openai/gpt-6.1-sol#medium",
+        "profile": "openai-sol"
+      },
+      {
+        "ref": "anthropic/claude-opus-5-5#medium",
+        "profile": "claude-opus"
+      }
+    ],
+    "deep-debugger-high": [
+      {
+        "ref": "openai/gpt-6.1-sol#high",
+        "profile": "openai-sol"
+      },
+      {
+        "ref": "anthropic/claude-opus-5-5#high",
+        "profile": "claude-opus"
+      }
+    ],
+    "architect": [
+      {
+        "ref": "openai/gpt-6.1-sol#high",
+        "profile": "openai-sol"
+      },
+      {
+        "ref": "anthropic/claude-opus-5-5#high",
+        "profile": "claude-opus"
+      }
+    ],
+    "reviewer": [
+      {
+        "ref": "openai/gpt-6.1-sol#high",
+        "profile": "openai-sol"
+      },
+      {
+        "ref": "anthropic/claude-opus-5-5#high",
+        "profile": "claude-opus"
+      }
+    ],
+    "maximum": [
+      {
+        "ref": "openai/gpt-6-astra#high",
+        "profile": "openai-astra"
+      },
+      {
+        "ref": "anthropic/claude-fable-5-1#high",
+        "profile": "claude-fable",
+        "requiresScopedQuota": true
+      }
+    ],
+    "coordinator": [
+      {
+        "ref": "openai/gpt-6.1-sol#medium",
+        "profile": "openai-sol"
+      },
+      {
+        "ref": "anthropic/claude-opus-5-5#medium",
+        "profile": "claude-opus"
+      }
+    ]
+  },
+  "profiles": {
+    "openai-luna": {
+      "model": "gpt-6-luna",
+      "evidence_status": "existing_workload",
+      "measure": [
+        "accepted_validation",
+        "confirmed_review_findings",
+        "repairs",
+        "user_corrections",
+        "elapsed_time",
+        "quota_observations"
+      ],
+      "guidance": "Keep the task acceptance contract stable. Evaluate tool reliability, scope discipline, verification, concise handoffs and long-task completion on this model version; do not infer behavior from provider brand or equal effort labels."
+    },
+    "openai-sol": {
+      "model": "gpt-6.1-sol",
+      "evidence_status": "existing_workload",
+      "measure": [
+        "accepted_validation",
+        "confirmed_review_findings",
+        "repairs",
+        "user_corrections",
+        "elapsed_time",
+        "quota_observations"
+      ],
+      "guidance": "Keep the task acceptance contract stable. Evaluate tool reliability, scope discipline, verification, concise handoffs and long-task completion on this model version; do not infer behavior from provider brand or equal effort labels."
+    },
+    "openai-astra": {
+      "model": "gpt-6-astra",
+      "evidence_status": "existing_workload",
+      "measure": [
+        "accepted_validation",
+        "confirmed_review_findings",
+        "repairs",
+        "user_corrections",
+        "elapsed_time",
+        "quota_observations"
+      ],
+      "guidance": "Keep the task acceptance contract stable. Evaluate tool reliability, scope discipline, verification, concise handoffs and long-task completion on this model version; do not infer behavior from provider brand or equal effort labels."
+    },
+    "claude-haiku": {
+      "model": "claude-haiku-5-5",
+      "evidence_status": "provisional",
+      "measure": [
+        "accepted_validation",
+        "confirmed_review_findings",
+        "repairs",
+        "user_corrections",
+        "elapsed_time",
+        "quota_observations"
+      ],
+      "guidance": "Keep the task acceptance contract stable. Evaluate tool reliability, scope discipline, verification, concise handoffs and long-task completion on this model version; do not infer behavior from provider brand or equal effort labels."
+    },
+    "claude-sonnet": {
+      "model": "claude-sonnet-5-5",
+      "evidence_status": "provisional",
+      "measure": [
+        "accepted_validation",
+        "confirmed_review_findings",
+        "repairs",
+        "user_corrections",
+        "elapsed_time",
+        "quota_observations"
+      ],
+      "guidance": "Keep the task acceptance contract stable. Evaluate tool reliability, scope discipline, verification, concise handoffs and long-task completion on this model version; do not infer behavior from provider brand or equal effort labels."
+    },
+    "claude-opus": {
+      "model": "claude-opus-5-5",
+      "evidence_status": "provisional",
+      "measure": [
+        "accepted_validation",
+        "confirmed_review_findings",
+        "repairs",
+        "user_corrections",
+        "elapsed_time",
+        "quota_observations"
+      ],
+      "guidance": "Keep the task acceptance contract stable. Evaluate tool reliability, scope discipline, verification, concise handoffs and long-task completion on this model version; do not infer behavior from provider brand or equal effort labels."
+    },
+    "claude-fable": {
+      "model": "claude-fable-5-1",
+      "evidence_status": "provisional",
+      "measure": [
+        "accepted_validation",
+        "confirmed_review_findings",
+        "repairs",
+        "user_corrections",
+        "elapsed_time",
+        "quota_observations"
+      ],
+      "guidance": "Keep the task acceptance contract stable. Evaluate tool reliability, scope discipline, verification, concise handoffs and long-task completion on this model version; do not infer behavior from provider brand or equal effort labels."
+    }
+  }
+}

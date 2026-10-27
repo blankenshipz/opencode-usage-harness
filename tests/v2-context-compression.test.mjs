@@ -43,6 +43,10 @@ test('errors, protected tools, unknown tools and missing before stay unchanged',
  const bare={...base,status:'completed',result:{content:source}};await f.after(bare);assert.equal(bare.result.content,source);
  assert.deepEqual(await fs.readdir(f.directory),[]);
 });
+test('built-in native agents bypass optional output compression',async t=>{
+ const f=await fixture(t),e={...base,agent:'explore',status:'completed',result:{content:source}};
+ await f.before(e);await f.after(e);assert.equal(e.result.content,source);
+});
 test('storage failure and capacity pressure preserve originals without fallback',async t=>{
  const f=await fixture(t,{maxRecords:0}); const e={...base,status:'completed',result:{content:source}};await f.before(e);await f.after(e);assert.equal(e.result.content,source);
  await installContextCompression({tool:{hook:async(n,fn)=>{f.hooks[n]=fn;}}},{save:async()=>{throw Error('disk unavailable');},diagnostics:quietDiagnostics});

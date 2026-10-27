@@ -61,3 +61,9 @@ test('unavailable metadata does not unlock an unchanged deterministic failure', 
  await assert.rejects(call(h.tools.get('patch'),changed),/verification failed/);
  const denied=await call(h.tools.get('patch'),changed);assert.match(denied.content,/identical patch/);assert.equal(h.calls.length,1);h.cleanup();
 });
+test('built-in native agents bypass optional deterministic retry recovery', async () => {
+ const h=await harness(), tool=h.tools.get('patch');
+ await assert.rejects(tool.execute({patchText:changed},{sessionID:'s1',agent:'build'}),/verification failed/);
+ await assert.rejects(tool.execute({patchText:changed},{sessionID:'s1',agent:'build'}),/verification failed/);
+ assert.equal(h.calls.length,2);h.cleanup();
+});

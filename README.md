@@ -12,7 +12,8 @@ the result; unused quota alone is no reason to manufacture work.
 **Start with [quota visibility](#install-the-toolkit), then
 [enable the agent workflow](#enable-agent-integration-separately).** Interested in
 combining several subscriptions? Explore the [pool planner and architecture](docs/SUBSCRIPTION-POOLS.md)
-and [help build the next integrations](#contributing).
+and the [native and multi-pool workflow](docs/NATIVE-AND-MULTI-POOL.md) before
+[helping build the next integrations](#contributing).
 
 ## What you get
 
@@ -89,12 +90,46 @@ primary router. An existing private profile may have different role assignments.
 Every admitted worker dispatch, including a continuation, passes the effective
 model reference to OpenCode so an old child does not silently retain an obsolete
 model. An explicit dispatch `model` override persists for that work key;
-`resetModel: true` returns to configured selection. A UI model change observed
+`resetModel: true` clears override metadata while retaining an admitted route. A UI model change observed
 after a known harness selection is also preserved. Legacy children have no override
 provenance: their next dispatch adopts the configured role unless an explicit
 model is supplied. This does not change inference already running. Dispatch status
 shows configured, selected and previously observed models; completed-response
 telemetry is the evidence for what actually ran.
+
+### Native OpenCode workflows
+
+The generated profile leaves OpenCode's stock `build`, `plan`, `general`, and
+`explore` agents enabled. A fresh native chat can use the same server and native
+model selection with the stock tool contracts; it does not enter managed task
+ownership. Native calls bypass harness routing, large-file mediation and optional
+result compression, while the subscription financial guard and native permission
+checks still apply. A native call cannot adopt a managed child or run beside a
+known managed writer; continue that work through its recorded harness owner.
+
+Use `task_dispatch` for durable harness work: it records ownership, routing,
+review evidence and continuations. The built-in agents can still be useful for a
+small independent task or a fresh native chat when that durable contract is not
+needed.
+
+### Opt-in multi-provider routing
+
+The public default remains OpenAI-only. To enable comparable OpenAI and Anthropic
+subscription candidates, pass an explicitly reviewed policy to
+`configure.py --routing-policy`; the policy expands enabled providers and is
+written beside the generated profile. It does not authenticate Claude or make
+Claude eligible by catalog visibility alone. Each role's candidates must be
+actual catalog model/effort references, and Anthropic still requires the guarded
+Claude Code OAuth artifact and extra usage disabled. See
+[native and multi-pool routing](docs/NATIVE-AND-MULTI-POOL.md) and
+[Claude subscription setup](docs/CLAUDE-SUBSCRIPTION.md).
+
+Admission reads independent provider windows and the selected OAuth identity.
+Selection happens for a fresh admission; continuations stay sticky to the
+admitted model, and an explicit manual model override wins. A depleted or
+unavailable pool is not retried through another provider. `reviewOf` requests a
+meaningful independent peer review only when the policy has a healthy capable
+peer; the harness never creates an automatic review.
 
 ### Quota pacing and the automatic adjustment
 
@@ -193,13 +228,16 @@ The longer-term goal is to put **Codex, Claude, and other eligible subscriptions
 work in parallel**, choosing tasks and model/effort combinations for each pool's
 capabilities and remaining allowance.
 
-The current development branch includes a provider-neutral **offline planner** for
-independent pools, shared quota groups, per-window pacing, and concurrency slots.
-It avoids treating two routes to one allowance as extra capacity. It does not
-launch cross-provider agents. **Live routing remains Codex-only**; other adapters
-must verify subscription access, quota identity, and financial controls first.
+The current development branch includes a provider-neutral **offline planner** and
+an opt-in live routing policy for independent pools, shared quota groups and
+per-window pacing. It avoids treating two routes to one allowance as extra
+capacity. There are no global concurrency reservations and no guarantee that a
+pool will be exhausted or that routing will save money. **Live multi-provider
+routing remains opt-in**; each adapter must verify subscription access, quota
+identity and financial controls first.
 
-See the [architecture and runnable fixture example](docs/SUBSCRIPTION-POOLS.md).
+See the [native and multi-pool workflow](docs/NATIVE-AND-MULTI-POOL.md) and the
+[architecture and runnable fixture example](docs/SUBSCRIPTION-POOLS.md).
 This planning foundation is scheduled for 0.2.0 and is not in the v0.1.0 release.
 
 ## Remaining work and next steps

@@ -30,19 +30,19 @@ test('status neither reconciles nor delivers or exposes another root recovery',a
  assert.equal(JSON.stringify(status).includes('other-child'),false);
  await h.registry('/project',async state=>{const other=state.records.find(r=>r.key==='other');assert.equal(other.state,'compacting');assert.equal(other.compactionOutcome,undefined);assert.equal(state.quotaRecoveryOutbox[0].deliveredAt,undefined);});
 });
-async function harness(t, custom) {
+async function harness(t, custom, nativeInput) {
  const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'dispatch-test-'));t.after(()=>fsp.rm(dir,{recursive:true,force:true}));
  const sessions=[{id:'root',agent:'router',directory:'/project',active:true}];const calls=[];const tools=new Map();
- const native={name:'subagent',description:'Native subagent',input:{},execute:async(input,context)=>{
+ const native={name:'subagent',description:'Native subagent',input:nativeInput??{type:'object',properties:{agent:{type:'string'},description:{type:'string'},prompt:{type:'string'},model:{type:'string'},sessionID:{type:'string'},background:{type:'boolean'}},required:['agent','description','prompt']},execute:async(input,context)=>{
   calls.push(input); if(custom)return custom(input,context,sessions,calls);
   const id=input.sessionID??`ses_${calls.length}`;let child=sessions.find(s=>s.id===id);
   if(!child){child={id,parentID:context.sessionID,agent:input.agent,directory:'/project',active:true};sessions.push(child);}
   await context.progress({sessionID:id,status:'running'});child.active=!!input.background;
   return {output:{sessionID:id,status:child.active?'running':'completed',output:'OK'},content:'OK',metadata:{sessionID:id,status:child.active?'running':'completed'}};
  }};const rawNative={...native};tools.set('subagent',native);
- const ctx={location:{directory:'/project'},agent:{list:async()=>({data:Object.entries(agents).map(([id,a])=>({id,...a}))})},tool:{transform:async fn=>fn({get:n=>tools.get(n),update:(n,fn)=>fn(tools.get(n)),add:tool=>tools.set(tool.name,tool)})}};
+ const ctx={location:{directory:'/project'},agent:{list:async()=>({data:Object.entries(agents).map(([id,a])=>({id,...a}))})},tool:{transform:async fn=>{assert.notEqual(fn.constructor.name,'AsyncFunction','native editor transformations must be synchronous');return fn({get:n=>tools.get(n),update:(n,fn)=>fn(tools.get(n)),add:tool=>tools.set(tool.name,tool)});}}};
  const registry=createRegistry(dir);await registry('/project',async(state,save)=>{setIntent(state,{rootID:'root',taskId:'release',intent,expectedRevision:0,actorSessionID:'root'});await save();});
- const hooks=new Map();ctx.session={hook:async(name,fn)=>hooks.set(name,fn)};
+ const hooks=new Map();ctx.session={hook:async(name,fn)=>{const previous=hooks.get(name);hooks.set(name,async event=>{if(previous)await previous(event);return fn(event);});}};
  const runtime=await installTaskDispatch(ctx,{registry,loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction']});
  const call=(input,tool='task_dispatch',sessionID='root')=>tools.get(tool).execute(input,{sessionID,agent:'router',progress:async()=>{}});
  return {call,sessions,calls,tools,ctx,dir,registry,rawNative,hooks,runtime};
@@ -67,6 +67,25 @@ test('native and wrapper both reject incapable Git history routing before native
  await assert.rejects(h.call({...base,operation:'coordinate',agent:'coordinator',requiredCapabilities:['shell','delegate']},tool),/cannot perform shell/);
  await assert.rejects(h.call({agent:'builder'},tool),/taskId/);
  }assert.equal(h.calls.length,0);
+});
+test('fresh built-in callers retain the stock subagent arguments and original executor',async t=>{
+ const h=await harness(t);const stock={agent:'builder',description:'Inspect files',prompt:'Inspect the current files',background:false};
+ const result=await h.tools.get('subagent').execute(stock,{sessionID:'root',agent:'build',progress:async()=>{}});
+ assert.deepEqual(h.calls,[stock]);assert.equal(result.content,'OK');assert.equal(h.tools.get('subagent').input.type,'object'); const event={agent:'build',sessionID:'root',tools:{subagent:{...h.tools.get('subagent')}},system:[]}; await h.hooks.get('context')(event); assert.deepEqual(event.tools.subagent.input,h.rawNative.input); event.agent='router'; await h.hooks.get('context')(event); assert.ok(event.tools.subagent.input.required.includes('taskId'));
+});
+test('native callers cannot bypass managed ownership or adopt a managed child',async t=>{
+ const h=await harness(t);const managed=await h.call({...base,background:true});const stock={agent:'builder',description:'Native work',prompt:'Do native work'};
+ await assert.rejects(h.tools.get('subagent').execute(stock,{sessionID:'root',agent:'build',progress:async()=>{}}),/managed task/);
+ h.sessions.find(session=>session.id===managed.metadata.sessionID).active=false;
+ await h.registry('/project',async(state,save)=>{state.records[0].state='completed';await save();});
+ await assert.rejects(h.tools.get('subagent').execute({...stock,sessionID:managed.metadata.sessionID},{sessionID:'root',agent:'build',progress:async()=>{}}),/cannot adopt managed child/);
+ assert.equal(h.calls.length,1);
+});
+test('fresh native callers wait for a foreign active registered writer',async t=>{
+ const h=await harness(t);h.sessions.push({id:'foreign-root',agent:'router',directory:'/project',active:false},{id:'foreign-writer',parentID:'foreign-root',agent:'builder',directory:'/project',active:true});
+ await h.registry('/project',async(state,save)=>{state.records.push({key:'foreign',rootID:'foreign-root',parentID:'foreign-root',childID:'foreign-writer',taskId:'other',workKey:'writer',writePaths:['src'],state:'running'});await save();});
+ await assert.rejects(h.tools.get('subagent').execute({agent:'builder',description:'Native work',prompt:'Do native work'},{sessionID:'root',agent:'build',progress:async()=>{}}),/registered writer/);
+ assert.equal(h.calls.length,0);
 });
 test('native permission errors propagate without retry',async t=>{
  const h=await harness(t,async()=>{throw new Error('Subagent denied: builder SECRET-native-error');});await assert.rejects(h.call(base),/Subagent denied/);assert.equal(h.calls.length,1);
@@ -418,4 +437,21 @@ test('status distinguishes an idle native worker from stale recorded running wor
  const h=await harness(t);const result=await h.call({...base,background:true});const child=h.sessions.find(s=>s.id===result.metadata.sessionID);child.active=false;child.lastIdleOutcome='succeeded';
  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];
  assert.equal(status.recordedState,'running');assert.equal(status.effectiveState,'awaiting_result_collection');assert.deepEqual(status.nativeExecution,{active:false,lastIdleOutcome:'succeeded'});assert.equal(h.calls.length,1);
+});
+
+test('native model steps cannot escape an unfinished managed root',async t=>{
+ const h=await harness(t);await h.call({...base,background:true});
+ await assert.rejects(h.hooks.get('model.request')({sessionID:'root',agent:'build'}),/managed task ownership/);
+ h.sessions.push({id:'fresh-native',agent:'build',active:true});
+ await h.hooks.get('model.request')({sessionID:'fresh-native',agent:'build'});
+});
+
+test('native Effect codec inputs use the pinned JSON contract without cloning functions',async t=>{
+ const h=await harness(t,undefined,function EffectCodec(){});
+ const event={agent:'build',sessionID:'root',tools:{subagent:{...h.tools.get('subagent')}},system:[]};
+ await h.hooks.get('context')(event);
+ assert.equal(event.tools.subagent.input.type,'object');assert.deepEqual(event.tools.subagent.input.required,['agent','description','prompt']);
+ assert.ok(event.tools.subagent.input.properties.model.description.includes('explicitly'));
+ const result=await h.tools.get('subagent').execute({agent:'explore',description:'Inspect files',prompt:'Inspect files'},{sessionID:'root',agent:'build',progress:async()=>{}});
+ assert.equal(result.content,'OK');assert.equal(h.calls.length,1);
 });
