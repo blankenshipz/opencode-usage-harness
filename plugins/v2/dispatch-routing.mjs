@@ -23,7 +23,8 @@ export function quotaPace(quota, now=Date.now(), provider='openai') {
   if (!Number.isFinite(checked) || now-checked>120000 || checked>now+5000) return 'unknown';
   const windows=(quota.pools ? quota.pools[provider]?.windows?.filter(w=>w.scope==='account')??[] : provider==='openai' ? (quota.buckets??[]).flatMap(b=>b.windows??[]) : []).filter(w=>Number.isFinite(w.pace_delta));
   if (!windows.length) return 'unknown';
-  if (windows.some(w=>w.pace_delta>10 || w.remaining_percent<=10)) return 'ahead';
+  if (windows.some(w=>w.pace_delta>10
+    || (w.remaining_percent<=10 && (!Number.isFinite(w.duration_minutes) || w.duration_minutes<10080)))) return 'ahead';
   if (windows.every(w=>w.pace_delta < -10)) return 'behind';
   return 'normal';
 }
@@ -46,7 +47,8 @@ export function selectDispatchModel({input,agent,agents,record,child,quota}) {
   }
   const decision = !override && chooseCandidate({input, quota});
   if (decision) return {selected:decision.ref,configured,observed,source:decision.reason,pace:decision.pace,
-    modelOverride:override,behaviorProfile:decision.profile,reviewOf:input.routing?.reviewOf ?? null};
+    modelOverride:override,behaviorProfile:decision.profile,reviewOf:input.routing?.reviewOf ?? null,
+    poolPacing:decision.pacing};
   const role=canonicalHarnessRole(input.agent);
   if (!override && input.routing?.complexity==='routine' && input.routing?.risk==='normal' && pace==='ahead' && ['builder','deep-debugger'].includes(role)) {
     const fast=modelReference(agents.find(a=>harnessRoleIDs('quick-builder').includes(a.id??a.name))?.model);
@@ -64,14 +66,27 @@ function matchesScope(window, ref) {
   const scope = (window.model_family ?? window.model ?? '').toLowerCase().replace(/[^a-z0-9]/g,'');
   return scope.length > 0 && model.includes(scope);
 }
+function timestamp(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function weeklyPacingWindows(windows, now) {
+  // A weekly pace is useful only when its normalized duration and reset establish
+  // an allowance cycle (the normalizer labels inferred durations). Do not manufacture a pace from incomplete data.
+  return windows.filter(w => Number.isFinite(w.pace_delta)
+    && Number.isFinite(w.duration_minutes) && w.duration_minutes >= 10080
+    && timestamp(w.resets_at) !== null && timestamp(w.resets_at) > now);
+}
 function candidateState(candidate, quota, reserve) {
   const provider = candidate.ref.split('/')[0], pool = quota?.pools?.[provider];
-  const checked = Date.parse(pool?.checked_at);
-  if (!pool || pool.availability !== 'available' || !Number.isFinite(checked) || Date.now()-checked > 120000 || checked>Date.now()+5000) return;
+  const now=Date.now(), checked = Date.parse(pool?.checked_at);
+  if (!pool || pool.availability !== 'available' || !Number.isFinite(checked) || now-checked > 120000 || checked>now+5000) return;
   if (provider === 'anthropic' && pool.financial?.extra_usage_enabled !== false) return;
   if (provider === 'openai' && pool.credit_risk !== 'none') return;
   const windows = (pool.windows ?? []).filter(w => matchesScope(w,candidate.ref));
-  if (!windows.length || windows.some(w => !Number.isFinite(w.used_percent) || w.used_percent >= 100-reserve || w.locked_reason)) return;
+  if (!windows.length || windows.some(w => !Number.isFinite(w.used_percent) || w.used_percent >= 100-reserve || w.locked_reason
+    || timestamp(w.resets_at) === null || timestamp(w.resets_at) <= now)) return;
   if (candidate.requiresScopedQuota && !windows.some(w => w.scope !== 'account')) return;
   if (Array.isArray(quota.catalog)) {
     const [key,variant] = candidate.ref.split('#'), slash=key.indexOf('/');
@@ -79,11 +94,24 @@ function candidateState(candidate, quota, reserve) {
     if (!model || (variant && !(model.variants??[]).some(v=>(typeof v==='string'?v:v.id)===variant))) return;
   } else return; // Newly selected routes must exist in the settled runtime catalog.
   const deltas=windows.map(w=>w.pace_delta).filter(Number.isFinite);
-  const pressure=windows.some(w=>w.used_percent>=90 || w.pace_delta>10);
-  const weekly=windows.filter(w=>w.scope==='account' && w.duration_minutes>=10080);
-  const weeklyDelta=weekly.map(w=>w.pace_delta).filter(Number.isFinite);
-  const score=(pressure?-100:0) + Math.max(-25,Math.min(25,-(weeklyDelta[0]??0)));
-  return {score,pace:pressure?'ahead':deltas.length&&deltas.every(v=>v < -10)?'behind':'normal'};
+  // A high weekly percentage alone is expected near a reset. Pressure comes
+  // from being ahead of an applicable pace, or a genuinely short-window cap.
+  const pressure=windows.some(w=>w.pace_delta>10
+    || (Number.isFinite(w.duration_minutes) && w.duration_minutes<10080 && w.used_percent>=90));
+  const weekly=weeklyPacingWindows(windows,now);
+  // All applicable weekly caps constrain the route. The largest delta is the
+  // limiting cap: it is the one furthest ahead of its own cycle target.
+  const limiting=weekly.reduce((best,w)=>!best || w.pace_delta>best.pace_delta
+    || (w.pace_delta===best.pace_delta && timestamp(w.resets_at)<timestamp(best.resets_at)) ? w : best,null);
+  const delta=limiting?.pace_delta;
+  const deficit=Math.max(0,-(delta??0));
+  const reset=timestamp(limiting?.resets_at);
+  const remaining=limiting ? Math.max(0,Math.min(1,(reset-now)/(limiting.duration_minutes*60_000))) : 1;
+  // Spend useful behind-pace capacity before that allowance resets, without
+  // allowing reset proximity to outweigh the underlying deficit by more than 2x.
+  const score=(delta===undefined?0:-delta) + Math.min(deficit,deficit*(1-remaining));
+  const pacing=limiting ? {provider,limitingWeeklyPaceDelta:delta,limitingWeeklyResetsAt:limiting.resets_at} : undefined;
+  return {score,pressure,pace:pressure?'ahead':deltas.length&&deltas.every(v=>v < -10)?'behind':'normal',pacing};
 }
 export function chooseCandidate({input,quota}) {
   const policy=quota?.routingPolicy;
@@ -103,7 +131,9 @@ export function chooseCandidate({input,quota}) {
   if(!choices.length)return;
   // For requested independent review, prefer a capable different family when
   // its pool is healthy; a depleted pool never wins solely for diversity.
-  choices.sort((a,b)=>((b.independent&&b.pace!=='ahead'?40:0)+b.score)-((a.independent&&a.pace!=='ahead'?40:0)+a.score)||a.index-b.index);
+  choices.sort((a,b)=>(Number(a.pressure)-Number(b.pressure))
+    || ((b.independent&&b.pace!=='ahead'?40:0)+b.score)-((a.independent&&a.pace!=='ahead'?40:0)+a.score)
+    || a.index-b.index);
   const chosen=choices[0];
   return {...chosen,profile:policy.profiles?.[chosen.profile] ?? chosen.profile,reason:authorProvider&&chosen.independent?'cross_family_review':'subscription_pool_selection'};
 }

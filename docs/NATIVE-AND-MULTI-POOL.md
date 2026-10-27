@@ -72,6 +72,33 @@ manual model override wins. Unknown, stale or exhausted telemetry retains the
 configured role or fails the separate admission guard; it does not authorize a
 paid fallback.
 
+## Independent pacing within capability peers
+
+The pools remain separate. For example, 60% used on Codex and 20% used on Claude
+are two account observations, not 80% of a combined allowance. Each usable window
+has its own duration, reset, elapsed target and `pace_delta`. A missing weekly
+meter is unknown; the other provider's meter never fills it in.
+
+Only the approved candidates for the requested role compete. This keeps routine
+worker choices, ordinary implementation peers and stronger review/debugging peers
+within their configured capability level. Equal effort labels across families do
+not establish equivalent capability; maintain those mappings using accepted work.
+
+For new work the selector prefers healthy candidates over pressured ones. It uses
+the most constraining applicable weekly pace, including a matching model-scoped
+weekly limit, rather than whichever window happens to be first. Behind-pace
+capacity gets a continuous preference, with additional bounded urgency as its own
+reset approaches. Two pools far behind pace no longer tie just because both
+exceeded a fixed score cap. Weekly usage above 90% alone does not penalize a pool
+near reset when it remains on pace and above the reserve; short-window pressure,
+scoped locks/exhaustion and financial checks still constrain selection.
+
+Selected routes retain a small numerical pacing explanation in dispatch status.
+This is advisory evidence, not a capacity reservation or a dollar estimate. Other
+clients may consume allowance between observations. The harness does not launch
+work merely to drain a pool, escalate tiers solely for consumption, move admitted
+workers between providers, or retry a denial through another subscription.
+
 ## Reviews and behavior profiles
 
 Set `routing.reviewOf` to the admitted model reference only when the task calls

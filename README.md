@@ -218,10 +218,14 @@ its original role, permissions and ownership.
 
 With an enabled candidate policy, fresh work can instead choose among explicitly
 approved model/effort peers using account and matching model-scoped pressure.
-The selector favors healthy candidates, uses weekly pace as a bounded preference,
-and applies a configurable reserve (2% by default). This is an admission-time
+The selector compares each provider’s own windows; quota percentages are never
+added together. It favors healthy, approved capability peers, considers the
+limiting applicable weekly window and its reset, and applies a configurable
+reserve (2% by default). More useful work can go to the pool further behind pace
+or closer to losing unused capacity, without changing the task’s required tier. This is an admission-time
 choice, not a retry after another provider rejects work. Candidates that require
-scoped quota are ineligible when that evidence is missing. Concurrent sessions
+scoped quota are ineligible when that evidence is missing. A weekly meter above 90% can still be used near reset when it is on pace and
+above the reserve; short-window pressure remains a constraint. Concurrent sessions
 can consume quota after a read; there are no atomic quota reservations.
 
 High-risk work, explicit overrides and other roles are not automatically demoted.

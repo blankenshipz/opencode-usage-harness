@@ -29,7 +29,13 @@ test('missing/stale quota and short-window pressure are handled conservatively',
 
 const policy = {version:1,enabled:true,reservePercent:2,roles:{builder:[{ref:'openai/sol#medium',profile:'openai-sol'},{ref:'anthropic/sonnet#high',profile:'claude-sonnet'}],reviewer:[{ref:'openai/sol#high'},{ref:'anthropic/opus#high'}]}};
 const catalog=[['openai','sol','medium'],['openai','sol','high'],['anthropic','sonnet','high'],['anthropic','opus','high']].map(([providerID,id,v])=>({providerID,id,variants:[{id:v},...(id==='sol'?[{id:'high'}]:[])]}));
-function pool(provider,delta=0){return {checked_at:new Date().toISOString(),availability:'available',credit_risk:'none',financial:{extra_usage_enabled:false},windows:[{scope:'account',used_percent:20,duration_minutes:10080,pace_delta:delta}]};}
+function weekly(delta=0,remaining=.5,extra={}){
+ const duration=10080,target=100*(1-remaining),used=target+delta;
+ return {scope:'account',used_percent:used,remaining_percent:100-used,duration_minutes:duration,pace_delta:delta,resets_at:new Date(Date.now()+remaining*duration*60_000).toISOString(),...extra};
+}
+function pool(provider,delta=0,remaining=.5){
+ return {checked_at:new Date().toISOString(),availability:'available',credit_risk:'none',financial:{extra_usage_enabled:false},windows:[weekly(delta,remaining)]};
+}
 function multi(){return {routingPolicy:policy,catalog,pools:{openai:pool('openai'),anthropic:pool('anthropic',-40)}};}
 test('new capable task can prefer expiring Claude allowance, admitted continuation stays pinned',()=>{
  const q=multi(),input={agent:'builder',routing:{complexity:'standard',risk:'normal'}};
@@ -40,7 +46,7 @@ test('new capable task can prefer expiring Claude allowance, admitted continuati
  assert.equal(continued.selected,first.selected);assert.equal(continued.source,'continuation_affinity');
 });
 test('comparable review prefers other family only with eligible healthy pool',()=>{
- const q=multi();q.pools.openai=pool('openai',-40);q.pools.anthropic=pool('anthropic',0);
+ const q=multi();q.pools.openai=pool('openai',-5);q.pools.anthropic=pool('anthropic',0);
  const input={agent:'reviewer',routing:{complexity:'complex',risk:'high',reviewOf:'openai/sol#medium'}};
  assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'anthropic/opus#high');
  q.pools.anthropic.financial.extra_usage_enabled=true;
@@ -81,4 +87,85 @@ test('cross-family review is optional and a single healthy pool remains useful',
  const q=multi();delete q.pools.openai;q.catalog=q.catalog.filter(m=>m.providerID==='anthropic');
  const result=selectDispatchModel({...base,agent:{model:'anthropic/opus#high'},input:{agent:'reviewer',routing:{complexity:'complex',risk:'high',reviewOf:'anthropic/sonnet#high'}},quota:q});
  assert.equal(result.selected,'anthropic/opus#high');assert.equal(result.source,'subscription_pool_selection');
+});
+
+test('far-behind pools rank continuously instead of provider order',()=>{
+ const q=multi();q.pools.openai=pool('openai',-25,.5);q.pools.anthropic=pool('anthropic',-45,.5);
+ const result=selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q});
+ assert.equal(result.selected,'anthropic/sonnet#high');
+ assert.equal(result.poolPacing.provider,'anthropic');
+ assert.equal(result.poolPacing.limitingWeeklyPaceDelta,-45);
+});
+test('every applicable weekly window constrains selection regardless of source order',()=>{
+ const input={agent:'builder',routing:{complexity:'standard',risk:'normal'}};
+ for (const windows of [[weekly(-40,.5),weekly(5,.5)],[weekly(5,.5),weekly(-40,.5)]]) {
+  const q=multi();q.pools.openai.windows=windows;q.pools.anthropic=pool('anthropic',-10,.5);
+  assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'anthropic/sonnet#high');
+ }
+});
+test('equal limiting deltas use the earliest reset regardless of source order',()=>{
+ const input={agent:'builder',routing:{complexity:'standard',risk:'normal'}};
+ for (const windows of [[weekly(-10,.8),weekly(-10,.2)],[weekly(-10,.2),weekly(-10,.8)]]) {
+  const q=multi();q.pools.openai.windows=windows;q.pools.anthropic=pool('anthropic',-9,.5);
+  const result=selectDispatchModel({...base,input,quota:q});
+  assert.equal(result.selected,'openai/sol#medium');
+  assert.equal(result.poolPacing.limitingWeeklyPaceDelta,-10);
+  assert.equal(result.poolPacing.limitingWeeklyResetsAt,windows.find(w=>w.used_percent===70).resets_at);
+ }
+});
+test('equal weekly deficits favor the pool whose own allowance resets sooner',()=>{
+ const q=multi();q.pools.openai=pool('openai',-20,.2);q.pools.anthropic=pool('anthropic',-20,.8);
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'openai/sol#medium');
+});
+test('on-pace weekly usage below reserve remains healthy near its reset',()=>{
+ const q=multi();q.pools.openai=pool('openai',0,.05);q.pools.anthropic.availability='unavailable';
+ const result=selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q});
+ assert.equal(result.selected,'openai/sol#medium');
+ assert.equal(result.pace,'normal');
+});
+test('on-pace weekly usage near reset does not demote routine single-pool work',()=>{
+ const q=multi();delete q.routingPolicy;q.pools.anthropic=pool('anthropic',0,.05);
+ const a={id:'builder',model:'anthropic/sonnet#high'},fast={id:'quick-builder',model:'anthropic/haiku#medium'};
+ assert.equal(selectDispatchModel({...base,agent:a,agents:[a,fast],input:{agent:'builder',routing:{complexity:'routine',risk:'normal'}},quota:q}).selected,'anthropic/sonnet#high');
+});
+test('short-window pressure loses to a healthy peer even with weekly deficit',()=>{
+ const q=multi();q.pools.openai=pool('openai',-40,.5);
+ q.pools.openai.windows.push({scope:'account',used_percent:95,remaining_percent:5,duration_minutes:300,pace_delta:-20,resets_at:new Date(Date.now()+60*60_000).toISOString()});
+ q.pools.anthropic=pool('anthropic',-1,.5);
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'anthropic/sonnet#high');
+});
+test('ahead weekly pace is pressured even below the usage reserve',()=>{
+ const q=multi();q.pools.openai=pool('openai',15,.5);q.pools.anthropic=pool('anthropic',-1,.5);
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'anthropic/sonnet#high');
+});
+test('independent pool usages and resets are never combined',()=>{
+ const q=multi();q.pools.openai=pool('openai',0,.05);q.pools.anthropic=pool('anthropic',-5,.2);
+ // The two reported usages add past 100%, but they are separate subscriptions.
+ assert.ok(q.pools.openai.windows[0].used_percent+q.pools.anthropic.windows[0].used_percent>100);
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'anthropic/sonnet#high');
+});
+test('scoped exhaustion excludes only candidates matching that scope',()=>{
+ const q=multi();q.catalog.push({providerID:'anthropic',id:'fable',variants:[{id:'high'}]});
+ q.routingPolicy={...policy,roles:{builder:[{ref:'anthropic/fable#high'},{ref:'openai/sol#medium'}]}};
+ q.pools.anthropic.windows.push({...weekly(0,.5),scope:'model',model:'Fable',used_percent:100,remaining_percent:0});
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'openai/sol#medium');
+});
+test('required scoped quota needs a current matching meter',()=>{
+ const input={agent:'builder',routing:{complexity:'standard',risk:'normal'}};
+ for (const scoped of [
+  {...weekly(-20,.5),scope:'model',model:'Fable'},
+  {scope:'model',model:'Fable',used_percent:20,remaining_percent:80},
+  {...weekly(-20,.5),scope:'model',model:'Fable',resets_at:new Date(Date.now()-60_000).toISOString()},
+ ]) {
+  const q=multi();q.catalog.push({providerID:'anthropic',id:'fable',variants:[{id:'high'}]});
+  q.routingPolicy={...policy,roles:{builder:[{ref:'anthropic/fable#high',requiresScopedQuota:true},{ref:'openai/sol#medium'}]}};
+  q.pools.anthropic.windows.push(scoped);
+  const selected=selectDispatchModel({...base,input,quota:q}).selected;
+  if (scoped.resets_at && Date.parse(scoped.resets_at)>Date.now()) assert.equal(selected,'anthropic/fable#high');
+  else assert.equal(selected,'openai/sol#medium');
+ }
+});
+test('one available pool with an unknown reset falls back to the configured role',()=>{
+ const q=multi();delete q.pools.anthropic;q.pools.openai.windows=[{scope:'account',used_percent:20,remaining_percent:80}];
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'openai/balanced#medium');
 });
