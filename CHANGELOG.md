@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — routing and deployment hardening
+
+- Add explicit executable verification with shell capability checks, retained model
+  overrides and conservative write ownership; keep static reviewers read-only.
+- Require routing assessments for new managed work when policy is enabled, while
+  retaining existing children and native Build/Plan contracts.
+- Reject policy typos and invalid reserve/scoped options; distinguish unknown weekly
+  pace and match provider scopes through explicit model/family semantics.
+- Preserve safe Anthropic usage-check diagnostics and coalesce concurrent reads
+  without inference retries, account switching or stale admission.
+- Stage private releases reproducibly with reviewed adapters and artifact hashes;
+  upstream OS-backed registry locking and check configuration/dependency drift.
+- Document independent Claude and Codex pools, provisional task-fit preferences,
+  cross-family review, harness-prefixed roles and capability preflight. These are
+  development-branch features, not a claim that the v0.1.0 tag contains them.
+
 ## Unreleased — recovery correctness
 
 - Bind compaction outcomes to their native ID, preserve failure history, and

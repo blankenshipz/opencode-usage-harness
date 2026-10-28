@@ -1,4 +1,5 @@
 import unittest
+import copy
 import json
 from pathlib import Path
 import subprocess
@@ -22,6 +23,10 @@ class ConfigureTests(unittest.TestCase):
             self.assertIn({'action':'task_*','resource':'*','effect':'deny'},p['agents'][name]['permissions'])
         self.assertIn({'action':'edit','resource':'*','effect':'deny'},p['agents']['plan']['permissions'])
         self.assertIn({'action':'edit','resource':'~/.opencode/plan/*','effect':'allow'},p['agents']['plan']['permissions'])
+        verifier = p['agents']['harness-verifier']
+        self.assertIn({'action':'edit','resource':'*','effect':'deny'}, verifier['permissions'])
+        self.assertNotIn({'action':'shell','resource':'*','effect':'deny'}, verifier['permissions'])
+        self.assertIn('not a read-only sandbox', verifier['system'])
         self.assertEqual(p['default_agent'], 'harness-router')
         for role in ('router','builder','quick-builder','reviewer'):
             self.assertFalse(p['agents'][f'harness-{role}'].get('hidden', False))
@@ -92,6 +97,28 @@ class ConfigureTests(unittest.TestCase):
             if policy is not None:
                 with self.assertRaises(ValueError):
                     profile(models,routing_policy=policy)
+
+    def test_routing_policy_schema_rejects_unknown_keys_and_bad_references(self):
+        models={k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')}
+        valid={'version':1,'enabled':True,'reservePercent':2,'profiles':{'measured':{}},'roles':{
+            'builder':[{'ref':'openai/fixture#medium','profile':'measured','requiresScopedQuota':False}]}}
+        self.assertEqual(profile(models,routing_policy=valid)['enabled_providers'], ['openai'])
+        for mutate in (
+            lambda p:p.update({'unknown':True}),
+            lambda p:p.update({'reservePercent':'2'}),
+            lambda p:p['roles']['builder'][0].update({'requiresScopedQuota':'false'}),
+            lambda p:p['roles']['builder'][0].update({'profile':'missing'}),
+            lambda p:p['roles']['builder'][0].update({'unknown':True}),
+            lambda p:p.update({'roles':{'harness-imposter':p['roles']['builder']}}),
+        ):
+            with self.subTest(mutate=mutate):
+                policy=copy.deepcopy(valid)
+                mutate(policy)
+                with self.assertRaises(ValueError):
+                    profile(models,routing_policy=policy)
+        alias=copy.deepcopy(valid)
+        alias['roles']={'harness-verifier':alias['roles']['builder']}
+        self.assertEqual(profile(models,routing_policy=alias)['enabled_providers'], ['openai'])
 
     def test_models_must_be_explicit_subscription_variants(self):
         for invalid in ('other/model#medium','openai/model','openai/model#','anthropic/model#'):

@@ -7,16 +7,32 @@ import { canonicalHarnessRole, harnessRoleIDs } from './agent-mode.mjs';
 
 export const TASK_TYPES = Object.freeze(['general','exploration','mechanical','implementation','debugging','architecture','testing','review']);
 const TASK_TYPE_SET = new Set(TASK_TYPES);
+const POLICY_KEYS = new Set(['version','enabled','reservePercent','roles','profiles']);
+const CANDIDATE_KEYS = new Set(['ref','profile','enabled','requiresScopedQuota','taskFit']);
 function policyError() { return Object.assign(new Error('ROUTING_POLICY_INVALID: routing policy is invalid'), { code: 'ROUTING_POLICY_INVALID' }); }
 function taskFitError() { return Object.assign(new Error('ROUTING_TASK_FIT_UNAVAILABLE: no supported-preferred candidate is available for this task'), { code: 'ROUTING_TASK_FIT_UNAVAILABLE' }); }
+function scopeQuotaError() { return Object.assign(new Error('ROUTING_QUOTA_SCOPE_UNAVAILABLE: scoped quota is ambiguous or unavailable for the configured route'), { code: 'ROUTING_QUOTA_SCOPE_UNAVAILABLE' }); }
 function isRecord(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 export function validateTaskFitPolicy(policy) {
   if (!isRecord(policy)) throw policyError();
-  if (policy.version !== 1 || (policy.enabled !== undefined && typeof policy.enabled !== 'boolean') || !isRecord(policy.roles)) throw policyError();
-  for (const candidates of Object.values(policy.roles)) {
+  if (Object.keys(policy).some(key => !POLICY_KEYS.has(key)) || policy.version !== 1
+    || (policy.enabled !== undefined && typeof policy.enabled !== 'boolean')
+    || (policy.reservePercent !== undefined && (!Number.isFinite(policy.reservePercent) || policy.reservePercent < 0 || policy.reservePercent > 10))
+    || !isRecord(policy.roles)
+    || (policy.profiles !== undefined && !isRecord(policy.profiles))) throw policyError();
+  if (policy.profiles && Object.entries(policy.profiles).some(([name, profile]) => !/^[A-Za-z0-9._-]+$/.test(name) || !isRecord(profile))) throw policyError();
+  for (const [role, candidates] of Object.entries(policy.roles)) {
+    // Policies may use a configured canonical role or its visible harness-
+    // alias, both of which are explicit runtime identities.
+    if (canonicalHarnessRole(role) === undefined) throw policyError();
     if (!Array.isArray(candidates)) throw policyError();
     for (const candidate of candidates) {
-      if (!isRecord(candidate) || typeof candidate.ref!=='string' || !/^(openai|anthropic)\/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+$/.test(candidate.ref) || (candidate.enabled !== undefined && typeof candidate.enabled !== 'boolean')) throw policyError();
+      if (!isRecord(candidate) || Object.keys(candidate).some(key => !CANDIDATE_KEYS.has(key))
+        || typeof candidate.ref!=='string' || !/^(openai|anthropic)\/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+$/.test(candidate.ref)
+        || (candidate.enabled !== undefined && typeof candidate.enabled !== 'boolean')
+        || (candidate.requiresScopedQuota !== undefined && typeof candidate.requiresScopedQuota !== 'boolean')
+        || (candidate.profile !== undefined && (typeof candidate.profile !== 'string' || !/^[A-Za-z0-9._-]+$/.test(candidate.profile)
+          || (policy.profiles !== undefined && !Object.hasOwn(policy.profiles, candidate.profile)))) ) throw policyError();
       if (candidate.taskFit === undefined) continue;
       if (!isRecord(candidate.taskFit)) throw policyError();
       for (const [taskType, rule] of Object.entries(candidate.taskFit)) {
@@ -34,7 +50,7 @@ export function validateTaskFitPolicy(policy) {
 export function taskTypeFor(input) {
   if (input?.routing?.taskType !== undefined) return TASK_TYPE_SET.has(input.routing.taskType) ? input.routing.taskType : 'general';
   const role = canonicalHarnessRole(input?.agent) ?? input?.agent;
-  return ({ scout:'exploration', 'quick-builder':'mechanical', builder:'implementation', 'builder-high':'implementation', 'deep-debugger':'debugging', 'deep-debugger-high':'debugging', architect:'architecture', reviewer:'review' })[role] ?? 'general';
+  return ({ scout:'exploration', 'quick-builder':'mechanical', builder:'implementation', 'builder-high':'implementation', 'deep-debugger':'debugging', 'deep-debugger-high':'debugging', architect:'architecture', reviewer:'review', verifier:'testing' })[role] ?? 'general';
 }
 function candidateFit(candidate, taskType) {
   const rule = candidate?.taskFit?.[taskType];
@@ -131,16 +147,58 @@ export function selectDispatchModel({input,agent,agents,record,child,quota}) {
     if (fast && configured && fast.split('/')[0]===configured.split('/')[0]
       && (!fitContext?.strict || fitContext.supportedPreferred.includes(fast))) {selected=fast;source='pace_routine';}
   }
+  if (!override && input.routing && quota?.routingPolicy?.version===1 && quota.routingPolicy.enabled===true
+    && scopedQuotaUnavailable(selected,quota,Number.isFinite(quota.routingPolicy.reservePercent) ? quota.routingPolicy.reservePercent : 2)) throw scopeQuotaError();
   const fallbackFit=!override && selectedTaskFit({input,policy:quota?.routingPolicy,ref:selected});
   return {selected,configured,observed,source,pace,modelOverride:override,...(!override ? {taskFit:fallbackFit ?? {taskType:taskTypeFor(input),band:'acceptable',evidenceStatus:'provisional',reason:'no_supported_preference'}} : {})};
 }
 
 
-function matchesScope(window, ref) {
-  if (window.scope === 'account') return true;
-  const model = ref.split('/')[1]?.split('#')[0]?.toLowerCase().replace(/[^a-z0-9]/g,'') ?? '';
-  const scope = (window.model_family ?? window.model ?? '').toLowerCase().replace(/[^a-z0-9]/g,'');
-  return scope.length > 0 && model.includes(scope);
+function canonicalScopeName(value) {
+  if (typeof value !== 'string') return undefined;
+  const canonical=value.toLowerCase().replace(/[^a-z0-9]/g,'');
+  return canonical || undefined;
+}
+function scopedNamesForReference(ref) {
+  const [provider, rawModel] = ref.split('/',2);
+  const bareModel=rawModel?.split('#')[0];
+  const model=canonicalScopeName(bareModel);
+  if (!model) return [];
+  const names=[model];
+  // Anthropic usage reports a reviewed model-family label (for example
+  // "Fable") while its catalog entry is a versioned claude-fable-* ID. This
+  // structural adapter is deliberately bounded; it is not fuzzy matching or a
+  // capability ranking.
+  const family=provider==='anthropic' && bareModel?.match(/^claude-([A-Za-z0-9]+)-\d+(?:-\d+)*$/i)?.[1];
+  const canonicalFamily=canonicalScopeName(family);
+  if (canonicalFamily) names.push(canonicalFamily);
+  return names;
+}
+function knownScopeNames(catalog, provider) {
+  if (!Array.isArray(catalog)) return new Set();
+  return new Set(catalog.filter(model=>model?.providerID===provider)
+    .flatMap(model=>scopedNamesForReference(`${provider}/${model.id}`)));
+}
+function scopeRelation(window, ref, catalog) {
+  if (window.scope === 'account') return 'applicable';
+  const [provider]=ref.split('/',1), labels=[window.model,window.model_family].map(canonicalScopeName).filter(Boolean);
+  if (!labels.length) return 'ambiguous';
+  const models=scopedNamesForReference(ref);
+  if (labels.some(label=>models.includes(label))) return 'applicable';
+  return labels.every(label=>knownScopeNames(catalog,provider).has(label)) ? 'unrelated' : 'ambiguous';
+}
+function scopedQuotaUnavailable(ref, quota, reserve) {
+  const provider=ref?.split('/')[0], pool=quota?.pools?.[provider];
+  if (!pool || !Array.isArray(pool.windows)) return false;
+  const now=Date.now();
+  for (const window of pool.windows) {
+    const relation=scopeRelation(window,ref,quota.catalog);
+    if (relation==='ambiguous') return true;
+    if (relation==='applicable' && window.scope!=='account'
+      && (!Number.isFinite(window.used_percent) || window.used_percent>=100-reserve || window.locked_reason
+        || timestamp(window.resets_at)===null || timestamp(window.resets_at)<=now)) return true;
+  }
+  return false;
 }
 function timestamp(value) {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -160,7 +218,9 @@ function candidateState(candidate, quota, reserve) {
   if (!pool || pool.availability !== 'available' || !Number.isFinite(checked) || now-checked > 120000 || checked>now+5000) return;
   if (provider === 'anthropic' && pool.financial?.extra_usage_enabled !== false) return;
   if (provider === 'openai' && pool.credit_risk !== 'none') return;
-  const windows = (pool.windows ?? []).filter(w => matchesScope(w,candidate.ref));
+  const relations=(pool.windows ?? []).map(window=>({window,relation:scopeRelation(window,candidate.ref,quota.catalog)}));
+  if (relations.some(entry=>entry.relation==='ambiguous')) return;
+  const windows=relations.filter(entry=>entry.relation==='applicable').map(entry=>entry.window);
   if (!windows.length || windows.some(w => !Number.isFinite(w.used_percent) || w.used_percent >= 100-reserve || w.locked_reason
     || timestamp(w.resets_at) === null || timestamp(w.resets_at) <= now)) return;
   if (candidate.requiresScopedQuota && !windows.some(w => w.scope !== 'account')) return;
@@ -185,9 +245,9 @@ function candidateState(candidate, quota, reserve) {
   const remaining=limiting ? Math.max(0,Math.min(1,(reset-now)/(limiting.duration_minutes*60_000))) : 1;
   // Spend useful behind-pace capacity before that allowance resets, without
   // allowing reset proximity to outweigh the underlying deficit by more than 2x.
-  const score=(delta===undefined?0:-delta) + Math.min(deficit,deficit*(1-remaining));
+  const score=limiting ? -delta + Math.min(deficit,deficit*(1-remaining)) : undefined;
   const pacing=limiting ? {provider,limitingWeeklyPaceDelta:delta,limitingWeeklyResetsAt:limiting.resets_at} : undefined;
-  return {score,pressure,pace:pressure?'ahead':deltas.length&&deltas.every(v=>v < -10)?'behind':'normal',pacing};
+  return {score,pressure,pace:pressure?'ahead':limiting ? (deltas.length&&deltas.every(v=>v < -10)?'behind':'normal') : 'unknown',pacing};
 }
 export function chooseCandidate({input,quota}) {
   const policy=quota?.routingPolicy;
@@ -214,7 +274,10 @@ export function chooseCandidate({input,quota}) {
   const routine=input.routing?.complexity==='routine' && input.routing?.risk==='normal';
   eligible.sort((a,b)=>(Number(a.pressure)-Number(b.pressure))
     || (routine ? 0 : (a.fit.band===b.fit.band ? 0 : a.fit.band==='preferred' ? -1 : 1))
-    || ((b.independent&&b.pace!=='ahead'?40:0)+b.score)-((a.independent&&a.pace!=='ahead'?40:0)+a.score)
+    // Unknown weekly pace remains eligible (including a one-pool profile), but
+    // cannot be treated as a neutral measured allowance when a peer is known.
+    || (Number(a.pace==='unknown')-Number(b.pace==='unknown'))
+    || ((b.independent&&b.pace!=='ahead'&&b.pace!=='unknown'?40:0)+(b.score ?? 0))-((a.independent&&a.pace!=='ahead'&&a.pace!=='unknown'?40:0)+(a.score ?? 0))
     || a.index-b.index);
   const chosen=eligible[0];
   const pressureTradeoff=!routine && chosen.fit.band==='acceptable' && choices.some(c=>c.fit.band==='preferred' && c.pressure) && !chosen.pressure;

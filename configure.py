@@ -30,7 +30,43 @@ def validate_task_fit(candidate):
             raise ValueError('supported task-fit preference requires evidence reference')
 
 
-NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','deep-debugger','deep-debugger-high','architect','reviewer','maximum','maximum-max')
+def validate_routing_policy(routing_policy):
+    allowed_policy_keys = {'version','enabled','reservePercent','roles','profiles'}
+    allowed_candidate_keys = {'ref','profile','enabled','requiresScopedQuota','taskFit'}
+    if (not isinstance(routing_policy, dict) or set(routing_policy) - allowed_policy_keys
+            or routing_policy.get('version') != 1 or not isinstance(routing_policy.get('roles'), dict)):
+        raise ValueError('routing policy must use version 1 and explicit role candidates')
+    if 'enabled' in routing_policy and not isinstance(routing_policy['enabled'], bool):
+        raise ValueError('routing policy enabled must be a boolean')
+    reserve = routing_policy.get('reservePercent')
+    if reserve is not None and (isinstance(reserve, bool) or not isinstance(reserve, (int, float)) or not 0 <= reserve <= 10):
+        raise ValueError('routing policy reservePercent must be a number from zero through ten')
+    profiles = routing_policy.get('profiles')
+    if profiles is not None:
+        if not isinstance(profiles, dict) or any(not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9._-]+', name) or not isinstance(value, dict) for name, value in profiles.items()):
+            raise ValueError('routing policy profiles must be named objects')
+    for role, candidates in routing_policy['roles'].items():
+        if role not in NAMESPACED_ROLES and not (role.startswith('harness-') and role.removeprefix('harness-') in NAMESPACED_ROLES):
+            raise ValueError('routing policy roles must use a configured harness ID')
+        if not isinstance(candidates, list):
+            raise ValueError('routing role candidates must be lists')
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or set(candidate) - allowed_candidate_keys:
+                raise ValueError('routing candidates must be policy objects')
+            if 'enabled' in candidate and not isinstance(candidate['enabled'], bool):
+                raise ValueError('routing candidate enabled must be a boolean')
+            if 'requiresScopedQuota' in candidate and not isinstance(candidate['requiresScopedQuota'], bool):
+                raise ValueError('routing candidate requiresScopedQuota must be a boolean')
+            ref = candidate.get('ref')
+            if not isinstance(ref, str) or not re.fullmatch(r'(openai|anthropic)/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+', ref):
+                raise ValueError('routing candidates must be discovered subscription model variants')
+            profile_ref = candidate.get('profile')
+            if profile_ref is not None and (not isinstance(profile_ref, str) or not re.fullmatch(r'[A-Za-z0-9._-]+', profile_ref) or (profiles is not None and profile_ref not in profiles)):
+                raise ValueError('routing candidate profile must be a declared profile reference')
+            validate_task_fit(candidate)
+
+
+NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','deep-debugger','deep-debugger-high','architect','reviewer','verifier','maximum','maximum-max')
 ROLES = {
     'router': ('STRONG', True, True),
     'coordinator': ('BALANCED', True, True),
@@ -40,6 +76,7 @@ ROLES = {
     'deep-debugger': ('STRONG', False, False),
     'architect': ('STRONG', False, True),
     'reviewer': ('STRONG', False, True),
+    'verifier': ('STRONG', False, False),
     'maximum': ('MAXIMUM', False, False),
 }
 
@@ -100,22 +137,10 @@ def profile(models, package_root=ROOT, routing_policy=None):
         if provider not in providers:
             providers.append(provider)
     if routing_policy is not None:
-        if not isinstance(routing_policy, dict) or routing_policy.get('version') != 1 or not isinstance(routing_policy.get('roles'), dict):
-            raise ValueError('routing policy must use version 1 and explicit role candidates')
-        if 'enabled' in routing_policy and not isinstance(routing_policy['enabled'], bool):
-            raise ValueError('routing policy enabled must be a boolean')
+        validate_routing_policy(routing_policy)
         for candidates in routing_policy['roles'].values():
-            if not isinstance(candidates, list):
-                raise ValueError('routing role candidates must be lists')
             for candidate in candidates:
-                if not isinstance(candidate, dict):
-                    raise ValueError('routing candidates must be objects')
-                if 'enabled' in candidate and not isinstance(candidate['enabled'], bool):
-                    raise ValueError('routing candidate enabled must be a boolean')
-                ref = candidate.get('ref')
-                if not isinstance(ref, str) or not re.fullmatch(r'(openai|anthropic)/[A-Za-z0-9._-]+#[A-Za-z0-9_-]+', ref):
-                    raise ValueError('routing candidates must be discovered subscription model variants')
-                validate_task_fit(candidate)
+                ref = candidate['ref']
                 if routing_policy.get('enabled') is True and candidate.get('enabled', True) is not False:
                     provider = ref.split('/')[0]
                     if provider not in providers:
@@ -133,10 +158,14 @@ def profile(models, package_root=ROOT, routing_policy=None):
                       for child in children for child_id in (child, visible_role(child))]
         if readonly:
             rules += [{'action':a,'resource':'*','effect':'deny'} for a in ('shell','edit')]
+        if role == 'verifier':
+            rules.append({'action':'edit','resource':'*','effect':'deny'})
         identity_guidance = ('\nUse visible harness-* IDs for new handoffs. When continuing an existing worker, '
                              'pass its exact stored agent ID and sessionID; never rename or adopt it.')
         definition = {'description':f'harness {role.replace("-", " ")}', 'mode':'primary' if role == 'router' else 'all',
             'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance, 'permissions':rules}
+        if role == 'verifier':
+            definition['system'] += '\nExecute the assigned checks and report commands, exit codes and findings. Do not implement repairs. Shell execution can write artifacts; retain declared workspace ownership and all native approvals. This role is not a read-only sandbox.'
         agents[visible_role(role)] = definition
         agents[role] = {**definition, 'description':role.replace('-', ' '), 'hidden':True}
     for builtin in ('build','plan','general','explore'):

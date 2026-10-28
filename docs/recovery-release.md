@@ -211,3 +211,46 @@ The launcher environment remains free of `OPENAI_API_KEY`. This establishes
 startup/artifact preservation, not an end-to-end paid inference recovery test.
 No inference was requested and no paused child was automatically resumed. Mobile
 reconnection still requires confirmation from the user's device.
+
+## Reproducible private plugin candidates
+
+`scripts/stage_private_release.py` builds a private candidate without activating it:
+
+```sh
+python3 scripts/stage_private_release.py stage \
+  --source /reviewed/public-checkout --private-input /private/reviewed-input \
+  --plan /private/release-plan.json --output /private/candidate
+python3 scripts/stage_private_release.py verify \
+  --source /reviewed/public-checkout --private-input /private/reviewed-input \
+  --plan /private/release-plan.json --output /private/candidate
+```
+
+A schema-1 plan lists `public_trees` with source-tree hashes, `overlays` with
+source/destination hashes and reasons, `adapters` with a pinned public source and
+exact single-match replacements, and `required` paths. Keep the plan outside the
+public checkout: it describes a particular deployment, not a portable default.
+Prefer public plugins plus a single state/config path adapter. Do not carry old
+private plugin implementations forward as overlays merely because they existed.
+
+The resulting `manifest.json` records every staged artifact. Install it under the
+private runtime and have the launcher call
+`verify_runtime_release.verify_release(root, manifest_relative_path)` alongside
+its existing binary verification. Include the verifier itself, launcher, effective
+configuration, routing policy, AGENTS files, and all relative import dependencies.
+The check rejects changed/missing files, extra V2 plugins, symlinked paths, and
+unmanifested literal relative dependencies. Computed imports and external packages
+still require the isolated compiled-runtime/import smoke test. Hashes establish
+reviewed byte identity, not a policy verdict.
+
+Registry locking now uses a kernel flock held through the callback; process death
+releases it. Python with `fcntl` is required (macOS/Linux). Old marker locks remain
+fail-closed; do not mix marker-based writers with flock writers or delete a marker
+to force admission. Quiesce before deployment or rollback. Configuration and
+launcher changes may require a managed restart even if plugins support hot reload.
+
+The October review also corrected nested recovery delivery: status may retry a
+pending notice only for a matching root/parent/child/current generation, with
+`resume:false`. It never resumes inference. Historical generations stay retained
+without appearing as the current notification. During telemetry path consolidation,
+retain old logs and use both roots for historical reports; do not claim that a new
+empty destination means no prior activity.

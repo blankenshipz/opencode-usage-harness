@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { validateFinancial } from '../../config/guard-validation.mjs';
 import { anthropicPackage, assertAnthropicOverrides, assertAnthropicBaseURL, assertAnthropicHTTPURL,
-  assertAnthropicCredential, fetchAnthropicUsage, readSelectedClaudeUsage } from './anthropic-subscription.mjs';
+  assertAnthropicCredential, fetchAnthropicUsage, normalizeAnthropicUsageFailure, readSelectedClaudeUsage } from './anthropic-subscription.mjs';
 import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
 import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
 import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
@@ -97,6 +97,7 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     database: statePath('telemetry', 'completions.sqlite3'), value, python: env.HARNESS_PYTHON || 'python3', env,
   }), registry = createRegistry(), readAnthropicUsage = fetchAnthropicUsage } = {}) {
   const anthropicUsageCache = new Map();
+  const anthropicUsagePending = new Map();
   async function quota(operation) {
     const started = performance.now();
     try {
@@ -169,13 +170,21 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     for (const [key, entry] of anthropicUsageCache) if (entry.expiresAt <= timestamp) anthropicUsageCache.delete(key);
     const cached = anthropicUsageCache.get(access);
     if (cached && cached.expiresAt > timestamp) return;
+    let request = anthropicUsagePending.get(access);
+    if (!request) {
+      request = Promise.resolve().then(() => readAnthropicUsage(access));
+      anthropicUsagePending.set(access, request);
+    }
     let usage;
-    try { usage = await readAnthropicUsage(access); }
-    catch { throw new Error('Subscription guard: Anthropic usage verification failed.'); }
+    try { usage = await request; }
+    catch (error) { throw normalizeAnthropicUsageFailure(error); }
+    finally { if (anthropicUsagePending.get(access) === request) anthropicUsagePending.delete(access); }
     if (usage?.extra_usage?.is_enabled !== false)
       throw new Error('Subscription guard: Anthropic usage credits must be disabled before inference.');
     if (anthropicUsageCache.size >= anthropicUsageCacheLimit) anthropicUsageCache.clear();
-    anthropicUsageCache.set(access, { expiresAt: timestamp + anthropicUsageCacheMs });
+    // Calculate freshness only after the successful telemetry read. This keeps
+    // a slow read from authorizing a request with stale telemetry.
+    anthropicUsageCache.set(access, { expiresAt: Date.parse(now()) + anthropicUsageCacheMs });
   }
   return {
     id: 'subscription.guard',

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { installTaskDispatch, hasCapability } from '../plugins/v2/task-dispatch.mjs';
 import { createV2TaskOutcomes } from '../plugins/v2/task-outcomes.mjs';
@@ -156,7 +156,7 @@ test('denial receipts survive reload and unrelated work remains eligible',async 
  const h=await harness(t,async(input)=>{if(input.description==='Fix backend')throw new Error('Subagent denied: builder');return {content:'other',metadata:{sessionID:'ses_other',status:'completed'},output:{sessionID:'ses_other',status:'completed'}};});
  await assert.rejects(h.call(base),/Subagent denied/);
  const recreated=new Map([['subagent',{...h.rawNative}]]);
- await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
+ await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
  await assert.rejects(recreated.get('task_dispatch').execute({...base,prompt:'changed after reload'},{sessionID:'root',agent:'router',progress:async()=>{}}),/remains denied/);
  const other=await h.call({...base,workKey:'unrelated',description:'Independent task',writePaths:['mobile']});assert.equal(other.content,'other');
 });
@@ -235,7 +235,7 @@ test('legacy active workers block new writers; direct-child adoption preserves o
 test('ownership survives plugin recreation and failed parents with active descendants',async t=>{
  const h=await harness(t);await h.call({...base,background:true});
  const recreated=new Map([['subagent',{...h.rawNative}]]);
- await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),loadSessions:async()=>h.sessions});
+ await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions});
  const content=JSON.parse((await recreated.get('task_dispatch_status').execute({},{sessionID:'root'})).content);assert.equal(content.owners[0].childID,'ses_1');
  h.sessions[1].active=false;h.sessions.push({id:'grandchild',parentID:'ses_1',agent:'builder',directory:'/project',active:true});
  await assert.rejects(h.call({...base,workKey:'replacement'}),/overlapping/);
@@ -246,6 +246,22 @@ test('registry serializes independent processes and preserves each update',async
  const source=`import {createRegistry} from ${JSON.stringify(moduleURL)}; await createRegistry(process.argv[1])('/project',async(s,save)=>{const n=s.counter??0;await new Promise(r=>setTimeout(r,30));s.counter=n+1;await save();});`;
  await Promise.all(Array.from({length:3},()=>execute(process.execPath,['--input-type=module','-e',source,h.dir])));
  await h.registry('/project',async state=>assert.equal(state.counter,3));
+});
+test('kernel flock keeps a held registry exclusive and releases it when its process dies',async t=>{
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'dispatch-flock-'));t.after(()=>fsp.rm(dir,{recursive:true,force:true}));
+ const registry=createRegistry(dir);let release,entered=false;let started;
+ const ready=new Promise(resolve=>{started=resolve;});
+ const first=registry('/project',async()=>{started();await new Promise(resolve=>{release=resolve;});});
+ await ready;
+ const second=registry('/project',async()=>{entered=true;});
+ await new Promise(resolve=>setTimeout(resolve,100));assert.equal(entered,false,'a second file description must not enter while the first callback owns flock');
+ release();await first;await second;assert.equal(entered,true);
+ const moduleURL=new URL('../plugins/v2/dispatch-registry.mjs',import.meta.url).href;
+ const source=`import {createRegistry} from ${JSON.stringify(moduleURL)}; await createRegistry(process.argv[1])('/dead-owner',async()=>{console.log('locked');await new Promise(()=>{});});`;
+ const child=spawn(process.execPath,['--input-type=module','-e',source,dir],{stdio:['ignore','pipe','pipe']});
+ await new Promise((resolve,reject)=>{child.stdout.once('data',data=>data.toString().includes('locked')?resolve():reject(new Error('child did not acquire registry')));child.once('error',reject);});
+ child.kill('SIGKILL');await new Promise(resolve=>child.once('close',resolve));
+ let recovered=false;await registry('/dead-owner',async()=>{recovered=true;});assert.equal(recovered,true);
 });
 test('dead admission owner is recovered without replacing a known child',async t=>{
  const h=await harness(t);await h.call({...base,background:true});
@@ -483,7 +499,7 @@ test('matching compaction outcome survives plugin restart with the same continua
  h.ctx.session.compact=async input=>{compacted=input;};await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'A',expectedEvidence:'receipt-a'}});
  child.lastCompaction={id:compacted.id,status:'completed'};
  const recreated=new Map([['subagent',{...h.rawNative}]]);
- await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:tool=>recreated.set(tool.name,tool)})}},{registry:createRegistry(h.dir),loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
+ await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:tool=>recreated.set(tool.name,tool)})}},{registry:createRegistry(h.dir),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
  const status=JSON.parse((await recreated.get('task_dispatch_status').execute({taskId:'release'},{sessionID:'root'})).content);
  assert.equal(status.owners[0].state,'awaiting_continuation');assert.equal(status.owners[0].compactionOutcome.id,compacted.id);assert.deepEqual(status.owners[0].continuationOwner,{parentID:'root',childID:child.id,action:'resume_same_child'});assert.equal(h.calls.length,1);
 });
@@ -508,4 +524,48 @@ test('native Effect codec inputs use the pinned JSON contract without cloning fu
  assert.ok(event.tools.subagent.input.properties.model.description.includes('explicitly'));
  const result=await h.tools.get('subagent').execute({agent:'explore',description:'Inspect files',prompt:'Inspect files'},{sessionID:'root',agent:'build',progress:async()=>{}});
  assert.equal(result.content,'OK');assert.equal(h.calls.length,1);
+});
+
+test('verify requires shell, preserves explicit model and reserves writes despite edit denial',async t=>{
+ const h=await harness(t);const list=h.ctx.agent.list;
+ h.ctx.agent.list=async()=>({data:[...(await list()).data,{id:'harness-verifier',model:'openai/fixture-strong#high',permissions:[{action:'edit',resource:'*',effect:'deny'},{action:'subagent',resource:'*',effect:'deny'}]}]});
+ await assert.rejects(h.call({...base,agent:'scout',operation:'verify',requiredCapabilities:[],prompt:'Run the checks',writePaths:[]}),/cannot perform shell/);
+ assert.equal(h.calls.length,0);
+ await assert.rejects(h.call({...base,agent:'harness-verifier',operation:'inspect',requiredCapabilities:[],writePaths:[]}),/verifier requires operation verify/);
+ const result=await h.call({...base,agent:'harness-verifier',operation:'verify',requiredCapabilities:[],prompt:'Run the checks',writePaths:[],model:'anthropic/fixture-opus#high'});
+ assert.equal(result.content,'OK');assert.equal(h.calls[0].model,'anthropic/fixture-opus#high');
+ await h.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['.']));
+});
+test('enabled routing policy requires assessment for new work but preserves admitted continuation',async t=>{
+ const policy={version:1,enabled:true,roles:{}};
+ const h=await harness(t,undefined,undefined,{loadRoutingPolicy:()=>policy,loadQuota:async()=>({})});
+ await assert.rejects(h.call(base),/ROUTING_ASSESSMENT_REQUIRED/);
+ assert.equal(h.calls.length,0);await h.registry('/project',async state=>assert.equal(state.records.length,0));
+ const first=await h.call({...base,routing:{complexity:'standard',risk:'normal'}});
+ const next=await h.call({...base,sessionID:first.metadata.sessionID});
+ assert.equal(next.metadata.sessionID,first.metadata.sessionID);assert.equal(h.calls.length,2);
+});
+
+test('root status delivers nested current-generation recovery to its real parent only',async t=>{
+ const h=await harness(t);const {quotaRecoveryReceipt,enqueueQuotaRecovery}=await import('../plugins/v2/quota-recovery.mjs');
+ h.sessions.push({id:'coord',parentID:'root',agent:'coordinator',active:false},{id:'nested',parentID:'coord',agent:'builder',active:false});
+ const error=Object.assign(new Error('fixture'),{code:'SUBSCRIPTION_QUOTA_CHECK_FAILED',quota:{category:'telemetry_failure'},detail:{reason:'timeout'}});
+ await h.registry('/project',async(state,save)=>{
+  state.records.push({key:'nested',rootID:'root',parentID:'coord',childID:'nested',taskId:'release',workKey:'nested',state:'failed',admissionGeneration:2});
+  for(const generation of [1,2])enqueueQuotaRecovery(state,quotaRecoveryReceipt({error,parentID:'coord',childID:'nested',generation}));await save();
+ });
+ const notices=[];h.ctx.session.synthetic=async notice=>notices.push(notice);
+ const status=JSON.parse((await h.call({},'task_dispatch_status')).content);
+ assert.equal(notices.length,1);assert.equal(notices[0].sessionID,'coord');assert.equal(notices[0].resume,false);assert.equal(notices[0].metadata.generation,2);
+ assert.equal(status.quotaRecoveryPending.length,0);assert.equal(h.calls.length,0);
+ await h.call({},'task_dispatch_status');assert.equal(notices.length,1);
+ await h.registry('/project',async state=>{assert.equal(state.quotaRecoveryOutbox[0].deliveredAt,undefined);assert.ok(state.quotaRecoveryOutbox[1].deliveredAt);});
+});
+
+test('routing assessment cannot mask an existing denial without a child',async t=>{
+ const policy={version:1,enabled:true,roles:{}};
+ const h=await harness(t,async()=>{throw new Error('Subagent denied: builder');},undefined,{loadRoutingPolicy:()=>policy,loadQuota:async()=>({})});
+ await assert.rejects(h.call({...base,routing:{complexity:'standard',risk:'normal'}}),/Subagent denied/);
+ await assert.rejects(h.call(base),/admission remains denied/);
+ assert.equal(h.calls.length,1);
 });

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {selectDispatchModel,quotaPace,modelReference,validateTaskFitPolicy,taskTypeFor,readRoutingPolicy,readRoutingQuota} from '../plugins/v2/dispatch-routing.mjs';
+import { normalizeClaudeQuota } from '../plugins/v2/provider-quota.mjs';
 const agent={id:'builder',model:{providerID:'openai',id:'balanced',variant:'medium'}};
 const agents=[agent,{id:'quick-builder',model:{providerID:'openai',id:'fast',variant:'low'}}];
 const quota={checked_at:new Date().toISOString(),buckets:[{windows:[{pace_delta:60,remaining_percent:34}]}]};
@@ -60,7 +61,7 @@ test('explicit model beats balancing; stale pools and unadvertised models cannot
  q.catalog=[];assert.equal(selectDispatchModel({...base,input,quota:q}).selected,base.agent.model.providerID+'/balanced#medium');
 });
 test('Fable scoped exhaustion does not exclude ordinary Claude routes',()=>{
- const q=multi();q.pools.anthropic.windows.push({scope:'model',model:'Fable',used_percent:100,pace_delta:100});
+ const q=multi();q.catalog.push({providerID:'anthropic',id:'claude-fable-5-1',variants:[{id:'high'}]});q.pools.anthropic.windows.push({scope:'model',model:'Fable',used_percent:100,pace_delta:100});
  assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'anthropic/sonnet#high');
 });
 
@@ -165,9 +166,53 @@ test('required scoped quota needs a current matching meter',()=>{
   else assert.equal(selected,'openai/sol#medium');
  }
 });
+test('scoped meters match exact canonical model labels and never a substring',()=>{
+ const q=multi();q.catalog.push({providerID:'anthropic',id:'fable',variants:[{id:'high'}]});
+ q.routingPolicy={version:1,enabled:true,roles:{builder:[{ref:'anthropic/fable#high',requiresScopedQuota:true},{ref:'openai/sol#medium'}]}};
+ q.pools.anthropic.windows.push({...weekly(-20,.5),scope:'model',model:'not-fable'});
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'openai/sol#medium');
+ q.pools.anthropic.windows.at(-1).model='Fable';
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'anthropic/fable#high');
+});
+test('normalized versioned Anthropic candidates honor explicit scoped family meters',()=>{
+ const now=Date.now(), reset=new Date(now+6*24*60*60_000).toISOString();
+ const raw=used=>({checked_at:new Date(now).toISOString(),extra_usage:{is_enabled:false},five_hour:{utilization:1,resets_at:new Date(now+60*60_000).toISOString()},seven_day:{utilization:10,resets_at:reset},limits:[{kind:'weekly_scoped',scope:{model:{id:'claude-fable-5-1',display_name:'Fable',family:'fable'}},percent:used,resets_at:reset}]});
+ const q=multi();q.catalog.push({providerID:'anthropic',id:'claude-fable-5-1',variants:[{id:'high'}]});
+ q.routingPolicy={version:1,enabled:true,roles:{builder:[{ref:'anthropic/claude-fable-5-1#high',requiresScopedQuota:true},{ref:'openai/sol#medium'}]}};
+ q.pools.anthropic=normalizeClaudeQuota(raw(20),{now});q.pools.openai.availability='unavailable';
+ const input={agent:'builder',routing:{complexity:'standard',risk:'normal'}};
+ assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'anthropic/claude-fable-5-1#high');
+ q.pools.openai.availability='available';q.pools.anthropic=normalizeClaudeQuota(raw(100),{now});
+ assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'openai/sol#medium');
+ const staleScoped=raw(20);staleScoped.limits[0].resets_at=new Date(now-60_000).toISOString();
+ q.pools.anthropic=normalizeClaudeQuota(staleScoped,{now});
+ assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'openai/sol#medium');
+});
+test('unknown scoped labels block provider routing, while known other-family caps stay unrelated',()=>{
+ const input={agent:'builder',routing:{complexity:'standard',risk:'normal'}};
+ const q=multi();q.catalog.push({providerID:'anthropic',id:'claude-fable-5-1',variants:[{id:'high'}]},{providerID:'anthropic',id:'claude-opus-5-5',variants:[{id:'high'}]});
+ q.routingPolicy={version:1,enabled:true,roles:{builder:[{ref:'anthropic/claude-opus-5-5#high'},{ref:'openai/sol#medium'}]}};
+ q.pools.anthropic.windows.push({...weekly(0,.5),scope:'model',model:'Fable',used_percent:100,remaining_percent:0});
+ assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'anthropic/claude-opus-5-5#high');
+ q.pools.anthropic.windows.at(-1).model='Claude Opus';
+ assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'openai/sol#medium');
+ q.routingPolicy={version:1,enabled:true,roles:{builder:[{ref:'anthropic/claude-fable-5-1#high'}]}};
+ assert.throws(()=>selectDispatchModel({...base,agent:{model:'anthropic/claude-opus-5-5#high'},input,quota:q}),error=>error.code==='ROUTING_QUOTA_SCOPE_UNAVAILABLE');
+});
 test('one available pool with an unknown reset falls back to the configured role',()=>{
  const q=multi();delete q.pools.anthropic;q.pools.openai.windows=[{scope:'account',used_percent:20,remaining_percent:80}];
  assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:q}).selected,'openai/balanced#medium');
+});
+test('an unknown weekly pace remains eligible alone but loses to a measured healthy peer',()=>{
+ const input={agent:'builder',routing:{complexity:'standard',risk:'normal'}};
+ const q=multi();q.pools.openai.windows=[{scope:'account',used_percent:20,remaining_percent:80,duration_minutes:300,pace_delta:-20,resets_at:new Date(Date.now()+60*60_000).toISOString()}];
+ q.pools.anthropic=pool('anthropic',-1,.5);
+ const mixed=selectDispatchModel({...base,input,quota:q});
+ assert.equal(mixed.selected,'anthropic/sonnet#high');
+ delete q.pools.anthropic;q.catalog=q.catalog.filter(model=>model.providerID==='openai');
+ const single=selectDispatchModel({...base,agent:{model:'openai/sol#medium'},input,quota:q});
+ assert.equal(single.selected,'openai/sol#medium');
+ assert.equal(single.pace,'unknown');
 });
 
 function fitPolicy() {
@@ -206,6 +251,7 @@ test('provisional preferred is neutral and task type inference remains backward 
  assert.equal(taskTypeFor({agent:'scout',routing:{}}),'exploration');
  assert.equal(taskTypeFor({agent:'harness-builder-high',routing:{}}),'implementation');
  assert.equal(taskTypeFor({agent:'deep-debugger-high',routing:{}}),'debugging');
+ assert.equal(taskTypeFor({agent:'harness-verifier',routing:{}}),'testing');
  assert.equal(taskTypeFor({agent:'reviewer',routing:{}}),'review');
 });
 test('task-fit policy validation rejects malformed evidence without leaking it',()=>{
@@ -247,4 +293,13 @@ test('policy reader rejects unsupported or malformed provider references',()=>{
  for (const ref of ['other/model#high','openai/nested/model#high','anthropic/model','openai/model#bad effort']) {
   assert.throws(()=>readRoutingPolicy({readFile:()=>JSON.stringify({version:1,enabled:true,roles:{builder:[{ref}]}})}),error=>error.code==='ROUTING_POLICY_INVALID' && !error.message.includes(ref));
  }
+});
+test('policy validation rejects unknown schema, invalid roles, profile refs, reserve, and scoped flags',()=>{
+ const valid={version:1,enabled:true,reservePercent:2,profiles:{known:{}},roles:{builder:[{ref:'openai/sol#medium',profile:'known',requiresScopedQuota:false}]}};
+ for (const mutate of [
+  policy=>{policy.extra=true;}, policy=>{policy.roles['harness-imposter']=policy.roles.builder;delete policy.roles.builder;},
+  policy=>{policy.reservePercent='2';}, policy=>{policy.roles.builder[0].requiresScopedQuota='false';},
+  policy=>{policy.roles.builder[0].profile='missing';}, policy=>{policy.roles.builder[0].unknown=true;},
+]) assert.throws(()=>{const policy=structuredClone(valid);mutate(policy);validateTaskFitPolicy(policy);},error=>error.code==='ROUTING_POLICY_INVALID');
+ assert.doesNotThrow(()=>validateTaskFitPolicy({version:1,enabled:true,roles:{'harness-verifier':[]}}));
 });

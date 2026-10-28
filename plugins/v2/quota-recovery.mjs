@@ -77,6 +77,6 @@ export async function deliverQuotaRecovery({ state, notify, target, now = Date.n
 
 export function quotaRecoverySyntheticInput(notice) {
   return {sessionID:notice.parentID,id:`msg_quota_${notice.receiptID}`,resume:false,
-    text:`Quota admission blocked for child ${notice.childID}. Receipt ${notice.receiptID}; inspect task_dispatch_status before any explicit recovery.`,
+    text:`Quota admission was blocked for child ${notice.childID} at generation ${notice.generation}. Receipt ${notice.receiptID}; inspect task_dispatch_status for current state before any explicit recovery.`,
     metadata:{type:'quota_admission_blocked',receiptID:notice.receiptID,childID:notice.childID,generation:notice.generation,requestKind:notice.requestKind, ...(notice.compactionID ? {compactionID:notice.compactionID} : {}),category:notice.category}};
 }

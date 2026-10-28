@@ -71,11 +71,15 @@ The generated profile in [configure.py](configure.py) maps roles as follows:
 | `harness-deep-debugger` | STRONG | Ambiguous failures and difficult debugging. |
 | `harness-architect` | STRONG | Design and consequential analysis; no shell or edits. |
 | `harness-reviewer` | STRONG | Correctness, regression and risk review; no shell or edits. |
+| `harness-verifier` | STRONG | Execute assigned checks and report results; no direct edit tool or delegation. Shell can write, so ownership and command approvals still apply. |
 | `harness-maximum` | MAXIMUM | Exceptional problems where the expected quality improvement justifies the capacity. |
 
 Only the router and coordinator delegate; other roles are terminal workers.
 Shell-capable roles still obey native command permissions. Assign executable checks
-to a capable worker rather than expecting a read-only reviewer to run them. A preflight
+using `operation:verify` and `harness-verifier`, preserving an explicitly requested
+OpenAI or Claude model. Verification implies shell capability and reserves write
+ownership, including for test-generated files; it is not a read-only sandbox.
+Static review stays with `harness-reviewer`. A preflight
 `TASK_DISPATCH_CAPABILITY_MISMATCH` means a new assignment selected an incapable
 role. The parent corrects that assignment while preserving the requested model
 and scope; the normal permission, ownership and financial checks still run. This
@@ -179,6 +183,12 @@ and provisional rather than inventing a winner for a provider family.
 | Complex or high risk | Declared supported-preferred candidates set the fit floor. Spare quota cannot silently substitute an acceptable model. If selection cannot meet the floor, the router reports `ROUTING_TASK_FIT_UNAVAILABLE`; an exact preferred configured model may still go through normal financial admission. |
 | Meaningful independent review | Prefer another family within the eligible fit/health group, without automatically creating a review. |
 | Explicit model or admitted continuation | Manual selection or recorded affinity wins; financial and native permission gates still apply. |
+
+With an enabled routing policy, new managed assignments must include `routing`
+complexity and risk; omission returns `ROUTING_ASSESSMENT_REQUIRED` before admission.
+Existing admitted children retain their identity and route, and native Build/Plan
+keep their stock contracts. Unknown policy fields, invalid reserves and unresolved
+profile references are rejected.
 
 The local fit policy is retained when quota reads fail. Invalid policy raises a
 sanitized error instead of falling through silently. Routing status records the
@@ -495,3 +505,27 @@ Headroom inspired our recoverable tool-result compression: the V2 harness now au
 ## License
 
 MIT. The OpenCode compatibility patch retains upstream attribution in `NOTICE` and `compat/LICENSE.opencode`.
+
+### Reviewing efficiency on real work
+
+Keep the default router and the native escape available while collecting ordinary
+work. Use `harness-metrics --help` to select the relevant root chats and time
+window, then compare direct-worker/native and routed tasks of similar scope.
+Track user-accepted outcomes, corrections, elapsed time and validation evidence
+alongside uncached input, cache reads and output. A reported completion is not
+user acceptance, and token shares are not subscription quota shares. Do not
+launch synthetic work just to evaluate routing. The provisional task-fit policy
+stays neutral until reviewed task evidence supports a preference.
+
+Anthropic usage-check failures now retain a sanitized reason (HTTP status, timeout,
+network failure or invalid response) and bounded retry-after seconds when available.
+Concurrent checks share the selected account's request; failures never authorize
+inference, switch accounts/providers, or reuse expired telemetry. A stored expired
+OAuth token tested outside the runtime is not proof that runtime refresh is broken.
+
+Private runtime releases can be staged from public source with explicit,
+hash-checked local adapters using `scripts/stage_private_release.py`. Source,
+installed and verified-live are separate states. Configuration, policy, instructions
+and launchers must be included in the verification manifest; see
+[release procedure](docs/recovery-release.md). Historical telemetry directories
+remain retained; reports covering the migration must account for both locations.

@@ -202,3 +202,21 @@ Claude-only admission requires its reviewed OAuth adapter and disabled usage
 credits; no Codex login or OpenAI financial-verification file is required. OpenAI
 admission still requires its own OAuth/account and financial checks. Unknown quota
 in an enabled pool never authorizes inference through a different provider.
+
+## Executable verification and admission metadata
+
+Use `harness-reviewer` for static analysis. Use `harness-verifier` with
+`operation:verify` for executed checks; the dispatcher requires shell even when
+the caller omits it from `requiredCapabilities`. Preserve an explicitly requested
+`provider/model#variant`. The verifier does not implement repairs and its direct
+edit tool is denied, but shell is not a read-only sandbox. Verification therefore
+retains workspace write ownership and native command approval checks. Existing
+workers keep their exact stored role; never replace an admitted child to change
+capabilities.
+
+Enabled policy requires complexity/risk metadata on every new managed assignment.
+An existing admitted continuation may omit it and retain its route. Native Build
+and Plan do not acquire this harness schema. A missing weekly meter is unknown,
+not on-pace: known weekly pacing wins among otherwise comparable candidates, while
+a single eligible pool with only short-window data remains usable. Stale reset
+windows remain ineligible until a fresh observation supports admission.

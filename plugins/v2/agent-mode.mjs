@@ -2,7 +2,7 @@
 // deliberately exact: configured harness roles must opt in through the
 // harness dispatch path instead of matching by a descriptive name.
 const nativeAgents = new Set(['build', 'plan', 'general', 'explore']);
-const harnessRoles = ['router', 'coordinator', 'scout', 'quick-builder', 'builder', 'builder-high', 'deep-debugger', 'deep-debugger-high', 'architect', 'reviewer', 'maximum', 'maximum-max'];
+const harnessRoles = ['router', 'coordinator', 'scout', 'quick-builder', 'builder', 'builder-high', 'deep-debugger', 'deep-debugger-high', 'architect', 'reviewer', 'verifier', 'maximum', 'maximum-max'];
 const roleAliases = new Map(harnessRoles.flatMap(role => [[role, role], [`harness-${role}`, role]]));
 
 // Role semantics may follow the visible alias, but persisted session and

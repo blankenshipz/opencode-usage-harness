@@ -23,7 +23,7 @@ export function hasCapability(agent, capability) {
   return capability === 'delegate' ? rules.some(r => r.action === action && r.resource !== '*' && effect(r.resource) !== 'deny') || effect('*') !== 'deny' : effect('*') !== 'deny';
 }
 const string = (value, name) => { if (typeof value !== 'string' || !value.trim() || value.length > 160 || /[\r\n\0]/.test(value)) throw new Error(`task-dispatch: valid ${name} is required`); return value; };
-const operations = ['inspect', 'implement', 'deploy', 'coordinate'];
+const operations = ['inspect', 'verify', 'implement', 'deploy', 'coordinate'];
 const capabilityMismatch = (agent, missing) => Object.assign(
   new Error(`task-dispatch: TASK_DISPATCH_CAPABILITY_MISMATCH: ${agent} cannot perform ${missing.join(', ')}; assignment validation failure; not native permission denial. No child was launched and no native execution, permission, or provider admission was attempted for this dispatch. Correct a new, unadmitted assignment by selecting an eligible role within the authorized scope; preserve any explicitly requested model. This does not clear previous denials; do not drop required capabilities, loosen permissions, or replace/resume an existing child under another role.`),
   { code: 'TASK_DISPATCH_CAPABILITY_MISMATCH', category: 'assignment_validation' },
@@ -126,7 +126,9 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
   };
   const paths = (input, agent) => {
     if (input.operation === 'deploy') return ['.'];
-    if (input.operation !== 'implement' && !input.requiredCapabilities.includes('edit') && !hasCapability(agent, 'edit')) return [];
+    // Executable checks may mutate via shell even when the edit tool is denied.
+    if (input.operation === 'verify' && !input.writePaths?.length) return ['.'];
+    if (input.operation !== 'implement' && input.operation !== 'verify' && !input.requiredCapabilities.includes('edit') && !hasCapability(agent, 'edit')) return [];
     return (input.writePaths?.length ? input.writePaths : ['.']).map(p => {
       const relative = path.relative(workspace, path.resolve(workspace, p));
       if (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative) || /[*?\0]/.test(relative)) throw new Error('task-dispatch: writePaths must be literal workspace-relative paths or directories');
@@ -194,11 +196,12 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       if (!agent || agent.disabled) throw new Error(`task-dispatch: role ${input.agent} is unavailable`);
       const required = new Set(input.requiredCapabilities);
       if (input.operation === 'implement') required.add('edit');
-      if (input.operation === 'deploy') required.add('shell');
+      if (['deploy','verify'].includes(input.operation)) required.add('shell');
       if (input.operation === 'coordinate') required.add('delegate');
       // Known executable requests cannot masquerade as file-only scouting.
       if (input.operation !== 'coordinate' && /\b(?:git history|commit history|git\s+(?:log|show|status|diff|rev-parse))\b/i.test(input.prompt)) required.add('shell');
       const role = canonicalHarnessRole(input.agent) ?? input.agent;
+      if (role === 'verifier' && input.operation !== 'verify') throw new Error('task-dispatch: verifier requires operation verify and retained write ownership');
       if (role === 'coordinator' && (input.operation !== 'coordinate' || !required.has('delegate'))) throw new Error('task-dispatch: coordinator requires operation coordinate and terminal-worker delegation');
       const missing = [...required].filter(c => !hasCapability(agent,c));
       if (missing.length) {
@@ -231,6 +234,19 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       // Optional planning telemetry is advisory only. Read it after all local
       // assignment validation so an impossible request has no quota side effect.
       const routingPolicy = loadRoutingPolicy();
+      if (routingPolicy?.enabled === true && !input.routing) {
+        // Existing admitted work keeps its route; only new managed assignments
+        // must supply the assessment that enables pacing and quality floors.
+        const admitted = await registry(workspace, async state => {
+          const sessions = await loadSessions(), rootID = lineage(sessions, context.sessionID);
+          const key = `${rootID}\0${input.taskId}\0${input.workKey}`;
+          const record = state.records.find(r => r.key === key);
+          const denied = suppression(record, input);
+          if (denied) throw new Error(`task-dispatch: admission remains denied (${denied.category}). ${denialAdvice(denied.category)} Inspect task_dispatch_status for the receipt.`);
+          return Boolean(record?.childID && (!input.sessionID || input.sessionID === record.childID));
+        });
+        if (!admitted) throw new Error('ROUTING_ASSESSMENT_REQUIRED: new managed assignments require routing complexity and risk; no work was admitted.');
+      }
       let quota;
       if (input.routing) { try { quota = await loadQuota(ctx); } catch (error) {
         if (error?.code === 'ROUTING_POLICY_INVALID') throw error;
@@ -402,8 +418,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       if (reconciled) await save();
       try {
         let delivered=false;
-        for (const record of state.records.filter(r=>r.rootID===rootID&&r.parentID===rootID&&r.childID&&r.admissionGeneration)) {
-          const recovered = await deliverQuotaRecovery({state,target:{parentID:rootID,childID:record.childID,generation:record.admissionGeneration},notify:quotaNotifier,now});
+        for (const record of state.records.filter(r=>r.rootID===rootID&&r.parentID&&r.childID&&r.admissionGeneration)) {
+          const recovered = await deliverQuotaRecovery({state,target:{parentID:record.parentID,childID:record.childID,generation:record.admissionGeneration},notify:quotaNotifier,now});
           delivered ||= recovered.delivered.length > 0;
         }
         if (delivered) await save();
@@ -412,8 +428,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }
-      const knownParentIDs=new Set(state.records.filter(r=>r.rootID===rootID).map(r=>r.parentID));
-      return {content:JSON.stringify({owners,quotaRecoveryPending:pendingQuotaRecovery(state,{parentID:rootID}).filter(entry=>knownParentIDs.has(entry.target.parentID)),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
+      const currentRecovery = entry => state.records.some(r => r.rootID===rootID && r.parentID===entry.target.parentID && r.childID===entry.target.childID && r.admissionGeneration===entry.target.generation);
+      return {content:JSON.stringify({owners,quotaRecoveryPending:pendingQuotaRecovery(state).filter(currentRecovery),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))})};
     })});
   });
   return { dispose: () => workerProgress.dispose(), outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
