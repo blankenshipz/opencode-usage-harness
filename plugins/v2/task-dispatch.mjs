@@ -24,6 +24,7 @@ export function hasCapability(agent, capability) {
 }
 const string = (value, name) => { if (typeof value !== 'string' || !value.trim() || value.length > 160 || /[\r\n\0]/.test(value)) throw new Error(`task-dispatch: valid ${name} is required`); return value; };
 const operations = ['inspect', 'verify', 'implement', 'deploy', 'coordinate'];
+const routingKeys = new Set(['complexity','risk','taskType','reviewOf','reviewOfChildID','reviewIndependence']);
 const capabilityMismatch = (agent, missing) => Object.assign(
   new Error(`task-dispatch: TASK_DISPATCH_CAPABILITY_MISMATCH: ${agent} cannot perform ${missing.join(', ')}; assignment validation failure; not native permission denial. No child was launched and no native execution, permission, or provider admission was attempted for this dispatch. Correct a new, unadmitted assignment by selecting an eligible role within the authorized scope; preserve any explicitly requested model. This does not clear previous denials; do not drop required capabilities, loosen permissions, or replace/resume an existing child under another role.`),
   { code: 'TASK_DISPATCH_CAPABILITY_MISMATCH', category: 'assignment_validation' },
@@ -49,7 +50,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   checkpoint: checkpointSchema,
   compact: {type:'boolean'}, resetModel: {type:'boolean'},
   workReview: {type:'object',additionalProperties:false,properties:{hypothesis:{type:'string',minLength:1,maxLength:500},evidenceReference:{type:'string',minLength:1,maxLength:500}},required:['hypothesis','evidenceReference']},
-  routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']},taskType:{type:'string',enum:TASK_TYPES},reviewOf:{type:'string',minLength:3,maxLength:240}},required:['complexity','risk']},
+  routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']},taskType:{type:'string',enum:TASK_TYPES},reviewOf:{type:'string',minLength:3,maxLength:240},reviewOfChildID:{type:'string',minLength:1,maxLength:240},reviewIndependence:{type:'string',enum:['preferred','required']}},required:['complexity','risk']},
   recovery: { type: 'object', additionalProperties: false, properties: {
     kind: { type: 'string', enum: ['scope_changed','inputs_changed','authorization_changed'] }, scope: { type: 'string', minLength: 1, maxLength: 160 },
     inputs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 160 } },
@@ -66,6 +67,46 @@ const nativeSubagentSchema = { type:'object', additionalProperties:false, proper
 }, required:['agent','description','prompt'] };
 const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
 const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
+// `reviewOf` predates durable worker provenance and remains a routing hint for
+// compatible callers.  A child ID is the only way a managed dispatch may make
+// a verified family claim or require cross-family review.
+function resolveReviewProvenance({ input, state, sessions, rootID, record, requested }) {
+  const routing=input.routing;
+  const persisted=record?.routing?.reviewProvenance;
+  if (requested===record?.childID && persisted?.childID && modelReference(persisted.model) && record.routing?.reviewIndependence==='required') {
+    if (routing?.reviewOfChildID && routing.reviewOfChildID!==persisted.childID)
+      throw new Error('task-dispatch: review continuation must retain its admitted author reference');
+    if (routing?.reviewIndependence && routing.reviewIndependence!=='required')
+      throw new Error('task-dispatch: review continuation must retain its admitted independence requirement');
+    if (routing?.reviewOf && modelReference(routing.reviewOf)!==persisted.model)
+      throw new Error('task-dispatch: review continuation must retain its admitted author model');
+    if (input.model && modelReference(input.model)!==record.routing.selected)
+      throw new Error('task-dispatch: required review continuation must retain its admitted reviewer model');
+    return {...input,routing:{...(routing ?? {}),reviewOf:persisted.model,reviewOfChildID:persisted.childID,reviewIndependence:'required',reviewProvenance:persisted}};
+  }
+  if (!routing?.reviewOfChildID) {
+    if (routing?.reviewIndependence === 'required') {
+      throw new Error('task-dispatch: required cross-family review needs routing.reviewOfChildID from an admitted implementation worker');
+    }
+    return input;
+  }
+  if (record?.routing?.reviewProvenance && requested===record.childID && routing.reviewOfChildID!==record.routing.reviewProvenance.childID)
+    throw new Error('task-dispatch: review continuation must retain its admitted author reference');
+  const owner=state.records.find(record=>record.rootID===rootID && record.childID===routing.reviewOfChildID);
+  const child=sessions.find(session=>session.id===routing.reviewOfChildID);
+  if (!owner || !child || lineage(sessions,child.id)!==rootID || child.parentID!==owner.parentID || child.agent!==owner.agent)
+    throw new Error('task-dispatch: review author reference is unknown, stale, or outside this root owner tree');
+  if (owner.operation!=='implement' || owner.state!=='completed' || owner.inFlight || child.active)
+    throw new Error('task-dispatch: review author must be a completed admitted implementation worker');
+  const selected=modelReference(owner.routing?.selected), observed=modelReference(child.model);
+  if (!selected || (observed && observed!==selected))
+    throw new Error('task-dispatch: review author model evidence is missing or disagrees with its admitted route');
+  if (routing.reviewOf !== undefined && modelReference(routing.reviewOf)!==selected)
+    throw new Error('task-dispatch: reviewOf does not match the admitted implementation worker model');
+  const provenance={childID:owner.childID,model:selected,source:'admitted_route'};
+  if (Number.isInteger(owner.admissionGeneration) && owner.admissionGeneration>0) provenance.generation=owner.admissionGeneration;
+  return {...input,routing:{...routing,reviewOf:selected,reviewProvenance:provenance}};
+}
 // Native runtime data only exposes the latest compaction.  Keep each observed
 // terminal generation separately so a prior failure cannot describe a later
 // successful request, and never infer an outcome from a different native ID.
@@ -185,7 +226,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       const checkpoint = normalizeCheckpoint(input.checkpoint);
       const review = input.workReview === undefined ? undefined : normalizeReviewAcknowledgement(input.workReview);
       if (input.compact !== undefined && typeof input.compact !== 'boolean') throw new Error('task-dispatch: invalid compact');
-      if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk) || (input.routing.taskType !== undefined && !TASK_TYPES.includes(input.routing.taskType)) || (input.routing.reviewOf !== undefined && !modelReference(input.routing.reviewOf)))) throw new Error('task-dispatch: invalid routing assessment');
+      if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk) || Object.keys(input.routing).some(key=>!routingKeys.has(key)) || (input.routing.taskType !== undefined && !TASK_TYPES.includes(input.routing.taskType)) || (input.routing.reviewOf !== undefined && !modelReference(input.routing.reviewOf)) || (input.routing.reviewOfChildID !== undefined && (typeof input.routing.reviewOfChildID!=='string' || !input.routing.reviewOfChildID.trim() || input.routing.reviewOfChildID.length>240 || /[\r\n\0]/.test(input.routing.reviewOfChildID))) || (input.routing.reviewIndependence !== undefined && !['preferred','required'].includes(input.routing.reviewIndependence)))) throw new Error('task-dispatch: invalid routing assessment');
       if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
@@ -322,7 +363,10 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           state.workReviews=(state.workReviews??[]).filter(r=>r.rootID!==rootID||r.taskId!==input.taskId);
           state.workReviews.push({rootID,taskId:input.taskId,steps:total.steps,continuations:total.continuations,...review,at:now()});
         }
-        const routing=selectDispatchModel({input,agent,agents,record,child,quota});
+        const routedInput=resolveReviewProvenance({input,state,sessions,rootID,record,requested});
+        const routing=selectDispatchModel({input:routedInput,agent,agents,record,child,quota});
+        if (routedInput.routing?.reviewProvenance) routing.reviewProvenance=routedInput.routing.reviewProvenance;
+        if (routedInput.routing?.reviewIndependence) routing.reviewIndependence=routedInput.routing.reviewIndependence;
         if (input.compact) {
           if (!requested || !checkpoint || !ctx.session?.compact) throw new Error('task-dispatch: compaction requires an existing worker, retained checkpoint and supported native compact API');
           if (sessions.some(s=>s.active&&(s.id===requested||descendant(sessions,s.id,requested)))) throw new Error('task-dispatch: wait for this worker and its descendants before checkpoint compaction');

@@ -163,6 +163,27 @@ peer; the harness never creates an automatic review.
 
 ### Task fit, model families and independent review
 
+`harness-router` is the default primary agent in generated harness profiles. Its
+own model stays configured; delegated tasks use the enabled peer-selection policy.
+Selecting native Build/Plan intentionally bypasses harness orchestration. External
+bridges must explicitly enter through the harness; installing the router does not
+make every client use it.
+
+The router decides **whether review is useful** before the dispatcher chooses a
+model. Skip extra review for trivial passing work. Prefer one bounded cross-family
+review for security, concurrency/state, substantial architecture, weak coverage or
+repeated failed repairs. Give the reviewer requirements, the diff and validation
+evidence; reconcile actionable findings and perform targeted repairs. Additional
+review needs a concrete unresolved risk. Spare quota alone is not a review trigger.
+Managed reviews identify the implementation worker with `routing.reviewOfChildID`;
+the dispatcher resolves its model rather than trusting a model-name claim.
+Use `reviewIndependence: "preferred"` normally and `"required"` for an explicit
+user requirement. Legacy `reviewOf` strings remain unverified hints.
+Same-family review remains valid when a suitable independent pool is unavailable;
+an explicit requirement for cross-family review must be reported as unavailable
+rather than silently substituted. A single-subscription installation remains valid.
+
+
 Selection combines **task fit → suitable model/effort peers → independent quota
 pace**. An optional `routing.taskType` classifies exploration, mechanical changes,
 implementation, debugging, architecture, testing, review or general work. Older
@@ -182,7 +203,7 @@ and provisional rather than inventing a winner for a provider family.
 | Standard, normal risk | A healthy supported-preferred candidate wins over acceptable peers; pressure or unavailability can justify an acceptable healthy peer for new work. |
 | Complex or high risk | Declared supported-preferred candidates set the fit floor. Spare quota cannot silently substitute an acceptable model. If selection cannot meet the floor, the router reports `ROUTING_TASK_FIT_UNAVAILABLE`; an exact preferred configured model may still go through normal financial admission. |
 | Meaningful independent review | Prefer another family within the eligible fit/health group, without automatically creating a review. |
-| Explicit model or admitted continuation | Manual selection or recorded affinity wins; financial and native permission gates still apply. |
+| Explicit model or admitted continuation | Manual selection or recorded affinity wins within any explicitly required review-independence constraint; financial and native permission gates still apply. |
 
 With an enabled routing policy, new managed assignments must include `routing`
 complexity and risk; omission returns `ROUTING_ASSESSMENT_REQUIRED` before admission.

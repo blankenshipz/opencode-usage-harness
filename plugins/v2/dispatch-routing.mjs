@@ -12,6 +12,7 @@ const CANDIDATE_KEYS = new Set(['ref','profile','enabled','requiresScopedQuota',
 function policyError() { return Object.assign(new Error('ROUTING_POLICY_INVALID: routing policy is invalid'), { code: 'ROUTING_POLICY_INVALID' }); }
 function taskFitError() { return Object.assign(new Error('ROUTING_TASK_FIT_UNAVAILABLE: no supported-preferred candidate is available for this task'), { code: 'ROUTING_TASK_FIT_UNAVAILABLE' }); }
 function scopeQuotaError() { return Object.assign(new Error('ROUTING_QUOTA_SCOPE_UNAVAILABLE: scoped quota is ambiguous or unavailable for the configured route'), { code: 'ROUTING_QUOTA_SCOPE_UNAVAILABLE' }); }
+function reviewFamilyError() { return Object.assign(new Error('ROUTING_REVIEW_FAMILY_UNAVAILABLE: a required cross-family review has no eligible different-family route'), { code: 'ROUTING_REVIEW_FAMILY_UNAVAILABLE' }); }
 function isRecord(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 export function validateTaskFitPolicy(policy) {
   if (!isRecord(policy)) throw policyError();
@@ -119,6 +120,13 @@ export function quotaPace(quota, now=Date.now(), provider='openai') {
 export function selectDispatchModel({input,agent,agents,record,child,quota}) {
   const configured=modelReference(agent.model), observed=modelReference(child?.model);
   const explicit=modelReference(input.model);
+  const reviewModel=modelReference(input.routing?.reviewProvenance?.model) ?? modelReference(input.routing?.reviewOf);
+  const reviewProvider=reviewModel?.split('/')[0];
+  const requiredCrossFamily=input.routing?.reviewIndependence==='required';
+  const requireIndependent=selected => {
+    if (requiredCrossFamily && (!reviewProvider || selected?.split('/')[0]===reviewProvider)) throw reviewFamilyError();
+    return selected;
+  };
   if (input.model!==undefined && !explicit) throw new Error('task-dispatch: invalid explicit model reference');
   if (input.resetModel!==undefined && typeof input.resetModel!=='boolean') throw new Error('task-dispatch: invalid resetModel');
   let override=input.resetModel ? undefined : record?.modelOverride;
@@ -127,14 +135,38 @@ export function selectDispatchModel({input,agent,agents,record,child,quota}) {
   if (!input.resetModel && observed && record?.routing?.selected && observed!==record.routing.selected) override=observed;
   override=explicit??override;
   const pace=quotaPace(quota,Date.now(),configured?.split('/')[0]);
+  // A verified required review keeps its admitted reviewer route through a
+  // continuation, including an explicit model that was already admitted.
+  if (requiredCrossFamily && record?.routing?.reviewProvenance && record.routing?.selected) {
+    const persistedFit=storedTaskFit(record.routing.taskFit);
+    return {selected:requireIndependent(record.routing.selected),configured,observed,source:'continuation_affinity',pace,modelOverride:override,...(persistedFit ? {taskFit:persistedFit} : {})};
+  }
   let selected=override??configured, source=override?'explicit_override':'configured_role';
   // Never reinterpret an admitted generation or change its provider on retry.
   if (!override && record?.routing?.selected) {
     const persistedFit=storedTaskFit(record.routing.taskFit);
-    return {selected:record.routing.selected,configured,observed,source:'continuation_affinity',pace,modelOverride:override,...(persistedFit ? {taskFit:persistedFit} : {})};
+    return {selected:requireIndependent(record.routing.selected),configured,observed,source:'continuation_affinity',pace,modelOverride:override,...(persistedFit ? {taskFit:persistedFit} : {})};
+  }
+  // Required independence is an admission constraint, rather than a diversity
+  // preference.  It may only use a currently eligible policy candidate; a
+  // configured role or override must not silently bypass an unhealthy peer.
+  if (requiredCrossFamily) {
+    let decision;
+    if (explicit) {
+      const policy=quota?.routingPolicy, role=canonicalHarnessRole(input.agent) ?? input.agent;
+      const candidates=policy?.roles?.[input.agent] ?? policy?.roles?.[role];
+      const candidate=Array.isArray(candidates) && candidates.find(item=>item?.ref===explicit);
+      if (!candidate) throw reviewFamilyError();
+      const explicitPolicy={...policy,roles:{...policy.roles,[input.agent]:[candidate]}};
+      decision=chooseCandidate({input,quota:{...quota,routingPolicy:explicitPolicy}});
+    } else decision=chooseCandidate({input,quota});
+    if (!decision) throw reviewFamilyError();
+    return {selected:decision.ref,configured,observed,source:decision.reason,pace:decision.pace,
+      modelOverride:explicit,behaviorProfile:decision.profile,reviewOf:input.routing?.reviewOf ?? null,
+      poolPacing:decision.pacing,taskFit:decision.taskFit,explanation:decision.explanation};
   }
   const decision = !override && chooseCandidate({input, quota});
-  if (decision) return {selected:decision.ref,configured,observed,source:decision.reason,pace:decision.pace,
+  if (decision) return {selected:requireIndependent(decision.ref),configured,observed,source:decision.reason,pace:decision.pace,
     modelOverride:override,behaviorProfile:decision.profile,reviewOf:input.routing?.reviewOf ?? null,
     poolPacing:decision.pacing,taskFit:decision.taskFit,explanation:decision.explanation};
   const fitContext=!override && taskFitContext({input,policy:quota?.routingPolicy});
@@ -150,7 +182,7 @@ export function selectDispatchModel({input,agent,agents,record,child,quota}) {
   if (!override && input.routing && quota?.routingPolicy?.version===1 && quota.routingPolicy.enabled===true
     && scopedQuotaUnavailable(selected,quota,Number.isFinite(quota.routingPolicy.reservePercent) ? quota.routingPolicy.reservePercent : 2)) throw scopeQuotaError();
   const fallbackFit=!override && selectedTaskFit({input,policy:quota?.routingPolicy,ref:selected});
-  return {selected,configured,observed,source,pace,modelOverride:override,...(!override ? {taskFit:fallbackFit ?? {taskType:taskTypeFor(input),band:'acceptable',evidenceStatus:'provisional',reason:'no_supported_preference'}} : {})};
+  return {selected:requireIndependent(selected),configured,observed,source,pace,modelOverride:override,...(!override ? {taskFit:fallbackFit ?? {taskType:taskTypeFor(input),band:'acceptable',evidenceStatus:'provisional',reason:'no_supported_preference'}} : {})};
 }
 
 
@@ -257,7 +289,8 @@ export function chooseCandidate({input,quota}) {
   if (!Array.isArray(candidates)) return;
   const fitContext=taskFitContext({input,policy});
   const reserve=Number.isFinite(policy.reservePercent)?Math.max(0,Math.min(10,policy.reservePercent)):2;
-  const author=modelReference(input.routing.reviewOf), authorProvider=author?.split('/')[0];
+  const author=modelReference(input.routing.reviewProvenance?.model) ?? modelReference(input.routing.reviewOf), authorProvider=author?.split('/')[0];
+  const requiredCrossFamily=input.routing.reviewIndependence==='required';
   const choices=candidates.flatMap((c,index)=>{
     if (!c || !modelReference(c.ref) || c.enabled===false) return [];
     // Role candidates are explicitly approved capability peers, not price-ranked.
@@ -267,7 +300,8 @@ export function chooseCandidate({input,quota}) {
     return [{...c,...state,index,independent,fit}];
   });
   if(!choices.length) return;
-  const eligible=fitContext.strict ? choices.filter(c=>c.fit.band==='preferred') : choices;
+  const eligible=(fitContext.strict ? choices.filter(c=>c.fit.band==='preferred') : choices)
+    .filter(c=>!requiredCrossFamily || c.independent);
   if (!eligible.length) return;
   // For requested independent review, prefer a capable different family when
   // its pool is healthy; a depleted pool never wins solely for diversity.

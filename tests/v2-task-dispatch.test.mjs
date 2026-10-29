@@ -569,3 +569,24 @@ test('routing assessment cannot mask an existing denial without a child',async t
  await assert.rejects(h.call(base),/admission remains denied/);
  assert.equal(h.calls.length,1);
 });
+
+test('review provenance binds a completed implementation owner and rejects forged, stale, or active references',async t=>{
+ const policy={version:1,enabled:true,roles:{reviewer:[{ref:'anthropic/reviewer#high'}]}};
+ const healthy={checked_at:new Date().toISOString(),availability:'available',credit_risk:'none',financial:{extra_usage_enabled:false},windows:[{scope:'account',used_percent:20,remaining_percent:80,duration_minutes:10080,pace_delta:0,resets_at:new Date(Date.now()+60_000).toISOString()}]};
+ const h=await harness(t,undefined,undefined,{loadRoutingPolicy:()=>policy,loadQuota:async()=>({catalog:[{providerID:'anthropic',id:'reviewer',variants:[{id:'high'}]}],pools:{anthropic:healthy}})});
+ const list=h.ctx.agent.list;h.ctx.agent.list=async()=>({data:[...(await list()).data,{id:'reviewer',model:'anthropic/reviewer#high',permissions:[{action:'shell',resource:'*',effect:'allow'},{action:'edit',resource:'*',effect:'deny'},{action:'subagent',resource:'*',effect:'deny'}]}]});
+ const author=await h.call({...base,model:'openai/author#medium',routing:{complexity:'standard',risk:'normal'}});
+ const review={...base,taskId:'release',workKey:'review',operation:'inspect',agent:'reviewer',description:'Review implementation',prompt:'Review completed implementation',requiredCapabilities:['shell'],writePaths:[],routing:{complexity:'complex',risk:'high',reviewOfChildID:author.metadata.sessionID,reviewIndependence:'required'}};
+ const accepted=await h.call(review);assert.equal(h.calls.at(-1).model,'anthropic/reviewer#high');
+ await h.registry('/project',async state=>assert.deepEqual(state.records.find(record=>record.workKey==='review').routing.reviewProvenance,{childID:author.metadata.sessionID,model:'openai/author#medium',source:'admitted_route',generation:1}));
+ const continued=await h.call({...review,sessionID:accepted.metadata.sessionID,routing:{complexity:'complex',risk:'high',reviewOfChildID:author.metadata.sessionID}});assert.equal(continued.metadata.sessionID,accepted.metadata.sessionID);assert.equal(h.calls.at(-1).model,'anthropic/reviewer#high');
+ await assert.rejects(h.call({...review,sessionID:accepted.metadata.sessionID,routing:{complexity:'complex',risk:'high',reviewOfChildID:author.metadata.sessionID,reviewIndependence:'preferred'}}),/retain its admitted independence requirement/);
+ await assert.rejects(h.call({...review,sessionID:accepted.metadata.sessionID,model:'openai/reviewer#high'}),/retain its admitted reviewer model/);
+ await assert.rejects(h.call({...review,workKey:'injected',routing:{...review.routing,reviewProvenance:{childID:'forged',model:'anthropic/forged#high'}}}),/invalid routing assessment/);
+ await assert.rejects(h.call({...review,workKey:'forged',routing:{...review.routing,reviewOf:'anthropic/forged#high'}}),/does not match/);
+ await assert.rejects(h.call({...review,workKey:'stale',routing:{...review.routing,reviewOfChildID:'missing'}}),/unknown, stale, or outside/);
+ h.sessions.find(session=>session.id===author.metadata.sessionID).active=true;
+ await assert.rejects(h.call({...review,workKey:'active'}),/completed admitted implementation/);
+ await assert.rejects(h.call({...review,workKey:'required-without-owner',routing:{complexity:'complex',risk:'high',reviewIndependence:'required'}}),/needs routing\.reviewOfChildID/);
+ assert.equal(h.calls.length,3);
+});

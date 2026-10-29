@@ -160,11 +160,26 @@ older plugin revisions do not implement these optional preference rules.
 
 ## Reviews and behavior profiles
 
-Set `routing.reviewOf` to the admitted model reference only when the task calls
-for a meaningful independent peer review. The policy prefers a capable healthy
-candidate from another provider family when available. This is a routing hint,
-not an automatic review: the parent must create and accept the review, and no
-review is generated merely because another pool has capacity.
+The router decides whether a review is worth doing. Skip routine passing edits;
+prefer one bounded review for security, concurrency/state, substantial architecture,
+weak test coverage or repeated failed repairs. Give requirements, the diff and test
+evidence before the author's conclusions. Reconcile findings and target repairs;
+additional review needs a concrete unresolved risk, not spare quota alone.
+
+For a managed review, pass `routing.reviewOfChildID` identifying the admitted
+implementation worker and `routing.reviewIndependence: "preferred"`. The dispatcher
+resolves the author's recorded model within the current task root. It prefers a
+healthy capable peer from another family; same-family review remains valid when
+an independent peer is unavailable. Report which actually ran.
+
+Use `reviewIndependence: "required"` only when the user explicitly requires a
+cross-family review. This requires a bound implementation worker and must fail
+before execution if an eligible different-family model cannot be selected. It does
+not authorize fallback, new subscriptions, additional spending or child replacement.
+Legacy `reviewOf` model strings remain advisory hints, not verified provenance.
+Single-pool installations retain normal and same-family review; a required
+cross-family request can be unavailable. Direct native or slash-command reviews do
+not automatically become provenance-bound harness reviews.
 
 Behavior profiles are version-specific. The example policy marks every profile
 `example_unvalidated`; replace its model references and record your own evidence.

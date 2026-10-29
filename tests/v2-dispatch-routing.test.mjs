@@ -89,6 +89,14 @@ test('cross-family review is optional and a single healthy pool remains useful',
  const result=selectDispatchModel({...base,agent:{model:'anthropic/opus#high'},input:{agent:'reviewer',routing:{complexity:'complex',risk:'high',reviewOf:'anthropic/sonnet#high'}},quota:q});
  assert.equal(result.selected,'anthropic/opus#high');assert.equal(result.source,'subscription_pool_selection');
 });
+test('required cross-family review fails closed when its only distinct-family peer is unhealthy',()=>{
+ const q=multi();q.pools.anthropic.availability='unavailable';
+ const input={agent:'reviewer',routing:{complexity:'complex',risk:'high',reviewOf:'openai/sol#medium',reviewIndependence:'required'}};
+ assert.throws(()=>selectDispatchModel({...base,agent:{id:'reviewer',model:'openai/sol#high'},input,quota:q}),error=>error.code==='ROUTING_REVIEW_FAMILY_UNAVAILABLE');
+ q.pools.anthropic=pool('anthropic',0);
+ assert.equal(selectDispatchModel({...base,agent:{id:'reviewer',model:'openai/sol#high'},input,quota:q}).selected,'anthropic/opus#high');
+ assert.throws(()=>selectDispatchModel({...base,agent:{id:'reviewer',model:'openai/sol#high'},input:{...input,model:'openai/sol#high'},quota:q}),error=>error.code==='ROUTING_REVIEW_FAMILY_UNAVAILABLE');
+});
 
 test('far-behind pools rank continuously instead of provider order',()=>{
  const q=multi();q.pools.openai=pool('openai',-25,.5);q.pools.anthropic=pool('anthropic',-45,.5);

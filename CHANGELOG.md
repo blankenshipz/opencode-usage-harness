@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — router-directed independent review
+
+- Let the router choose whether a bounded review is useful; avoid routine extra
+  review and quota-driven busywork. Preserve the configured primary router.
+- Bind managed review provenance to an admitted implementation worker and distinguish
+  preferred diversity from explicitly required cross-family review.
+- Document native/direct entry points and single-pool behavior honestly.
+
 ## Unreleased — routing and deployment hardening
 
 - Add explicit executable verification with shell capability checks, retained model
