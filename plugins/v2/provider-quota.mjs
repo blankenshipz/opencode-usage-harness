@@ -109,8 +109,14 @@ function claudeWindow(kind, source, raw, now, share) {
 
 export function normalizeClaudeQuota(raw, { now = Date.now(), maxAgeMs = DEFAULT_MAX_AGE_MS } = {}) {
   const pool = basePool('anthropic', now);
-  const checked = timestamp(raw?.checked_at ?? raw?.checkedAt) ?? now;
-  if (!raw || typeof raw !== 'object' || now - checked > maxAgeMs || checked > now + 5_000) { pool.reason = 'stale_or_invalid'; return pool; }
+  const checked = timestamp(raw?.checked_at ?? raw?.checkedAt);
+  if (raw?.quota_cache && typeof raw.quota_cache === 'object') pool.cache = {
+    stale: raw.quota_cache.stale === true,
+    verified_at: Number.isFinite(raw.quota_cache.verified_at) ? iso(raw.quota_cache.verified_at) : null,
+    cooldown_until: Number.isFinite(raw.quota_cache.cooldown_until) ? iso(raw.quota_cache.cooldown_until) : null,
+    error: typeof raw.quota_cache.error === 'string' ? raw.quota_cache.error : null,
+  };
+  if (!raw || typeof raw !== 'object' || checked === null || now - checked > maxAgeMs || checked > now + 5_000) { pool.reason = 'stale_or_invalid'; return pool; }
   pool.checked_at = iso(checked);
   const windows = [];
   const shares = Array.isArray(raw.weekly_scoped_shares) ? raw.weekly_scoped_shares : [];

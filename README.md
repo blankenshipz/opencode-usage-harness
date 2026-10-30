@@ -247,9 +247,13 @@ the public profile generator does not install that slash command automatically.
 Financial admission is separate from this advisory view. OpenAI checks matching
 OAuth identity, current Codex admission and the configured financial attestation
 (no purchased-credit balance, automatic top-up or reload). Claude checks selected
-subscription OAuth and disabled usage credits; its provider-enforced included
-quota remains the hard stop. Claude candidate routing rejects reported exhaustion,
-but the guard does not implement a separate Codex-style quota-check subprocess.
+subscription OAuth and disabled usage credits. Claude shares usage telemetry across
+routing and admission, and rejects confirmed applicable exhaustion. On a transient
+lookup failure, admission may use an existing verification of disabled usage credits
+for at most five minutes from its original successful read. Expired financial evidence,
+authentication failures, and enabled or unknown usage credits still block admission.
+The provider remains the final included-quota hard stop; no Codex-style subprocess
+is required for Claude.
 Neither path admits API-key billing or automatically retries with another provider.
 Account-side changes and concurrent usage mean these controls are not a billing
 guarantee; see [security boundaries](SECURITY.md).
@@ -263,8 +267,16 @@ durations remain labeled as estimates; missing reset/usage data cannot establish
 pace. Account-wide pace and model-scoped constraints are kept distinct.
 
 At meaningful dispatch boundaries, the parent supplies task complexity and risk.
-The provider readers cache successful data briefly (30 seconds), and telemetry
-older than two minutes is unsuitable for candidate selection. **If a usable account window for the role’s provider is more than ten percentage
+Codex retains its short-lived file cache and cross-process lock. Claude uses a
+60-second shared private cache and coalesces concurrent lookups across processes.
+Transient failures trigger a cooldown (respecting Retry-After, with bounded
+exponential backoff when needed), not repeated requests from each worker. Quota
+estimates older than two minutes remain unsuitable for candidate selection.
+The separate five-minute financial-verification limit never moves forward on a
+cache hit or failed lookup; stale quota does not mean unused capacity. See
+[Claude telemetry caching](docs/CLAUDE-SUBSCRIPTION.md#shared-telemetry-and-bounded-recovery).
+
+**If a usable account window for the role’s provider is more than ten percentage
 points ahead of pace, or has at most 10% remaining**, an explicitly routine,
 normal-risk `harness-builder` or `harness-deep-debugger` dispatch can use the configured
 `harness-quick-builder` model and variant within the same provider. This is a specific
@@ -540,8 +552,10 @@ stays neutral until reviewed task evidence supports a preference.
 
 Anthropic usage-check failures now retain a sanitized reason (HTTP status, timeout,
 network failure or invalid response) and bounded retry-after seconds when available.
-Concurrent checks share the selected account's request; failures never authorize
-inference, switch accounts/providers, or reuse expired telemetry. A stored expired
+Concurrent checks share the selected OAuth credential's private cache. Transient
+failures may reuse still-valid disabled-overage verification; failures themselves
+never grant admission. Auth failures, known exhaustion and expired financial evidence
+remain blocking. This does not retry inference or switch accounts/providers. A stored expired
 OAuth token tested outside the runtime is not proof that runtime refresh is broken.
 
 Private runtime releases can be staged from public source with explicit,

@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createV2Guard } from '../plugins/v2/subscription-guard.mjs';
-import { fetchAnthropicUsage } from '../plugins/v2/anthropic-subscription.mjs';
+import { createAnthropicUsageReader } from '../plugins/v2/anthropic-subscription.mjs';
+import { createQuotaCache } from '../plugins/v2/quota-cache.mjs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const codex = { auth_mode: 'chatgpt', tokens: { account_id: 'same-account' } };
 const openaiFinancial = { auto_top_up_off: true, automatic_reload_off: true, purchased_credit_balance_ui: 0, verified_at: '2026-10-20' };
@@ -9,19 +13,21 @@ const anthropicConnection = { type: 'credential', method: 'oauth' };
 const anthropicCredential = { type: 'oauth', methodID: 'claude-code', access: 'fake-access', metadata: { 'opencode-claude-auth/claude-code-oauth': 'v1' } };
 const anthropicProvider = { package: '@opencode/ai/providers/anthropic', settings: { baseURL: 'https://api.anthropic.com/v1' } };
 
-function event(providerID = 'anthropic') {
-  return { sessionID: 's1', agent: 'builder', kind: 'primary', model: { providerID, id: 'claude-opus' },
+function event(providerID = 'anthropic', modelID = 'claude-opus') {
+  return { sessionID: 's1', agent: 'builder', kind: 'primary', model: { providerID, id: modelID },
     baseURL: providerID === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://chatgpt.com/backend-api/codex' };
 }
 
 async function setup({ env = {}, connection = anthropicConnection, credential = anthropicCredential,
   provider = anthropicProvider, models = [{ providerID: 'anthropic', id: 'claude-opus' }], quota = () => 'ok',
-  usage = async () => ({ extra_usage: { is_enabled: false } }), openaiConnection, openaiCredential } = {}) {
+  usage = async () => ({ extra_usage: { is_enabled: false } }), openaiConnection, openaiCredential, clock = { now: Date.parse('2026-10-26T00:00:00.000Z') } } = {}) {
   const hooks = new Map(), quotaCalls = [], reads = [], usageCalls = [];
-  const plugin = createV2Guard({ now: () => '2026-10-26T00:00:00.000Z', env, append: () => {}, recordCompletion: () => {},
+  const cacheDirectory = await mkdtemp(join(tmpdir(), 'anthropic-guard-cache-'));
+  const plugin = createV2Guard({ now: () => new Date(clock.now).toISOString(), env, append: () => {}, recordCompletion: () => {},
     readJSON: file => { reads.push(file); return file.includes('.codex/auth.json') ? codex : openaiFinancial; },
     runQuota: args => { quotaCalls.push(args); return quota(args); },
-    readAnthropicUsage: async access => { usageCalls.push(access); return usage(access); } });
+    readAnthropicUsage: async access => { usageCalls.push(access); return usage(access); },
+    anthropicQuotaCache: createQuotaCache({ directory: cacheDirectory, now: () => clock.now }) });
   const providers = { anthropic: provider, openai: { package: '@opencode/ai/providers/openai', settings: { baseURL: 'https://chatgpt.com/backend-api/codex' } } };
   const ctx = {
     location: { directory: process.cwd() }, provider: {
@@ -31,8 +37,14 @@ async function setup({ env = {}, connection = anthropicConnection, credential = 
     integration: { connection: { active: async providerID => providerID === 'anthropic' ? connection : openaiConnection,
       resolve: async value => value === openaiConnection ? openaiCredential : credential } }, event: { subscribe: () => ({ async *[Symbol.asyncIterator]() {} }) },
   };
-  const cleanup = await plugin.setup(ctx);
-  return { hooks, quotaCalls, reads, usageCalls, cleanup };
+  const stop = await plugin.setup(ctx);
+  const cleanup = () => { stop(); return rm(cacheDirectory, { recursive: true, force: true }); };
+  return { hooks, quotaCalls, reads, usageCalls, cleanup, clock };
+}
+
+async function readerFixture() {
+  const directory = await mkdtemp(join(tmpdir(), 'anthropic-reader-cache-'));
+  return { reader: createAnthropicUsageReader({ cache: createQuotaCache({ directory }) }), cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
 
 test('Anthropic Claude Code OAuth admits only the Messages API and skips Codex quota checks', async () => {
@@ -76,10 +88,11 @@ test('Anthropic rejects API billing paths, enabled or unavailable usage, unsafe 
 
 test('Anthropic usage telemetry emits safe typed HTTP, timeout, network, and invalid-response diagnostics', async () => {
   const originalFetch = globalThis.fetch;
+  const fixtureReader = await readerFixture(); const fetchAnthropicUsage = fixtureReader.reader;
   try {
     const cases = [
       { access: 'http-401', fetch: async () => ({ ok: false, status: 401, headers: { get: () => 'private-header' }, json: async () => ({ error: 'private body' }) }), reason: 'http_error', status: 401 },
-      { access: 'rate-limited', fetch: async () => ({ ok: false, status: 429, headers: { get: () => '99999' }, json: async () => ({ error: 'private body' }) }), reason: 'http_error', status: 429, retry: 600 },
+      { access: 'rate-limited', fetch: async () => ({ ok: false, status: 429, headers: { get: () => '99999' }, json: async () => ({ error: 'private body' }) }), reason: 'http_error', status: 429, retry: 86400 },
       { access: 'timeout', fetch: async () => { const error = new Error('private token'); error.name = 'TimeoutError'; throw error; }, reason: 'timeout' },
       { access: 'network', fetch: async () => { throw new TypeError('private token'); }, reason: 'network_error' },
       { access: 'invalid', fetch: async () => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => { throw new Error('private body'); } }), reason: 'invalid_response' },
@@ -96,11 +109,12 @@ test('Anthropic usage telemetry emits safe typed HTTP, timeout, network, and inv
         return true;
       });
     }
-  } finally { globalThis.fetch = originalFetch; }
+  } finally { globalThis.fetch = originalFetch; await fixtureReader.cleanup(); }
 });
 
 test('Anthropic coalesces concurrent same-account telemetry reads and only caches a verified response', async () => {
   const originalFetch = globalThis.fetch;
+  const fixtureReader = await readerFixture(); const fetchAnthropicUsage = fixtureReader.reader;
   let calls = 0;
   let release;
   try {
@@ -111,7 +125,7 @@ test('Anthropic coalesces concurrent same-account telemetry reads and only cache
     };
     const first = fetchAnthropicUsage('coalesced-access');
     const second = fetchAnthropicUsage('coalesced-access');
-    await new Promise(resolve => setImmediate(resolve));
+    while (calls !== 1) await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(calls, 1);
     release();
     const [one, two] = await Promise.all([first, second]);
@@ -129,7 +143,7 @@ test('Anthropic coalesces concurrent same-account telemetry reads and only cache
     await assert.rejects(fetchAnthropicUsage('retry-after-invalid'), error => error.detail.reason === 'invalid_response');
     await fetchAnthropicUsage('retry-after-invalid');
     assert.equal(invalidCalls, 2, 'a failed response never becomes a cached admission');
-  } finally { globalThis.fetch = originalFetch; }
+  } finally { globalThis.fetch = originalFetch; await fixtureReader.cleanup(); }
 });
 
 test('Anthropic guard sanitizes usage diagnostics and coalesces concurrent selected-account checks', async () => {
@@ -137,7 +151,7 @@ test('Anthropic guard sanitizes usage diagnostics and coalesces concurrent selec
   const h = await setup({ usage: async () => new Promise(resolve => { resolveUsage = resolve; }) });
   const first = h.hooks.get('model.request')(event());
   const second = h.hooks.get('http.request')({ model: event().model, request: { url: 'https://api.anthropic.com/v1/messages' } });
-  await new Promise(resolve => setImmediate(resolve));
+  while (h.usageCalls.length !== 1) await new Promise(resolve => setTimeout(resolve, 5));
   assert.deepEqual(h.usageCalls, ['fake-access']);
   resolveUsage({ extra_usage: { is_enabled: false } });
   await Promise.all([first, second]);
@@ -156,6 +170,37 @@ test('Anthropic guard sanitizes usage diagnostics and coalesces concurrent selec
     return true;
   });
   failed.cleanup();
+});
+
+test('Anthropic hook admits only bounded stale disabled financial evidence and blocks enabled, auth, and applicable exhaustion', async () => {
+  const clock = { now: Date.parse('2026-10-26T00:00:00.000Z') }; let calls = 0;
+  const failure = transient => Object.assign(new Error('network'), { code: 'SUBSCRIPTION_ANTHROPIC_USAGE_CHECK_FAILED', detail: { reason: 'http_error', http_status: transient } });
+  const h = await setup({ clock, usage: async () => ++calls === 1 ? { extra_usage: { is_enabled: false } } : Promise.reject(failure(429)) });
+  await h.hooks.get('model.request')(event());
+  clock.now += 61_000;
+  await h.hooks.get('model.request')(event());
+  clock.now += 300_001;
+  await assert.rejects(h.hooks.get('model.request')(event()), /usage verification failed/); h.cleanup();
+  for (const usage of [
+    async () => ({ extra_usage: { is_enabled: true } }),
+    async () => { throw failure(401); },
+    async () => ({ extra_usage: { is_enabled: false }, five_hour: { utilization: 100 } }),
+    async () => ({ extra_usage: { is_enabled: false }, seven_day: { used_percent: 100 } }),
+    async () => ({ extra_usage: { is_enabled: false }, limits: [{ kind: 'weekly_scoped', scope: { model: { family: 'opus' } }, utilization: 100 }] }),
+  ]) {
+    const current = await setup({ usage });
+    await assert.rejects(current.hooks.get('model.request')(event()), /Subscription guard/); current.cleanup();
+  }
+  const unrelated = await setup({ usage: async () => ({ extra_usage: { is_enabled: false }, limits: [{ kind: 'weekly_scoped', scope: { model: { family: 'sonnet' } }, utilization: 100 }] }) });
+  await unrelated.hooks.get('model.request')(event()); unrelated.cleanup();
+  const fable = await setup({ usage: async () => ({ extra_usage: { is_enabled: false }, limits: [{ kind: 'weekly_scoped', scope: { model: { family: 'fable' } }, utilization: 100 }] }) });
+  await assert.rejects(fable.hooks.get('model.request')(event('anthropic', 'claude-fable-5-1')), /exhausted/); fable.cleanup();
+  const scopeFamily = await setup({ usage: async () => ({ extra_usage: { is_enabled: false }, limits: [{ kind: 'weekly_scoped', scope: { model_family: 'fable' }, usedPercent: 100 }] }) });
+  await assert.rejects(scopeFamily.hooks.get('model.request')(event('anthropic', 'claude-fable-5-1')), /exhausted/); scopeFamily.cleanup();
+  const displayFamily = await setup({ usage: async () => ({ extra_usage: { is_enabled: false }, limits: [{ kind: 'weekly_scoped', display_name: 'Fable', used_percent: 100 }] }) });
+  await assert.rejects(displayFamily.hooks.get('model.request')(event('anthropic', 'claude-fable-5-1')), /exhausted/); displayFamily.cleanup();
+  const otherVersion = await setup({ usage: async () => ({ extra_usage: { is_enabled: false }, limits: [{ kind: 'weekly_scoped', model: 'claude-fable-4', used_percent: 100 }] }) });
+  await otherVersion.hooks.get('model.request')(event('anthropic', 'claude-fable-5-1')); otherVersion.cleanup();
 });
 
 test('OpenAI continues through its existing Codex quota path when Anthropic is present in the inventory', async () => {

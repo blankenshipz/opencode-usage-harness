@@ -105,3 +105,39 @@ The routing policy is separately opt-in. It does not add Claude candidates to
 an OpenAI-only profile, and it does not retry a failed Claude request
 through another provider. See [native and multi-pool routing](NATIVE-AND-MULTI-POOL.md)
 for candidate, continuation and review behavior.
+
+
+## Shared telemetry and bounded recovery
+
+Claude routing and inference admission use the same private telemetry cache. A
+successful snapshot stays fresh for 60 seconds. Concurrent lookups for the same
+selected OAuth credential coalesce across processes, including after restart.
+Cache keys are opaque digests; credentials and raw provider errors must never be
+stored in cache records. Credential rotation starts a new verification boundary.
+
+A timeout, network failure, HTTP 429 or server failure is not quota exhaustion.
+After a transient failure the last verified snapshot may support inference only
+while its original disabled-usage-credits evidence is at most five minutes old.
+Cache reads and failed lookups never extend that deadline. Routing preserves the
+original timestamp and exposes stale/cooldown metadata; its existing two-minute
+freshness requirement still limits model-selection decisions.
+
+Failed lookups enter a cooldown. Numeric and HTTP-date Retry-After hints are
+retained with a one-day safety bound; absent or zero hints use
+backoff starting at 60 seconds and doubling up to ten minutes. A lookup makes one
+network attempt, with no internal retry loop. Cooldown expiry permits a later
+caller to check again; it does not automatically resume a worker or make an
+inference call.
+
+Authentication failures, invalid financial responses, enabled usage credits,
+confirmed applicable exhaustion, and expired financial verification remain
+blocking. A new unsafe response invalidates prior safe evidence. Switching model
+families must not treat a reported account-wide limit as a separate quota pool.
+No API-key fallback, account substitution, credit purchase or inference retry is
+introduced. The selected OAuth connection and endpoint checks still run for each
+request.
+
+The five-minute interval is a bounded trust window, not a provider-side billing
+lock: an account setting changed during it may not be observed immediately. Keep
+usage credits disabled in the account UI. Codex keeps its independent account,
+credit and quota checks; this Claude recovery policy does not relax them.

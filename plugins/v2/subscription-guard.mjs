@@ -6,7 +6,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { validateFinancial } from '../../config/guard-validation.mjs';
 import { anthropicPackage, assertAnthropicOverrides, assertAnthropicBaseURL, assertAnthropicHTTPURL,
-  assertAnthropicCredential, fetchAnthropicUsage, normalizeAnthropicUsageFailure, readSelectedClaudeUsage } from './anthropic-subscription.mjs';
+  assertAnthropicCredential, fetchAnthropicUsage, normalizeAnthropicUsageFailure, readSelectedClaudeUsage, anthropicUsageExhausted, sanitizeAnthropicUsage } from './anthropic-subscription.mjs';
+import { createQuotaCache } from './quota-cache.mjs';
 import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
 import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
 import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
@@ -21,8 +22,6 @@ const oauthMethods = new Set(['chatgpt-browser', 'chatgpt-headless']);
 const officialPackages = new Set(['@opencode/ai/providers/openai', '@opencode/ai/providers/openai/responses']);
 const allowedProviders = new Set(['openai', 'anthropic']);
 const quotaTimeout = 25000;
-const anthropicUsageCacheMs = 30000;
-const anthropicUsageCacheLimit = 16;
 const execFileAsync = promisify(execFile);
 const quotaErrorCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'EAGAIN', 'EMFILE', 'ENFILE',
   'ENOMEM', 'E2BIG', 'ETIMEDOUT', 'ENOBUFS', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER']);
@@ -95,9 +94,14 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     appendFileSync(path.join(telemetry, `${file}.jsonl`), JSON.stringify(value) + '\n', { mode: 0o600 });
   }, env = process.env, now = () => new Date().toISOString(), recordCompletion = value => persistCompletion({
     database: statePath('telemetry', 'completions.sqlite3'), value, python: env.HARNESS_PYTHON || 'python3', env,
-  }), registry = createRegistry(), readAnthropicUsage = fetchAnthropicUsage } = {}) {
-  const anthropicUsageCache = new Map();
-  const anthropicUsagePending = new Map();
+  }), registry = createRegistry(), readAnthropicUsage = fetchAnthropicUsage, anthropicQuotaCache } = {}) {
+  const quotaCache = anthropicQuotaCache ?? createQuotaCache({ now: () => Date.parse(now()) });
+  // The default reader already owns the process-shared cache used by routing.
+  // Injected readers are raw test/integration adapters and need that wrapper.
+  const cachedAnthropicUsage = readAnthropicUsage === fetchAnthropicUsage ? readAnthropicUsage : access => quotaCache('anthropic', access, () => readAnthropicUsage(access), {
+    safe: usage => usage?.extra_usage?.is_enabled === false && !anthropicUsageExhausted(usage),
+    sanitize: sanitizeAnthropicUsage,
+  });
   async function quota(operation) {
     const started = performance.now();
     try {
@@ -110,7 +114,7 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
   }
   async function verify(ctx, event) {
     if (!allowedProviders.has(event.model?.providerID)) throw new Error('Subscription guard: supported providers are OpenAI and Anthropic only.');
-    if (event.model.providerID === 'anthropic') return verifyAnthropic(ctx);
+    if (event.model.providerID === 'anthropic') return verifyAnthropic(ctx, event.model.id);
     return verifyOpenAI(ctx);
   }
   async function inventory(ctx) {
@@ -150,7 +154,7 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     validateFinancial(readJSON(path.join(managedConfigRoot, 'financial-verification.json')));
     await quota('check');
   }
-  async function verifyAnthropic(ctx) {
+  async function verifyAnthropic(ctx, modelID) {
     let provider;
     try { provider = (await ctx.provider.get({ providerID: 'anthropic' })).data; }
     catch { throw new Error('Subscription guard: effective Anthropic provider unavailable.'); }
@@ -166,25 +170,16 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     const access = credential.access;
     if (typeof access !== 'string' || access.length === 0)
       throw new Error('Subscription guard: Anthropic Claude Code OAuth access is unavailable.');
-    const timestamp = Date.parse(now());
-    for (const [key, entry] of anthropicUsageCache) if (entry.expiresAt <= timestamp) anthropicUsageCache.delete(key);
-    const cached = anthropicUsageCache.get(access);
-    if (cached && cached.expiresAt > timestamp) return;
-    let request = anthropicUsagePending.get(access);
-    if (!request) {
-      request = Promise.resolve().then(() => readAnthropicUsage(access));
-      anthropicUsagePending.set(access, request);
-    }
     let usage;
-    try { usage = await request; }
+    try { usage = await cachedAnthropicUsage(access); }
     catch (error) { throw normalizeAnthropicUsageFailure(error); }
-    finally { if (anthropicUsagePending.get(access) === request) anthropicUsagePending.delete(access); }
+    const verifiedAt = Number(usage?.quota_cache?.verified_at);
+    if (usage?.quota_cache && (!Number.isFinite(verifiedAt) || verifiedAt > Date.parse(now()) || Date.parse(now()) - verifiedAt > 300_000))
+      throw new Error('Subscription guard: Anthropic financial verification has expired. Admission remains blocked.');
     if (usage?.extra_usage?.is_enabled !== false)
       throw new Error('Subscription guard: Anthropic usage credits must be disabled before inference.');
-    if (anthropicUsageCache.size >= anthropicUsageCacheLimit) anthropicUsageCache.clear();
-    // Calculate freshness only after the successful telemetry read. This keeps
-    // a slow read from authorizing a request with stale telemetry.
-    anthropicUsageCache.set(access, { expiresAt: Date.parse(now()) + anthropicUsageCacheMs });
+    if (anthropicUsageExhausted(usage, modelID))
+      throw new Error('Subscription guard: Anthropic subscription quota is exhausted for this model or account.');
   }
   return {
     id: 'subscription.guard',
@@ -235,7 +230,7 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
         execute: async () => ({ content: JSON.stringify(await readProviderQuotas({
           providers: catalogProviders((await ctx.model.list()).data),
           readCodex: async () => JSON.parse(await quota('read')),
-          readClaude: () => readSelectedClaudeUsage(ctx, readAnthropicUsage),
+          readClaude: () => readSelectedClaudeUsage(ctx, cachedAnthropicUsage),
         })) }),
       }));
       await ctx.session.hook('model.request', async event => {

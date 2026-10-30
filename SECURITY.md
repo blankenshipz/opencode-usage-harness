@@ -9,3 +9,5 @@ The default generated profile asks before unknown shell operations. Unrestricted
 Integrity manifests detect changed installed files. They do not authenticate a publisher or prevent a malicious owner from changing both source and manifest. The installer does not download or execute remote install scripts. Runtime patch compatibility must be verified separately.
 
 Account attestations are user-supplied, can become stale, and are not an independent billing lock. No provider fallback, purchased-credit use, credit purchases, or auto-top-up configuration is implemented here.
+
+Claude telemetry recovery reuses verified disabled-overage evidence for at most five minutes from its original successful read. It does not observe account-setting changes instantaneously. Keep usage credits disabled; this bounded cache is not an account-side billing lock. Unsafe/authentication responses invalidate prior evidence, and expired financial verification cannot authorize inference.

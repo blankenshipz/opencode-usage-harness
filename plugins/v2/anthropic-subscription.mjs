@@ -36,18 +36,19 @@ export function assertAnthropicCredential(connection, credential) {
 }
 
 // Shared by admission and advisory routing. Never tries another account or API key.
-const usageCache = new Map();
-const usagePending = new Map();
+import { createQuotaCache } from './quota-cache.mjs';
 const usageFailureReasons = new Set(['http_error', 'timeout', 'network_error', 'invalid_response']);
-const retryAfterLimitSeconds = 600;
+const retryAfterLimitSeconds = 86_400;
 
 function retryAfterSeconds(response) {
   // This is the only response-header value retained. It is parsed into a small
   // bounded number before it can reach a native error or telemetry consumer.
   let value;
   try { value = response?.headers?.get?.('retry-after'); } catch { return; }
-  if (typeof value !== 'string' || !/^\d+(?:\.\d+)?$/.test(value)) return;
-  return Math.min(retryAfterLimitSeconds, Math.max(0, Math.ceil(Number(value))));
+  if (typeof value !== 'string') return;
+  const seconds = /^\d+(?:\.\d+)?$/.test(value) ? Number(value) : (Date.parse(value) - Date.now()) / 1000;
+  if (!Number.isFinite(seconds)) return;
+  return Math.min(retryAfterLimitSeconds, Math.max(0, Math.ceil(seconds)));
 }
 
 function usageFailure(reason, { status, retryAfter } = {}) {
@@ -82,14 +83,58 @@ export function normalizeAnthropicUsageFailure(error) {
   return usageFailure(timeout ? 'timeout' : 'network_error');
 }
 
-export async function fetchAnthropicUsage(access) {
-  const now = Date.now();
-  for (const [key, entry] of usageCache) if (entry.expires <= now) usageCache.delete(key);
-  const cached = usageCache.get(access);
-  if (cached) return cached.value;
-  const pending = usagePending.get(access);
-  if (pending) return pending;
-  const request = (async () => {
+const defaultQuotaCache = createQuotaCache();
+function accountExhausted(value) {
+  return [value?.five_hour, value?.seven_day].some(window => Number(window?.utilization ?? window?.percent ?? window?.used_percent ?? window?.usedPercent) >= 100 || window?.locked_reason);
+}
+const scalar = value => typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || value === null ? value : undefined;
+function safeWindow(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const allowed = ['utilization', 'percent', 'used_percent', 'usedPercent', 'resets_at', 'resetsAt', 'reset_at', 'locked_reason', 'kind', 'scope', 'model', 'display_name', 'model_display_name', 'model_family', 'is_active', 'active', 'duration_minutes', 'durationMins', 'allowance_percent_of_weekly', 'used_percent_of_weekly', 'limit_index'];
+  const result = {};
+  for (const key of allowed) if (scalar(value[key]) !== undefined) result[key] = value[key];
+  if (value.scope && typeof value.scope === 'object' && !Array.isArray(value.scope)) {
+    const model = value.scope.model;
+    if (typeof model === 'string') result.scope = { model };
+    else if (model && typeof model === 'object') result.scope = { model: Object.fromEntries(['id', 'display_name', 'family'].flatMap(k => typeof model[k] === 'string' ? [[k, model[k]]] : [])) };
+    if (typeof value.scope.model_family === 'string') (result.scope ??= {}).model_family = value.scope.model_family;
+  }
+  return result;
+}
+// Cache only the fields used for financial and quota decisions. OAuth/account
+// identifiers and arbitrary provider response fields never reach disk.
+export function sanitizeAnthropicUsage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { checked_at: new Date().toISOString(), extra_usage: { is_enabled: null } };
+  const result = { checked_at: typeof value.checked_at === 'string' ? value.checked_at : new Date().toISOString(),
+    extra_usage: { is_enabled: value.extra_usage?.is_enabled === true ? true : value.extra_usage?.is_enabled === false ? false : null } };
+  for (const name of ['five_hour', 'seven_day']) { const window = safeWindow(value[name]); if (window) result[name] = window; }
+  if (Array.isArray(value.limits)) result.limits = value.limits.map(safeWindow).filter(Boolean);
+  if (Array.isArray(value.weekly_scoped_shares)) result.weekly_scoped_shares = value.weekly_scoped_shares.map(safeWindow).filter(Boolean);
+  return result;
+}
+export function anthropicUsageExhausted(value, modelID) {
+  if (accountExhausted(value)) return true;
+  const id = String(modelID ?? '').toLowerCase();
+  return (value?.limits ?? []).some(limit => {
+    if (!(Number(limit?.utilization ?? limit?.percent ?? limit?.used_percent ?? limit?.usedPercent) >= 100 || limit?.locked_reason)) return false;
+    if (limit?.kind === 'session' || limit?.kind === 'weekly_all' || limit?.scope === 'account') return true;
+    const scope = limit?.scope?.model ?? limit?.model ?? limit?.display_name ?? limit?.model_display_name;
+    const scoped = typeof scope === 'object' ? (scope.id ?? scope.display_name) : scope;
+    if (typeof scoped === 'string' && id === scoped.toLowerCase()) return true;
+    const family = (typeof scope === 'object' ? scope.family : undefined) ?? limit?.scope?.model_family ?? limit?.model_family;
+    // Match only the explicit provider family segment (for example
+    // claude-fable-5-1), never an arbitrary substring or unknown label.
+    const selectedFamily = /^claude-([a-z0-9]+)(?:-\d|$)/i.exec(id)?.[1]?.toLowerCase();
+    const labels = [family, typeof scope === 'object' ? scope.id : scope, typeof scope === 'object' ? scope.display_name : undefined,
+      limit?.display_name, limit?.model_display_name].filter(value => typeof value === 'string').map(value => value.toLowerCase());
+    // Full model references must match the selected model exactly above. Only
+    // a bare family label (for example "fable") applies family-wide.
+    return selectedFamily !== undefined && labels.some(label => label === selectedFamily);
+  });
+}
+export function createAnthropicUsageReader({ cache = defaultQuotaCache } = {}) {
+  return async function fetchAnthropicUsage(access) {
+    return cache('anthropic', access, async () => {
     let response;
     try {
       response = await fetch('https://api.anthropic.com/api/oauth/usage', {
@@ -104,17 +149,11 @@ export async function fetchAnthropicUsage(access) {
     try { body = await response.json(); }
     catch { throw usageFailure('invalid_response'); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw usageFailure('invalid_response');
-    const value = { ...body, checked_at: new Date().toISOString() };
-    if (usageCache.size >= 16) usageCache.clear();
-    // Start the cache after a verified response arrives. A slow request can
-    // therefore never turn into an admission based on an already-expired read.
-    usageCache.set(access, { value, expires: Date.now() + 30000 });
-    return value;
-  })();
-  usagePending.set(access, request);
-  try { return await request; }
-  finally { if (usagePending.get(access) === request) usagePending.delete(access); }
+    return { ...body, checked_at: new Date().toISOString() };
+    }, { safe: value => value?.extra_usage?.is_enabled === false && !accountExhausted(value), sanitize: sanitizeAnthropicUsage });
+  };
 }
+export const fetchAnthropicUsage = createAnthropicUsageReader();
 export async function readSelectedClaudeUsage(ctx, reader = fetchAnthropicUsage) {
   const connection = await ctx.integration.connection.active('anthropic');
   const credential = await ctx.integration.connection.resolve(connection);
