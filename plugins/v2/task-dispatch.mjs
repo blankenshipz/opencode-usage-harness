@@ -4,7 +4,7 @@ import { checkpointSchema, normalizeCheckpoint, beginCheckpoint, acknowledgeTask
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { createRegistry, runtimeSessions, runtimeIntentSources, lineage, descendant, overlaps } from './dispatch-registry.mjs';
+import { createRegistry, runtimeSessions, runtimeIntentSources, runtimeCompletionReceipt, lineage, descendant, overlaps } from './dispatch-registry.mjs';
 import { intentSchema, getIntent, setIntent, bindIntent, renderIntent, renderIntentReference } from './task-intent.mjs';
 import { packageRoot } from './paths.mjs';
 import { createWorkerProgress } from './worker-progress.mjs';
@@ -83,7 +83,16 @@ function rebindRecovery(record, current) {
 // `reviewOf` predates durable worker provenance and remains a routing hint for
 // compatible callers.  A child ID is the only way a managed dispatch may make
 // a verified family claim or require cross-family review.
-function resolveReviewProvenance({ input, state, sessions, rootID, record, requested }) {
+async function validateBackgroundReceipt(owner, child, loadCompletionReceipt) {
+  const receipt=owner.completionReceipt,binding=owner.completionBinding;
+  if (!binding?.background) return;
+  if (!receipt || receipt.generation!==owner.admissionGeneration || receipt.generation!==binding.generation || receipt.marker!==binding.marker || receipt.promptHash!==binding.promptHash || !receipt.promptID || !receipt.assistantID || !receipt.idleID)
+    throw new Error('task-dispatch: review author completion receipt is missing or does not bind its admitted background generation');
+  const observed=await loadCompletionReceipt({sessionID:owner.childID,marker:binding.marker,promptHash:`${binding.promptHash},${binding.prefixedPromptHash}`});
+  if (!observed || ['promptID','assistantID','assistantSeq','idleID','idleSeq'].some(key=>observed[key]!==receipt[key]))
+    throw new Error('task-dispatch: review author completion receipt no longer matches the native terminal chain');
+}
+async function resolveReviewProvenance({ input, state, sessions, rootID, record, requested, loadCompletionReceipt }) {
   const routing=input.routing;
   const persisted=record?.routing?.reviewProvenance;
   if (requested===record?.childID && persisted?.childID && modelReference(persisted.model) && record.routing?.reviewIndependence==='required') {
@@ -95,7 +104,10 @@ function resolveReviewProvenance({ input, state, sessions, rootID, record, reque
       throw new Error('task-dispatch: review continuation must retain its admitted author model');
     if (input.model && modelReference(input.model)!==record.routing.selected)
       throw new Error('task-dispatch: required review continuation must retain its admitted reviewer model');
-    return {...input,routing:{...(routing ?? {}),reviewOf:persisted.model,reviewOfChildID:persisted.childID,reviewIndependence:'required',reviewProvenance:persisted}};
+    const validated=await resolveReviewProvenance({input:{...input,routing:{...(routing ?? {}),reviewOf:persisted.model,reviewOfChildID:persisted.childID,reviewIndependence:'required'}},state,sessions,rootID,loadCompletionReceipt});
+    if (validated.routing.reviewProvenance.generation!==persisted.generation)
+      throw new Error('task-dispatch: review continuation author generation changed; inspect current evidence before a new review assignment');
+    return validated;
   }
   if (!routing?.reviewOfChildID) {
     if (routing?.reviewIndependence === 'required') {
@@ -109,8 +121,15 @@ function resolveReviewProvenance({ input, state, sessions, rootID, record, reque
   const child=sessions.find(session=>session.id===routing.reviewOfChildID);
   if (!owner || !child || lineage(sessions,child.id)!==rootID || child.parentID!==owner.parentID || child.agent!==owner.agent)
     throw new Error('task-dispatch: review author reference is unknown, stale, or outside this root owner tree');
-  if (owner.operation!=='implement' || owner.state!=='completed' || owner.inFlight || child.active)
-    throw new Error('task-dispatch: review author must be a completed admitted implementation worker');
+  if (owner.operation!=='implement')
+    throw new Error('task-dispatch: review author must be an admitted implementation worker');
+  if (owner.inFlight)
+    throw new Error('task-dispatch: review author admission is still in flight; wait for its admitted generation to finish before dispatching review');
+  if (child.active)
+    throw new Error('task-dispatch: review author is still active; wait for the worker to become idle and for its admitted dispatch to record completion before dispatching review');
+  if (owner.state!=='completed')
+    throw new Error(`task-dispatch: review author has no completed admitted implementation generation (recorded state: ${owner.state ?? 'unknown'}); explicit generation-bound completion evidence is required before dispatching review`);
+  await validateBackgroundReceipt(owner,child,loadCompletionReceipt);
   const selected=modelReference(owner.routing?.selected), observed=modelReference(child.model);
   if (!selected || (observed && observed!==selected))
     throw new Error('task-dispatch: review author model evidence is missing or disagrees with its admitted route');
@@ -156,7 +175,7 @@ export function taskWorkStatus(state,rootID,taskId) {
   const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
-export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -386,7 +405,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           state.workReviews=(state.workReviews??[]).filter(r=>r.rootID!==rootID||r.taskId!==input.taskId);
           state.workReviews.push({rootID,taskId:input.taskId,steps:total.steps,continuations:total.continuations,...review,at:now()});
         }
-        const routedInput=resolveReviewProvenance({input,state,sessions,rootID,record,requested});
+        const routedInput=await resolveReviewProvenance({input,state,sessions,rootID,record,requested,loadCompletionReceipt});
         const routing=selectDispatchModel({input:routedInput,agent,agents,record,child,quota});
         if (routedInput.routing?.reviewProvenance) routing.reviewProvenance=routedInput.routing.reviewProvenance;
         if (routedInput.routing?.reviewIndependence) routing.reviewIndependence=routedInput.routing.reviewIndependence;
@@ -429,8 +448,15 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         const handoff = !admission.intent ? input.prompt : admission.fullIntent
           ? `${renderIntent(admission.intent,input.checkIds)}\n\nWorker assignment:\n${input.prompt}`
           : `${renderIntentReference(admission.intent,input.checkIds)}\n\nNext action:\n${input.prompt}`;
-        const boundedHandoff = `${handoff}\n\n${checkpointHandoff(checkpoint)}${admission.contextAdvice ? "\nHigh context: at the next completed boundary retain a concise checkpoint and ask the parent for same-session compact:true before further work." : ""}`;
-        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:admission.convergence ? `${boundedHandoff}\n\nConvergence advisory: ${admission.convergence.advisory}` : boundedHandoff,...(admission.childID?{sessionID:admission.childID}:{}),...(admission.routing.selected?{model:admission.routing.selected}:{}),background:backgroundDispatch(input) }, {
+        const marker=`task-dispatch-generation-${crypto.randomUUID()}`;
+        const baseHandoff = `${handoff}\n\n${checkpointHandoff(checkpoint)}${admission.contextAdvice ? "\nHigh context: at the next completed boundary retain a concise checkpoint and ask the parent for same-session compact:true before further work." : ""}`;
+        const markedHandoff = `${baseHandoff}\n\nDispatch completion marker: ${marker}`;
+        const boundedHandoff = admission.convergence ? `${markedHandoff}\n\nConvergence advisory: ${admission.convergence.advisory}` : markedHandoff;
+        const promptHash=crypto.createHash('sha256').update(boundedHandoff).digest('hex');
+        const prefixedPromptHash=crypto.createHash('sha256').update(`You are a subagent spawned by another session.\n${boundedHandoff}`).digest('hex');
+        const completionBinding={generation:admission.generation,marker,promptHash,prefixedPromptHash,background:backgroundDispatch(input)};
+        await update({completionBinding,completionReceipt:undefined});
+        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:boundedHandoff,...(admission.childID?{sessionID:admission.childID}:{}),...(admission.routing.selected?{model:admission.routing.selected}:{}),background:backgroundDispatch(input) }, {
           ...context, progress: async progress => {
             if(progress.sessionID) { observed=progress.sessionID;await update({childID:observed,state:'running'}); }
             return visible.native(progress);
@@ -470,6 +496,18 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       };
     });
     editor.add({name:'task_dispatch',description:`Capability-checked durable handoff. ${guidance}`,input:schema,execute:async(input,context)=>{const {output,...rendered}=await dispatch(input,context);return rendered;}});
+    editor.add({name:'task_dispatch_collect',description:'Collect an exact terminal receipt for one admitted background generation without inference. Legacy or unbound generations are not collectable.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1},workKey:{type:'string',minLength:1},sessionID:{type:'string',minLength:1},generation:{type:'integer',minimum:1}},required:['taskId','workKey','sessionID','generation']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
+      const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID),key=`${rootID}\0${input.taskId}\0${input.workKey}`,record=state.records.find(r=>r.key===key),child=sessions.find(s=>s.id===input.sessionID);
+      if (!record || record.parentID!==context.sessionID || record.childID!==input.sessionID || record.admissionGeneration!==input.generation) throw new Error('task-dispatch: collection must name the recorded parent, task, work key, child, and generation exactly');
+      const binding=record.completionBinding,current=getIntent(state,rootID,input.taskId);
+      if (!binding?.background || binding.generation!==input.generation) throw new Error('task-dispatch: this generation has no collectable background completion binding');
+      if (record.state==='completed' && record.completionReceipt?.generation===input.generation) return {content:JSON.stringify({sessionID:input.sessionID,generation:input.generation,status:'completed',receipt:record.completionReceipt})};
+      if (record.state!=='running' || record.inFlight || !child || lineage(sessions,input.sessionID)!==rootID || child.active || child.parentID!==record.parentID || child.agent!==record.agent || (modelReference(child.model)&&modelReference(child.model)!==modelReference(record.routing?.selected)) || current?.revision!==record.intentRevision || sessions.some(s=>s.active&&descendant(sessions,s.id,input.sessionID))) throw new Error('task-dispatch: generation is not at a collectable terminal boundary');
+      const receipt=await loadCompletionReceipt({sessionID:input.sessionID,marker:binding.marker,promptHash:`${binding.promptHash},${binding.prefixedPromptHash}`});
+      if (!receipt) throw new Error('task-dispatch: no exact terminal receipt exists for this background generation; idle alone is not completion');
+      record.state='completed';record.completionReceipt={generation:input.generation,marker:binding.marker,promptHash:binding.promptHash,...receipt};record.updatedAt=Date.now();await save();
+      return {content:JSON.stringify({sessionID:input.sessionID,generation:input.generation,status:'completed',receipt:record.completionReceipt})};
+    })});
     editor.add({name:'task_intent',description:'Read or revise the shared user outcome for this root task. Get returns valid root user-message IDs. Only the root goal owner may set; use expectedRevision to avoid overwriting corrections. Never store secret values.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1,maxLength:128},action:{type:'string',enum:['get','set']},expectedRevision:{type:'integer',minimum:0},intent:intentSchema},required:['taskId','action']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
       string(input.taskId,'taskId');
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID);
@@ -498,7 +536,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         }
         if (delivered) await save();
       } catch { /* status remains read-safe; the durable receipt stays pending for a later explicit retry */ }
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current);const awaiting=r.state==='running'&&!native?.active;return {...r,key:undefined,recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,nativeExecution:{active:!!native?.active,lastIdleOutcome:native?.lastIdleOutcome},workCheckpoint:checkpointStatus(r,now()),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current);const awaiting=r.state==='running'&&native?.active===false,eligibleForInspection=!!(r.completionBinding?.background&&awaiting&&!r.inFlight&&!sessions.some(s=>s.active&&descendant(sessions,s.id,r.childID)));return {...r,key:undefined,recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection,terminalEvidenceVerified:false,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},workCheckpoint:checkpointStatus(r,now()),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }

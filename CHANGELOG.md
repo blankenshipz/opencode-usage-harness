@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased — native wait visibility
+
+- Distinguish pending native questions and permissions from execution, including sessions still marked running. Keep inaccessible or malformed wait evidence unknown and preserve caller ancestry checks.
+- Add explicit generation-bound collection of background completion evidence and revalidate author provenance before review; no inference, status-triggered mutation or retroactive certification of legacy work.
+
 ## Unreleased — workflow recovery and honest optimization
 
 - Make invalid checkpoint fields actionable; clarify human-action status and Git-hook discipline.

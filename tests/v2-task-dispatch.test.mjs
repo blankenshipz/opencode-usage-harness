@@ -550,6 +550,37 @@ test('status distinguishes an idle native worker from stale recorded running wor
  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];
  assert.equal(status.recordedState,'running');assert.equal(status.effectiveState,'awaiting_result_collection');assert.deepEqual(status.nativeExecution,{active:false,lastIdleOutcome:'succeeded'});assert.equal(h.calls.length,1);
 });
+test('background collection requires an exact generation receipt and is idempotent',async t=>{
+ let reads=0;const h=await harness(t,undefined,undefined,{loadCompletionReceipt:async()=>{reads++;return {promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3};}});
+ const started=await h.call({...base,background:true});const id=started.metadata.sessionID;h.sessions.find(s=>s.id===id).active=false;
+ const collect={taskId:'release',workKey:'backend',sessionID:id,generation:1};
+ const first=JSON.parse((await h.call(collect,'task_dispatch_collect')).content);assert.equal(first.status,'completed');assert.equal(reads,1);
+ const second=JSON.parse((await h.call(collect,'task_dispatch_collect')).content);assert.equal(second.status,'completed');assert.equal(reads,1);
+ await assert.rejects(h.call({...collect,generation:2},'task_dispatch_collect'),/parent, task, work key, child, and generation exactly/);
+});
+test('background collection rejects foreign parent, active descendants, and legacy bindings',async t=>{
+ const receipt=async()=>({promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3});
+ const h=await harness(t,undefined,undefined,{loadCompletionReceipt:receipt});const started=await h.call({...base,background:true}),id=started.metadata.sessionID;h.sessions.find(s=>s.id===id).active=false;
+ const collect={taskId:'release',workKey:'backend',sessionID:id,generation:1};
+ await assert.rejects(h.call(collect,'task_dispatch_collect',id),/parent, task, work key, child, and generation exactly/);
+ h.sessions.push({id:'descendant',parentID:id,agent:'builder',directory:'/project',active:true});await assert.rejects(h.call(collect,'task_dispatch_collect'),/collectable terminal boundary/);h.sessions.pop();
+ await h.registry('/project',async(state,save)=>{delete state.records[0].completionBinding;await save();});await assert.rejects(h.call(collect,'task_dispatch_collect'),/no collectable background completion binding/);
+});
+test('collected background receipts survive plugin recreation and stale native evidence blocks review',async t=>{
+ let receipt={promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3};
+ const loadCompletionReceipt=async()=>receipt;
+ const h=await harness(t,undefined,undefined,{loadCompletionReceipt});
+ const author=await h.call({...base,background:true}),sessionID=author.metadata.sessionID;
+ h.sessions.find(s=>s.id===sessionID).active=false;
+ const args={taskId:'release',workKey:'backend',sessionID,generation:1};
+ const before=JSON.parse((await h.call(args,'task_dispatch_collect')).content);
+ h.tools.set('subagent',{...h.rawNative});
+ await installTaskDispatch(h.ctx,{registry:createRegistry(h.dir),loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user'],loadRoutingPolicy:()=>undefined,loadCompletionReceipt});
+ assert.deepEqual(JSON.parse((await h.call(args,'task_dispatch_collect')).content),before);
+ receipt=null;
+ await assert.rejects(h.call({...base,workKey:'review',operation:'inspect',agent:'builder',requiredCapabilities:['shell'],writePaths:[],routing:{complexity:'standard',risk:'normal',reviewOfChildID:sessionID,reviewIndependence:'preferred'}}),/receipt|evidence|generation/);
+ assert.equal(h.calls.length,1,'collection and rejected review must not start inference');
+});
 
 test('native model steps cannot escape an unfinished managed root',async t=>{
  const h=await harness(t);await h.call({...base,background:true});
@@ -622,13 +653,22 @@ test('review provenance binds a completed implementation owner and rejects forge
  const accepted=await h.call(review);assert.equal(h.calls.at(-1).model,'anthropic/reviewer#high');
  await h.registry('/project',async state=>assert.deepEqual(state.records.find(record=>record.workKey==='review').routing.reviewProvenance,{childID:author.metadata.sessionID,model:'openai/author#medium',source:'admitted_route',generation:1}));
  const continued=await h.call({...review,sessionID:accepted.metadata.sessionID,routing:{complexity:'complex',risk:'high',reviewOfChildID:author.metadata.sessionID}});assert.equal(continued.metadata.sessionID,accepted.metadata.sessionID);assert.equal(h.calls.at(-1).model,'anthropic/reviewer#high');
+ const authorIndex=h.sessions.findIndex(s=>s.id===author.metadata.sessionID),authorSession=h.sessions.splice(authorIndex,1)[0];
+ await assert.rejects(h.call({...review,sessionID:accepted.metadata.sessionID}),/unknown, stale, or outside/);
+ h.sessions.splice(authorIndex,0,authorSession);
+ await h.registry('/project',async(state,save)=>{state.records.find(r=>r.childID===author.metadata.sessionID).admissionGeneration=2;await save();});
+ await assert.rejects(h.call({...review,sessionID:accepted.metadata.sessionID}),/author generation changed/);
+ await h.registry('/project',async(state,save)=>{state.records.find(r=>r.childID===author.metadata.sessionID).admissionGeneration=1;await save();});
  await assert.rejects(h.call({...review,sessionID:accepted.metadata.sessionID,routing:{complexity:'complex',risk:'high',reviewOfChildID:author.metadata.sessionID,reviewIndependence:'preferred'}}),/retain its admitted independence requirement/);
  await assert.rejects(h.call({...review,sessionID:accepted.metadata.sessionID,model:'openai/reviewer#high'}),/retain its admitted reviewer model/);
  await assert.rejects(h.call({...review,workKey:'injected',routing:{...review.routing,reviewProvenance:{childID:'forged',model:'anthropic/forged#high'}}}),/invalid routing assessment/);
  await assert.rejects(h.call({...review,workKey:'forged',routing:{...review.routing,reviewOf:'anthropic/forged#high'}}),/does not match/);
  await assert.rejects(h.call({...review,workKey:'stale',routing:{...review.routing,reviewOfChildID:'missing'}}),/unknown, stale, or outside/);
  h.sessions.find(session=>session.id===author.metadata.sessionID).active=true;
- await assert.rejects(h.call({...review,workKey:'active'}),/completed admitted implementation/);
+ await assert.rejects(h.call({...review,workKey:'active'}),/review author is still active/);
+ h.sessions.find(session=>session.id===author.metadata.sessionID).active=false;
+ await h.registry('/project',async(state,save)=>{state.records.find(record=>record.workKey==='backend').state='running';await save();});
+ await assert.rejects(h.call({...review,workKey:'idle-without-completion'}),/no completed admitted implementation generation \(recorded state: running\)/);
  await assert.rejects(h.call({...review,workKey:'required-without-owner',routing:{complexity:'complex',risk:'high',reviewIndependence:'required'}}),/needs routing\.reviewOfChildID/);
  assert.equal(h.calls.length,3);
 });

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.dispatch_runtime import intent_sources, sessions
+from src.dispatch_runtime import completion_receipt, intent_sources, sessions
 from src.paths import opencode_db, ownership_dir, quota_cache_path, state_dir
 
 
@@ -59,6 +59,39 @@ class DispatchRuntimeTest(unittest.TestCase):
             self.assertEqual(ownership_dir(), Path("/tmp/harness-state/dispatch-ownership"))
             with self.assertRaisesRegex(RuntimeError, "HARNESS_OPENCODE_DB"):
                 opencode_db()
+
+    def test_completion_receipt_requires_one_exact_prompt_terminal_assistant_and_idle(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup); db = Path(tmp.name) / "opencode.db"
+        marker = "marker-1"; text = f"work\nDispatch completion marker: {marker}"; digest = __import__('hashlib').sha256(text.encode()).hexdigest()
+        with sqlite3.connect(db) as c:
+            c.executescript("create table session_v2 (id text, idle_outcome text); create table session_message (id text,session_id text,type text,seq integer,data text); create table session_inbox (id text,session_id text,type text,payload text,delivery text,enqueued_seq integer,time_created integer);")
+            c.execute("insert into session_v2 values ('child','succeeded')")
+            c.executemany("insert into session_message values (?,?,?,?,?)", [("prompt","child","user",1,json.dumps({"text":text})), ("answer","child","assistant",2,json.dumps({"finish":"stop","time":{"completed":2},"content":[{"type":"text","text":"done"}]})), ("idle","child","idle",3,json.dumps({"outcome":"succeeded"}))])
+        self.assertEqual(completion_receipt("child",marker,digest,db_path=db), {"promptID":"prompt","assistantID":"answer","assistantSeq":2,"idleID":"idle","idleSeq":3})
+        with sqlite3.connect(db) as c: c.execute("insert into session_message values (?,?,?,?,?)", ("later","child","user",4,json.dumps({"text":"later"})))
+        self.assertIsNone(completion_receipt("child",marker,digest,db_path=db))
+
+    def test_completion_receipt_rejects_tool_error_cancel_compaction_pending_and_ambiguous_prompt(self):
+        marker="marker-2"; text=f"work\nDispatch completion marker: {marker}"; digest=__import__('hashlib').sha256(text.encode()).hexdigest()
+        def make(assistant, extra=None, inbox=None, duplicate=False):
+            tmp=tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup); db=Path(tmp.name)/"opencode.db"
+            with sqlite3.connect(db) as c:
+                c.executescript("create table session_v2 (id text, idle_outcome text); create table session_message (id text,session_id text,type text,seq integer,data text); create table session_inbox (id text,session_id text,type text,payload text,delivery text,enqueued_seq integer,time_created integer);")
+                c.execute("insert into session_v2 values ('child','succeeded')")
+                rows=[("prompt","child","user",1,json.dumps({"text":text})),("answer","child","assistant",2,json.dumps(assistant)),("idle","child","idle",3,json.dumps({"outcome":"succeeded"}))]
+                if extra: rows.append(extra)
+                if duplicate: rows.insert(1,("prompt2","child","user",1,json.dumps({"text":text})))
+                c.executemany("insert into session_message values (?,?,?,?,?)",rows)
+                if inbox: c.execute("insert into session_inbox values ('queued','child','message',?,'queued',1,1)",(json.dumps({"text":text}),))
+            return db
+        bad=[{"finish":"stop","time":{"completed":2},"content":[{"type":"tool","name":"read"}]}, {"finish":"error","time":{"completed":2},"content":[{"type":"text","text":"no"}]}, {"finish":"cancelled","time":{"completed":2},"content":[{"type":"text","text":"no"}]}]
+        for assistant in bad: self.assertIsNone(completion_receipt("child",marker,digest,db_path=make(assistant)))
+        good={"finish":"stop","time":{"completed":2},"content":[{"type":"text","text":"done"}]}
+        self.assertIsNone(completion_receipt("child",marker,digest,db_path=make(good,("compact","child","compaction",4,json.dumps({})))) )
+        self.assertIsNone(completion_receipt("child",marker,digest,db_path=make(good,inbox=True)))
+        self.assertIsNone(completion_receipt("child",marker,digest,db_path=make(good,duplicate=True)))
+        self.assertIsNone(completion_receipt("child",marker,digest,db_path=make(good,("later-tool","child","assistant",4,json.dumps({"finish":"tool-calls","time":{"completed":4},"content":[]})))))
+        self.assertIsNone(completion_receipt("child",marker,digest,db_path=make({"finish":"stop","content":[{"type":"text","text":"done"}]})))
 
 
 if __name__ == "__main__":

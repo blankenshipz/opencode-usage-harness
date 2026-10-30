@@ -27,9 +27,51 @@ class RuntimeHealthTest(unittest.TestCase):
         db = self.db()
         with mock.patch.dict(os.environ, {"OPENCODE_SERVER_URL": "http://127.0.0.1:4096", "OPENCODE_SERVER_PASSWORD": "secret"}):
             with mock.patch.object(runtime_health, "_native_active", return_value=True):
-                self.assertEqual(runtime_health.inspect("child", caller_id="root", db_path=db)["assessment"], "active")
-            with mock.patch.object(runtime_health, "_native_active", return_value=False):
+                with mock.patch.object(runtime_health, "_native_pending", return_value=(False, False)):
+                    self.assertEqual(runtime_health.inspect("child", caller_id="root", db_path=db)["assessment"], "active")
+            with mock.patch.object(runtime_health, "_native_active", return_value=False), mock.patch.object(runtime_health, "_native_pending", return_value=(False, False)):
                 self.assertEqual(runtime_health.inspect("child", caller_id="root", db_path=db)["assessment"], "claim_without_owner")
+
+    def test_pending_native_questions_are_distinguished(self):
+        db = self.db()
+        env = {"OPENCODE_SERVER_URL": "http://127.0.0.1:4096", "OPENCODE_SERVER_PASSWORD": "secret"}
+        with mock.patch.dict(os.environ, env):
+            with mock.patch.object(runtime_health, "_native_active", return_value=False), mock.patch.object(runtime_health, "_native_pending", return_value=(True, False)):
+                self.assertEqual(runtime_health.inspect("child", caller_id="root", db_path=db)["assessment"], "pending_form")
+            with mock.patch.object(runtime_health, "_native_active", return_value=False), mock.patch.object(runtime_health, "_native_pending", return_value=(False, True)):
+                self.assertEqual(runtime_health.inspect("child", caller_id="root", db_path=db)["assessment"], "pending_permission")
+
+    def test_active_native_question_takes_precedence(self):
+        db = self.db()
+        env = {"OPENCODE_SERVER_URL": "http://127.0.0.1:4096", "OPENCODE_SERVER_PASSWORD": "secret"}
+        with mock.patch.dict(os.environ, env):
+            with mock.patch.object(runtime_health, "_native_active", return_value=True), mock.patch.object(runtime_health, "_native_pending", return_value=(True, False)):
+                self.assertEqual(runtime_health.inspect("child", caller_id="root", db_path=db)["assessment"], "pending_form")
+            with mock.patch.object(runtime_health, "_native_active", return_value=True), mock.patch.object(runtime_health, "_native_pending", return_value=(False, True)):
+                self.assertEqual(runtime_health.inspect("child", caller_id="root", db_path=db)["assessment"], "pending_permission")
+
+    def test_pending_item_must_belong_to_session(self):
+        payloads = [
+            {"data": [{"id": "form1", "sessionID": "other"}]},
+            {"data": [{"id": "per1", "sessionID": "child"}]},
+        ]
+        with mock.patch.object(runtime_health, "_native_json", side_effect=payloads):
+            self.assertEqual(runtime_health._native_pending("http://127.0.0.1:4096", "secret", "child"), (None, True))
+
+    def test_unavailable_pending_native_is_unknown(self):
+        db = self.db()
+        env = {"OPENCODE_SERVER_URL": "http://127.0.0.1:4096", "OPENCODE_SERVER_PASSWORD": "secret"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(runtime_health, "_native_active", return_value=False), mock.patch.object(runtime_health, "_native_pending", return_value=(None, False)):
+            result = runtime_health.inspect("child", caller_id="root", db_path=db)
+        self.assertEqual(result["assessment"], "unknown")
+
+    def test_idle_does_not_report_completion(self):
+        db = self.db()
+        env = {"OPENCODE_SERVER_URL": "http://127.0.0.1:4096", "OPENCODE_SERVER_PASSWORD": "secret"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(runtime_health, "_native_active", return_value=False), mock.patch.object(runtime_health, "_native_pending", return_value=(False, False)):
+            result = runtime_health.inspect("root", caller_id="root", db_path=db)
+        self.assertEqual(result["assessment"], "idle")
+        self.assertNotIn("completed", result)
 
     def test_unavailable_native_is_unknown(self):
         db = self.db()
@@ -47,6 +89,17 @@ class RuntimeHealthTest(unittest.TestCase):
             opener.open.return_value = response
             with mock.patch.object(runtime_health.urllib.request, "build_opener", return_value=opener):
                 self.assertIsNone(runtime_health._native_active("http://127.0.0.1:4096", "secret", "root"))
+
+    def test_active_entry_wins_over_historical_failed_entry(self):
+        response = mock.MagicMock()
+        response.headers = {}
+        response.read.return_value = json.dumps({"data": {"root": {"type": "running"}, "old": {"type": "failed"}}}).encode()
+        response.__enter__.return_value = response
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+        with mock.patch.object(runtime_health.urllib.request, "build_opener", return_value=opener):
+            self.assertTrue(runtime_health._native_active("http://127.0.0.1:4096", "secret", "root"))
+            self.assertFalse(runtime_health._native_active("http://127.0.0.1:4096", "secret", "old"))
 
     def test_missing_database_configuration_is_unknown(self):
         with mock.patch.dict(os.environ, {}, clear=True):

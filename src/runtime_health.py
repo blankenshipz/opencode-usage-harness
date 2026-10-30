@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 try:
     from .paths import opencode_db
@@ -20,8 +20,11 @@ except ImportError:
 
 
 _TIMEOUT = 5
+_PENDING_TIMEOUT = 1
 _LOOPBACK = {"127.0.0.1", "::1"}
 _MAX_RESPONSE_BYTES = 1024 * 1024
+_MAX_PENDING_ITEMS = 256
+_MAX_PENDING_ID_BYTES = 256
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -53,22 +56,26 @@ def _validate_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, "/api/session/active", "", ""))
 
 
-def _native_active(url: str, password: str, session_id: str) -> bool | None:
-    endpoint = _validate_url(url)
+def _native_json(endpoint: str, password: str, *, timeout: int = _TIMEOUT) -> Any | None:
     token = base64.b64encode(f"opencode:{password}".encode("utf-8")).decode("ascii")
     request = urllib.request.Request(endpoint, headers={"Authorization": f"Basic {token}", "Accept": "application/json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     try:
-        with opener.open(request, timeout=_TIMEOUT) as response:
+        with opener.open(request, timeout=timeout) as response:
             length = response.headers.get("Content-Length")
             if length is not None and int(length) > _MAX_RESPONSE_BYTES:
                 return None
             raw = response.read(_MAX_RESPONSE_BYTES + 1)
             if len(raw) > _MAX_RESPONSE_BYTES:
                 return None
-            payload = json.loads(raw)
+            return json.loads(raw)
     except (OSError, ValueError, urllib.error.URLError, urllib.error.HTTPError):
         return None
+
+
+def _native_active(url: str, password: str, session_id: str) -> bool | None:
+    endpoint = _validate_url(url)
+    payload = _native_json(endpoint, password)
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict):
         return None
@@ -79,6 +86,29 @@ def _native_active(url: str, password: str, session_id: str) -> bool | None:
     if not isinstance(entry, dict) or not isinstance(entry.get("type"), str):
         return None
     return entry["type"] == "running"
+
+
+def _native_pending(url: str, password: str, session_id: str) -> tuple[bool | None, bool | None]:
+    active_endpoint = _validate_url(url)
+    parts = urlsplit(active_endpoint)
+    prefix = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+    encoded_session = quote(session_id, safe="")
+    states: list[bool | None] = []
+    for kind in ("form", "permission"):
+        payload = _native_json(f"{prefix}/api/session/{encoded_session}/{kind}", password, timeout=_PENDING_TIMEOUT)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list) or len(data) > _MAX_PENDING_ITEMS:
+            states.append(None)
+            continue
+        valid = all(
+            isinstance(item, dict)
+            and item.get("sessionID") == session_id
+            and isinstance(item.get("id"), str)
+            and 0 < len(item["id"].encode("utf-8")) <= _MAX_PENDING_ID_BYTES
+            for item in data
+        )
+        states.append(len(data) > 0 if valid else None)
+    return states[0], states[1]
 
 
 def _session_claim(db_path: Path, session_id: str, caller_id: str | None) -> bool | None:
@@ -125,12 +155,23 @@ def inspect(session_id: str, *, caller_id: str | None = None, db_path: str | Pat
         native_active = None
     if native_active is None:
         assessment = "unknown"
-    elif native_active:
-        assessment = "active"
-    elif claimed:
-        assessment = "claim_without_owner"
     else:
-        assessment = "idle"
+        try:
+            pending_form, pending_permission = _native_pending(service[0], service[1], session_id)
+        except ValueError:
+            pending_form = pending_permission = None
+        if pending_form is True:
+            assessment = "pending_form"
+        elif pending_permission is True:
+            assessment = "pending_permission"
+        elif pending_form is None or pending_permission is None:
+            assessment = "unknown"
+        elif native_active:
+            assessment = "active"
+        elif claimed:
+            assessment = "claim_without_owner"
+        else:
+            assessment = "idle"
     return {"session": session_id, "claimed": claimed, "native_active": native_active, "assessment": assessment, "warning": "activity evidence is not proof of useful progress; operator reconciliation may be needed" if assessment in {"active", "claim_without_owner"} else None}
 
 

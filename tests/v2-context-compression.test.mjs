@@ -130,6 +130,9 @@ test('diagnostics classify skips and publication without retaining tool text',as
  assert.deepEqual(events.map(x=>x.reason),['prepared','protected_tool','below_minimum']);
  assert.equal(events[1].originalChars,source.length);
  assert.equal(unsupported.result.content,source);
+ const receipt={...base,id:'collection',tool:'task_dispatch_collect',status:'completed',result:{content:source}};
+ await hooks['execute.before'](receipt);await hooks['execute.after'](receipt);
+ assert.equal(receipt.result.content,source);assert.equal(events.at(-1).reason,'protected_tool');
  assert.ok(events.every(x=>Number.isInteger(x.processingMs) && !Object.values(x).includes(source)));
 });
 test('observer and diagnostics failures preserve native output',async()=>{

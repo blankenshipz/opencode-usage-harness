@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import sys
 from pathlib import Path
@@ -75,11 +76,73 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
         return rows
 
 
+def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_path: str | Path | None = None) -> dict[str, object] | None:
+    """Return only a terminal chain bound to one exact dispatched prompt."""
+    accepted = set(prompt_hash.split(","))
+    with _connect(db_path) as connection:
+        connection.execute("BEGIN")
+        columns = {r[1] for r in connection.execute("pragma table_info(session_v2)")}
+        if "idle_outcome" not in columns:
+            return None
+        # A queued prompt is not a finished generation, regardless of any older idle.
+        pending = connection.execute("SELECT 1 FROM session_inbox WHERE session_id=? AND delivery!='delivered' LIMIT 1", (session_id,)).fetchone()
+        if pending:
+            return None
+        candidates = []
+        for ident, payload in connection.execute("SELECT id,payload FROM session_inbox WHERE session_id=?", (session_id,)):
+            try: text = json.loads(payload).get("text")
+            except (TypeError, json.JSONDecodeError): text = None
+            if isinstance(text, str) and marker in text and hashlib.sha256(text.encode()).hexdigest() in accepted:
+                candidates.append((str(ident), None))
+        for ident, seq, data in connection.execute("SELECT id,seq,data FROM session_message WHERE session_id=? AND type='user' ORDER BY seq", (session_id,)):
+            try: text = json.loads(data).get("text")
+            except (TypeError, json.JSONDecodeError): text = None
+            if isinstance(text, str) and marker in text and hashlib.sha256(text.encode()).hexdigest() in accepted:
+                candidates.append((str(ident), int(seq)))
+        ids = {item[0] for item in candidates}
+        bound = [item for item in candidates if item[1] is not None]
+        if len(ids) != 1 or len(bound) != 1:
+            return None
+        prompt_id, prompt_seq = bound[0]
+        after = list(connection.execute("SELECT id,seq,type,data FROM session_message WHERE session_id=? AND seq>? ORDER BY seq", (session_id, prompt_seq)))
+        assistant = None
+        receipt = None
+        for ident, seq, kind, data in after:
+            if kind in ("user", "compaction"):
+                return None
+            if kind == "assistant":
+                if receipt is not None or assistant is not None: return None
+                try: item = json.loads(data)
+                except (TypeError, json.JSONDecodeError): return None
+                content = item.get("content")
+                text = "".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text") if isinstance(content, list) else ""
+                finish=item.get("finish")
+                completed=(item.get("time") or {}).get("completed")
+                if not isinstance(completed, (int, float)) or isinstance(completed, bool) or completed <= 0:
+                    return None
+                if item.get("error") or finish in ("error", "cancelled", "aborted"):
+                    return None
+                if finish == "stop":
+                    if receipt is not None or not text.strip(): return None
+                    assistant = (str(ident), int(seq))
+                elif finish not in ("tool-calls", "tool_calls", None):
+                    return None
+            elif kind == "idle" and assistant is not None:
+                try: outcome = json.loads(data).get("outcome")
+                except (TypeError, json.JSONDecodeError): return None
+                if outcome != "succeeded": return None
+                receipt = {"promptID": prompt_id, "assistantID": assistant[0], "assistantSeq": assistant[1], "idleID": str(ident), "idleSeq": int(seq)}
+        return receipt
+
+
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) == 2 and args[0] == "--intent-sources":
         print(json.dumps(intent_sources(args[1])))
+        return 0
+    if len(args) == 4 and args[0] == "--completion-receipt":
+        print(json.dumps(completion_receipt(args[1], args[2], args[3])))
         return 0
     print(json.dumps(sessions()))
     return 0

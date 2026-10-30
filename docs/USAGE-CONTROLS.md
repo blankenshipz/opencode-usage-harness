@@ -31,6 +31,22 @@ cannot be established. High-risk work and explicit overrides are not demoted.
 Behind-pace capacity does not automatically create work or reviews: the parent
 can choose stronger reasoning where the expected improvement warrants it.
 
+## Background completion and review
+
+A native idle state alone does not complete a harness assignment. For newly
+admitted background work, the parent can call `task_dispatch_collect` with the
+recorded `taskId`, `workKey`, child `sessionID` and admission `generation`. This
+read-only native inspection records a harness completion receipt only when the
+exact dispatched prompt has a terminal visible answer and a successful idle
+boundary. It does not send a prompt, resume inference or accept the overall task.
+
+Pending input, newer execution, compaction, cancellation or failed execution must
+not turn an older successful answer into the current result. Review admission
+rechecks the collected generation before using it as author provenance. Existing
+legacy background records without a generation binding cannot be retroactively
+certified by this tool; inspect their evidence explicitly rather than redispatching
+solely to obtain a completion flag. Status inspection never collects or starts work.
+
 ## Cumulative work and compact continuation
 
 The cooperative ten-minute/30-model-step slice remains. It asks the worker to

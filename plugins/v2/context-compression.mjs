@@ -172,7 +172,7 @@ export async function installContextCompression(ctx, options = {}) {
         if (nativeMcp) kind = 'json';
       }
       if (!kind) {
-        const protectedTool = ['read', 'patch', 'write', 'edit', 'task_dispatch', 'task_dispatch_status', 'task_intent', 'task_outcome', 'task_artifact'].includes(event.tool);
+        const protectedTool = ['read', 'patch', 'write', 'edit', 'task_dispatch', 'task_dispatch_collect', 'task_dispatch_status', 'task_intent', 'task_outcome', 'task_artifact'].includes(event.tool);
         const content = event.result?.content;
         const originalChars = typeof content === 'string' ? content.length : undefined;
         observe({ type: 'candidate', sessionID: event.sessionID, reason: protectedTool ? 'protected_tool' : 'unsupported_tool',
