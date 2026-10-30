@@ -59,7 +59,7 @@
         }
       },
       {
-        "ref": "anthropic/claude-sonnet-5-5#high",
+        "ref": "anthropic/claude-sonnet-5-5#medium",
         "profile": "claude-sonnet",
         "taskFit": {
           "implementation": {

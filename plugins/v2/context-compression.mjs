@@ -171,7 +171,13 @@ export async function installContextCompression(ctx, options = {}) {
           `${tool.options.namespace}_${tool.name.replace(/[^a-zA-Z0-9_-]/g, '_')}` === event.tool);
         if (nativeMcp) kind = 'json';
       }
-      if (!kind) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'unsupported_tool', processingMs: Date.now() - started }); return; }
+      if (!kind) {
+        const protectedTool = ['read', 'patch', 'write', 'edit', 'task_dispatch', 'task_dispatch_status', 'task_intent', 'task_outcome', 'task_artifact'].includes(event.tool);
+        const content = event.result?.content;
+        const originalChars = typeof content === 'string' ? content.length : undefined;
+        observe({ type: 'candidate', sessionID: event.sessionID, reason: protectedTool ? 'protected_tool' : 'unsupported_tool',
+          processingMs: Date.now() - started, originalChars }); return;
+      }
       const content = event.result.content;
       const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : content;
       if (!Array.isArray(blocks)) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'non_text_content', processingMs: Date.now() - started }); return; }

@@ -325,6 +325,8 @@ ceiling or a promised percentage saving.
 | **Bounded work and cumulative review** | A cooperative reminder after ten minutes or 30 prepared model steps asks for evidence and a next action; it does not cancel tools. At the next idle admission, 120 steps/six continuations per lane or 240 steps/12 continuations across the root task require an agent-supplied evidence-backed reassessment. Totals survive handoffs; this is not a new human approval gate. |
 | **Repeated-work detection** | Two continuations without new reported progress produce a convergence advisory. Changed wording, timestamps or artifact churn alone do not count as progress. Evidence remains self-reported and must be checked; the advisory is not an automatic stop or extra review call. |
 | **Verification reuse and retained diagnostics** | Instructions favor targeted checks, reuse of unaffected passing evidence and follow-up reviews of changed findings. Substantial checks retain stdout, stderr, exit status and revision in private receipts, with bounded previews and disk-space checks. Necessary tests still run; avoiding quota is not a reason to skip requested validation. |
+| **Actionable worker recovery** | Revised intent still requires parent authorization. Status identifies the existing child and current revision for an explicit rebind; no automatic inference or replacement worker. Human-action checkpoints use `status=blocked`, `progressState=needs_user_action`, and concrete blocker evidence. |
+| **Git workflow discipline** | Instructions prohibit precautionary hook bypasses and require explicit authorization to disable checks. Isolated launchers can preserve GitHub CLI's existing configuration directory without copying credentials or forwarding API tokens. Native permissions still apply. |
 | **Useful human/device attempts** | Optional verification records retain readiness, expected signal, result references and expiry so agents inspect prior evidence before asking for another live test. They do not verify a physical device themselves or turn expiry into an automatic retry. |
 | **Background completion and health visibility** | Sustained implementation, coordination and deployment default to native background work; completion resumes the parent. Guidance discourages polling and duplicate workers. Read-only health/status tools help distinguish stale status from execution; they do not automatically retry or restart services. |
 
@@ -568,3 +570,16 @@ installed and verified-live are separate states. Configuration, policy, instruct
 and launchers must be included in the verification manifest; see
 [release procedure](docs/recovery-release.md). Historical telemetry directories
 remain retained; reports covering the migration must account for both locations.
+
+### Routine effort and measured compression
+
+The example multi-pool policy selects Sonnet 5.5 **medium** for ordinary new
+builder assignments, alongside the OpenAI medium-effort peer. High-effort roles
+remain available for concrete complexity or risk. Validate model variants against
+your own catalog. Existing worker routes and explicit overrides are preserved;
+this policy change does not downgrade an admitted worker.
+
+Compression reports distinguish deliberately protected tools from unsupported
+formats and report observed skipped characters. `savings_status=no_observed_savings`
+is a valid result: small outputs and source reads do not justify forced compression.
+Prepared character reductions are not measured subscription-credit savings.

@@ -158,3 +158,18 @@ test('dependency waits stay in progress and require bounded non-self references'
  await tool.execute({taskId:'cp',scope:'checkpoint',status:'blocked',progressState:'needs_user_action',blocker:{kind:'authorization',evidence:'Operation awaits approval',nextAction:'User must approve operation'}},call());
  assert.equal(rows.at(-1).progressState,'needs_user_action');h.cleanup();
 });
+
+test('enum validation names the field without echoing invalid input, while needs_user_action remains a blocked outcome', async () => {
+ const rows=[], h=await harness(memoryPlugin(rows)), tool=h.tools.get('task_outcome');
+ await assert.rejects(tool.execute({taskId:'enum',scope:'checkpoint',status:'not-a-real-status<secret>'},call()), error => {
+   assert.match(error.message,/invalid status; expected one of/);
+   assert.doesNotMatch(error.message,/not-a-real-status|secret/);
+   return true;
+ });
+ await assert.rejects(tool.execute({taskId:'enum',scope:'checkpoint',status:'blocked',progressState:'needs_user_action',blocker:{kind:'not-a-kind',evidence:'approval is required',nextAction:'ask the user'}},call()), /invalid blocker\.kind; expected one of/);
+ await tool.execute({taskId:'enum',scope:'checkpoint',status:'blocked',progressState:'needs_user_action',blocker:{kind:'authorization',evidence:'approval is required',nextAction:'ask the user'}},call());
+ assert.equal(rows.at(-1).status,'blocked');
+ assert.equal(rows.at(-1).progressState,'needs_user_action');
+ assert.deepEqual(rows.at(-1).blocker,{kind:'authorization',evidence:'approval is required',nextAction:'ask the user'});
+ h.cleanup();
+});

@@ -25,3 +25,14 @@ Use separate XDG data/config/state/cache directories when running an isolated te
 The generated roles use your selected tier/variant references. Tune effort using real catalog variants; the generator does not infer a universal low/medium/high model hierarchy. Read-only roles cannot edit or execute shell commands. Router/coordinator can delegate; leaf workers cannot. Routine formatting/tests have selected allow rules while unfamiliar or consequential shell commands require approval.
 
 Model request admission applies provider-specific checks: OpenAI OAuth/account matching, local financial attestation and actual quota admission; Claude subscription OAuth and disabled usage credits. Both restrict provider endpoints and reject API-key fallback. Account controls remain the ultimate authority: this software cannot guarantee a subscription service will never charge credits. Do not use it to evade provider quotas or access restrictions.
+
+### Preserve GitHub CLI login in isolated launchers
+
+Before changing `XDG_CONFIG_HOME`, call
+`src.launcher_environment.github_cli_environment(home=..., original_env=...)`
+and merge its returned `GH_CONFIG_DIR` into the controlled environment. It
+preserves an explicit GitHub config directory, otherwise the original XDG config
+location or the user's normal `.config/gh`. It never reads or copies credential
+files and never forwards `GH_TOKEN`, `GITHUB_TOKEN` or inference API keys.
+Check `gh auth status` in the resulting runtime environment. This is authentication
+visibility, not authorization to create repositories, commit, push or publish.

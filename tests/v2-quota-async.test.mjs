@@ -1,4 +1,6 @@
 import test from 'node:test';
+import { rmSync } from 'node:fs';
+import { createQuotaCache } from '../plugins/v2/quota-cache.mjs';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -7,7 +9,8 @@ import { createV2Guard } from '../plugins/v2/subscription-guard.mjs';
 
 async function quotaTool(options, name='codex_quota', integration, providers=['openai','anthropic']) {
   let tool;
-  const cleanup = await createV2Guard(options).setup({
+  const cacheDirectory = await mkdtemp(join(tmpdir(), 'quota-async-cache-'));
+  const cleanup = await createV2Guard({ anthropicQuotaCache: createQuotaCache({ directory: cacheDirectory }), ...options }).setup({
     integration,
     model: {list:async()=>({data:providers.map(providerID=>({providerID}))})},
     provider: { transform: async () => {} },
@@ -15,7 +18,7 @@ async function quotaTool(options, name='codex_quota', integration, providers=['o
     session: { hook: async () => {} },
     event: { subscribe: () => ({ async *[Symbol.asyncIterator]() {} }) },
   });
-  return { tool, cleanup };
+  return { tool, cleanup() { cleanup(); rmSync(cacheDirectory, { recursive: true, force: true }); } };
 }
 
 async function fakeQuota(mode) {

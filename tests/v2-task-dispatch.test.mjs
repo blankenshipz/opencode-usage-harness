@@ -227,6 +227,20 @@ test('writers have disjoint ownership; deployment waits for existing writers',as
  await h.call({...base,workKey:'deploy',operation:'deploy',requiredCapabilities:['shell'],background:true});
  await assert.rejects(h.call({...base,workKey:'another-deploy',operation:'deploy',requiredCapabilities:['shell']}),/overlapping/);
 });
+test('continuation path retention cannot erase fresh writer or deploy workspace ownership',async t=>{
+ const h=await harness(t);const inspect=(await h.call({...base,background:true})).metadata.sessionID;
+ h.sessions.push({id:'active-writer',parentID:'root',agent:'builder',directory:'/project',active:true});
+ await h.registry('/project',async(state,save)=>{Object.assign(state.records[0],{operation:'inspect',writePaths:[]});state.records.push({key:'other-writer',rootID:'root',parentID:'root',childID:'active-writer',taskId:'other',workKey:'writer',agent:'builder',writePaths:['backend'],state:'running'});await save();});
+ await assert.rejects(h.call({...base,sessionID:inspect,background:true,writePaths:undefined}),/overlapping/);
+
+ const deploy=await harness(t);const implement=(await deploy.call({...base,background:true})).metadata.sessionID;
+ await deploy.call({...base,sessionID:implement,background:true,writePaths:['backend/api']});
+ await deploy.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['backend/api']));
+ deploy.sessions.push({id:'mobile-writer',parentID:'root',agent:'builder',directory:'/project',active:true});
+ await deploy.registry('/project',async(state,save)=>{state.records.push({key:'mobile-writer',rootID:'root',parentID:'root',childID:'mobile-writer',taskId:'mobile',workKey:'writer',agent:'builder',writePaths:['mobile'],state:'running'});await save();});
+ await assert.rejects(deploy.call({...base,sessionID:implement,operation:'verify',requiredCapabilities:['shell'],background:true,writePaths:undefined}),/overlapping/);
+ await assert.rejects(deploy.call({...base,sessionID:implement,operation:'deploy',requiredCapabilities:['shell'],background:true,writePaths:undefined}),/overlapping/);
+});
 test('legacy active workers block new writers; direct-child adoption preserves ownership',async t=>{
  const h=await harness(t);h.sessions.push({id:'legacy',parentID:'root',agent:'builder',directory:'/project',active:true});
  await assert.rejects(h.call(base),/untracked worker/);await h.call({...base,sessionID:'legacy',background:true});assert.equal(h.calls[0].sessionID,'legacy');
@@ -310,16 +324,44 @@ test('root correction parks old child and explicit same-child continuation rebin
  const h=await harness(t);const first=await h.call({...base,background:true});const id=first.metadata.sessionID;
  await assert.rejects(h.call({action:'set',taskId:'release',expectedRevision:1,intent:{...intent,target:'Physical phone',sourceMessageIDs:['msg_correction']}},'task_intent',id),/only the root/);
  await h.call({action:'set',taskId:'release',expectedRevision:1,intent:{...intent,target:'Physical phone',sourceMessageIDs:['msg_correction']}},'task_intent');
- await assert.rejects(h.hooks.get('model.request')({sessionID:id}),/superseded/);
+ await assert.rejects(h.hooks.get('model.request')({sessionID:id}),/rebind_same_child/);
+ const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];
+ assert.equal(status.needsRebind,true);assert.deepEqual(status.rebind,{action:'rebind_same_child',parentID:'root',childID:id,taskId:'release',workKey:'backend',agent:'builder',operation:'implement',writePaths:['backend'],previousIntentRevision:1,intentRevision:2,availableCheckIds:['backend'],advice:'The recorded parent must explicitly call task_dispatch with this sessionID, taskId/workKey, agent, operation, current intentRevision, and selected current checkIds. Omit writePaths to retain these paths; explicit paths remain subject to ownership checks. This does not authorize execution.'});
+ assert.equal(h.calls.length,1,'status reads recovery state without native inference');
  await assert.rejects(h.call({...base,sessionID:id}),/revision/i);
  await assert.rejects(h.call({...base,intentRevision:2}),/explicitly resume/);
- await h.call({...base,intentRevision:2,sessionID:id,background:true});
+ h.sessions.push({id:'other-parent',parentID:'root',agent:'router',directory:'/project',active:true});
+ await assert.rejects(h.call({...base,intentRevision:2,sessionID:id},'task_dispatch','other-parent'),/direct child/);
+ await assert.rejects(h.call({...base,intentRevision:2,sessionID:id,background:true}),/still active on a superseded revision/);
+ await h.registry('/project',async state=>assert.equal(state.records[0].intentRevision,1));
+ await assert.rejects(h.hooks.get('model.request')({sessionID:id}),/rebind_same_child/);
+ h.sessions.find(session=>session.id===id).active=false;
+ await h.call({...base,intentRevision:2,sessionID:id,background:true,writePaths:undefined});
+ await h.registry('/project',async state=>{assert.equal(state.records[0].childID,id);assert.deepEqual(state.records[0].writePaths,['backend']);assert.equal(state.records[0].intentRevision,2);});
  await h.hooks.get('model.request')({sessionID:id});assert.equal(h.calls[1].sessionID,id);assert.match(h.calls[1].prompt,/Physical phone/);
+ await h.call({...base,intentRevision:2,sessionID:id,background:true,writePaths:undefined});
+ await h.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['backend']));
+ await h.call({...base,intentRevision:2,sessionID:id,background:true,writePaths:['backend/api']});
+ await h.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['backend/api']));
+});
+test('failed corrected delivery restores the prior child binding',async t=>{
+ const h=await harness(t,async(input,context,sessions,calls)=>{
+  const id=input.sessionID??'rebind-failure';let child=sessions.find(session=>session.id===id);
+  if(!child){child={id,parentID:context.sessionID,agent:input.agent,directory:'/project',active:false};sessions.push(child);}
+  await context.progress({sessionID:id,status:'running'});if(calls.length===2)throw new Error('native delivery failed');
+  return {content:'OK',metadata:{sessionID:id,status:'completed'},output:{sessionID:id,status:'completed'}};
+ });
+ const id=(await h.call(base)).metadata.sessionID;
+ await h.call({action:'set',taskId:'release',expectedRevision:1,intent:{...intent,target:'Corrected target',sourceMessageIDs:['msg_correction']}},'task_intent');
+ await assert.rejects(h.call({...base,intentRevision:2,sessionID:id}),/native delivery failed/);
+ await h.registry('/project',async state=>{assert.equal(state.records[0].intentRevision,1);assert.deepEqual(state.records[0].checkIds,['backend']);});
+ await assert.rejects(h.hooks.get('model.request')({sessionID:id}),/rebind_same_child/);
 });
 test('changed checks resend full intent to the same child',async t=>{
  const h=await harness(t);const id=(await h.call({...base,background:true})).metadata.sessionID;
  await h.call({...base,background:true,sessionID:id,checkIds:['backend']});assert.match(h.calls[1].prompt,/compact continuation/);
  await h.call({action:'set',taskId:'release',expectedRevision:1,intent:{...intent,checks:[...intent.checks,{id:'review',description:'Review the diff',mode:'synthetic'}],sourceMessageIDs:['msg_correction']}},'task_intent');
+ h.sessions.find(session=>session.id===id).active=false;
  await h.call({...base,intentRevision:2,checkIds:['review'],background:true,sessionID:id});
  assert.match(h.calls[2].prompt,/Shared user intent/);assert.match(h.calls[2].prompt,/"id":"review"/);assert.equal(h.calls[2].prompt.includes('compact continuation'),false);
 });

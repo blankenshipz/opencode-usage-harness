@@ -42,3 +42,11 @@ fields and adds `diagnostics_status` (missing evidence is unavailable), `skipped
 `invalid_diagnostic_records`, plus the bounded `diagnostics_retention` value.
 The metrics reader reads the current file and `.1`, and does not open originals
 or chunk files.
+
+Protected source/edit/control tools now report `protected_tool`, separately from
+`unsupported_tool`. `skipped_observed_chars` aggregates available bounded text
+lengths by reason; absent lengths are unknown, not evidence of zero output.
+`savings_status` explicitly reports no observed savings when no projection was
+prepared. These counters never contain source, prompts, paths or model tokens.
+Use actual coverage to choose future transforms; do not lower safety thresholds
+or compress protected reads just to produce a positive savings number.

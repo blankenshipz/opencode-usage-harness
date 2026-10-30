@@ -65,8 +65,21 @@ const nativeSubagentSchema = { type:'object', additionalProperties:false, proper
   agent:{type:'string',minLength:1}, description:{type:'string',minLength:1}, prompt:{type:'string',minLength:1},
   model:{type:'string',minLength:1,description:'Set only when the user explicitly requests a model or variant. Discover its exact provider/model#variant ID.'}, sessionID:{type:'string',minLength:1}, background:{type:'boolean'},
 }, required:['agent','description','prompt'] };
-const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. Implement owns writePaths (omitted means whole workspace); deploy requires exclusive workspace ownership.';
+const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. A new implement assignment with omitted writePaths owns the workspace; an explicit same-child continuation with omitted writePaths retains its admitted paths. Deploy requires exclusive workspace ownership.';
 const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
+// A corrected outcome may need a new assignment, but it may never silently
+// widen or replace an already admitted child's ownership.  This is deliberately
+// descriptive only: the parent still chooses the checks and explicitly resumes.
+function rebindRecovery(record, current) {
+  if (!record?.childID || !current || record.intentRevision === current.revision) return undefined;
+  return {
+    action: 'rebind_same_child', parentID: record.parentID, childID: record.childID,
+    taskId: record.taskId, workKey: record.workKey, agent: record.agent, operation: record.operation,
+    writePaths: record.writePaths ?? [], previousIntentRevision: record.intentRevision,
+    intentRevision: current.revision, availableCheckIds: current.intent.checks.map(check => check.id),
+    advice: 'The recorded parent must explicitly call task_dispatch with this sessionID, taskId/workKey, agent, operation, current intentRevision, and selected current checkIds. Omit writePaths to retain these paths; explicit paths remain subject to ownership checks. This does not authorize execution.',
+  };
+}
 // `reviewOf` predates durable worker provenance and remains a routing hint for
 // compatible callers.  A child ID is the only way a managed dispatch may make
 // a verified family claim or require cross-family review.
@@ -190,7 +203,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
     const owner = state.records.find(r => r.childID === event.sessionID && r.intentRevision);
     if (!owner) return;
     const current = getIntent(state,owner.rootID,owner.taskId);
-    if (current && current.revision !== owner.intentRevision) throw new Error('task-intent: assignment superseded by user correction; parent must rebind this child to the current revision');
+    if (current && current.revision !== owner.intentRevision) throw new Error(`task-intent: assignment superseded by user correction; parent must rebind this child to the current revision. Recovery: ${JSON.stringify(rebindRecovery(owner,current))}`);
   }));
   // Native context is prepared only for primary model steps, not titles/compaction.
   // Inject a stable reminder on an existing request; never interrupt a tool or
@@ -271,7 +284,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         if (existing) throw new Error(existing.message);
         throw capabilityMismatch(input.agent, missing);
       }
-      const writes = paths(input, agent);
+      let writes = paths(input, agent);
       // Optional planning telemetry is advisory only. Read it after all local
       // assignment validation so an impossible request has no quota side effect.
       const routingPolicy = loadRoutingPolicy();
@@ -317,6 +330,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         if (intent) bindIntent(state,{rootID,taskId:input.taskId,intentRevision:input.intentRevision,checkIds:input.checkIds});
         else if (!summaryOnly && !record && !input.sessionID) throw new Error('task-intent: register the user outcome with task_intent before a new handoff; then pass intentRevision and checkIds');
         const requested = input.sessionID ?? record?.childID;
+        const staleRebind = Boolean(intent && record && requested && record.intentRevision !== intent.revision);
         if (requested) {
           const child = sessions.find(s => s.id === requested);
           if (!child || child.parentID !== context.sessionID || child.agent !== input.agent) throw new Error(`task-dispatch: continuation must be the same role and a direct child of this parent. Recovery: ${JSON.stringify(recovery(sessions,requested,context.sessionID,state.records))}`);
@@ -324,12 +338,21 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           if (owner && owner.key !== key) throw new Error(`task-dispatch: child belongs to taskId ${owner.taskId}, workKey ${owner.workKey}; retain that ownership identity`);
           if (record?.childID && record.childID !== requested) throw new Error('task-dispatch: workKey already owns another child; resume that child');
           if (reconcileCompaction(record, child, now)) await save();
+          // A continuation cannot silently widen a non-empty ownership set by
+          // omitting paths. An empty prior inspect scope must not suppress the
+          // fresh workspace reservation for implement/verify, and deploy always
+          // retains its exclusive workspace reservation. Explicit path changes
+          // still take the normal overlap and ownership route below.
+          if (record && input.sessionID && input.writePaths === undefined && record.operation === input.operation && input.operation !== 'deploy' && ((record.writePaths?.length ?? 0) > 0 || writes.length === 0)) writes = record.writePaths ?? writes;
+          if (staleRebind) {
+            if (!input.sessionID) throw new Error(`task-intent: explicitly resume child ${requested} with sessionID and the current revision to deliver the correction. Recovery: ${JSON.stringify(rebindRecovery(record,intent))}`);
+            if (child.active) throw new Error(`task-intent: child ${requested} is still active on a superseded revision; wait for it to become idle before explicitly rebinding. Recovery: ${JSON.stringify(rebindRecovery(record,intent))}`);
+          }
           if (record?.state === 'compacting') {
             const settled=record.compactionOutcome?.id===record.compactionID;
             if (!settled || child.active) return {existing:requested,compacting:true};
           }
           if (child.active && !input.sessionID) {
-            if (intent && record?.intentRevision !== intent.revision) throw new Error(`task-intent: explicitly resume child ${requested} with sessionID and the current revision to deliver the correction`);
             return { existing: requested };
           }
         }
@@ -373,6 +396,13 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           if (!child.lastAssistantID || child.lastAssistantID===record.compactedThrough) throw new Error('task-dispatch: no new observed context to compact');
         }
         const contextAdvice=checkpointStatus(record,now(),{knownContext:{tokens:child?.contextTokens}})?.highContext;
+        // Native delivery has not yet acknowledged the corrected assignment.
+        // Preserve the old gate so a failed or denied delivery cannot let the
+        // existing child infer against a revision it never received.
+        const restoreBinding = staleRebind ? {
+          intentRevision: record.intentRevision, checkIds: record.checkIds,
+          deliveredIntentRevision: record.deliveredIntentRevision, deliveredCheckIds: record.deliveredCheckIds,
+        } : undefined;
         Object.assign(record,{routing,modelOverride:routing.modelOverride});
         const convergence = observeAdmission(record,state,input,rootID);
         const fullIntent = !!intent && (!requested || record.deliveredIntentRevision !== intent.revision || !sameChecks(record.deliveredCheckIds,input.checkIds) || input.refreshIntent === true);
@@ -381,7 +411,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         const generation=(record.admissionGeneration ?? 0)+1;
         Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now(),admissionGeneration:generation });
         beginCheckpoint(record, checkpoint, now());
-        await save(); return { key,childID:requested,intent,fullIntent,convergence,routing,contextAdvice,lastAssistantID:child?.lastAssistantID,generation };
+        await save(); return { key,childID:requested,intent,fullIntent,convergence,routing,contextAdvice,lastAssistantID:child?.lastAssistantID,generation,restoreBinding };
       });
       if (admission.existing) return { content:`Existing child ${admission.existing} is still running or awaiting its admitted compaction outcome. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
       const update = async patch => registry(workspace,async(state,save)=> { const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly'); Object.assign(r,patch,{updatedAt:Date.now()});await save(); });
@@ -411,14 +441,14 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         // retries deliberately resend the full intent rather than treating a progress event as an acknowledgement.
         const denied = admissionDenial(result);
         if (denied) {
-          await update({childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null});
+          await update({childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null,...(admission.restoreBinding ?? {})});
           return {...result,content:`task-dispatch: native ${denied} recorded. ${denialAdvice(denied)}`,metadata:{...(result?.metadata??{}),denial:{category:denied}}};
         }
         await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null});
         return {...result, metadata:{...(result.metadata ?? {}),routing:admission.routing,...(admission.contextAdvice?{contextAdvice:admission.contextAdvice}:{}),...(admission.convergence?{convergence:admission.convergence}:{})}};
       } catch(error) {
         const denied = admissionDenial(error);
-        await update(denied ? {childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null} : {childID:observed,state:observed?'paused':'not_started',inFlight:null});
+        await update(denied ? {childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null,...(admission.restoreBinding ?? {})} : {childID:observed,state:observed?'paused':'not_started',inFlight:null,...(admission.restoreBinding ?? {})});
         try { await queueQuotaRecovery({error,parentID:context.sessionID,childID:observed,generation:admission.generation,requestKind:input.compact?'compaction':'dispatch',compactionID}); } catch { /* recovery reporting cannot replace the native admission failure */ }
         // Preserve original permission/guard error; never retry, change provider, or replace the child here.
         throw error;
@@ -468,7 +498,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         }
         if (delivered) await save();
       } catch { /* status remains read-safe; the durable receipt stays pending for a later explicit retry */ }
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID);const awaiting=r.state==='running'&&!native?.active;return {...r,key:undefined,recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,nativeExecution:{active:!!native?.active,lastIdleOutcome:native?.lastIdleOutcome},workCheckpoint:checkpointStatus(r,now()),verificationAttempt:r.attemptIntentRevision===getIntent(state,rootID,r.taskId)?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!r.intentRevision&&getIntent(state,rootID,r.taskId)?.revision!==r.intentRevision,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current);const awaiting=r.state==='running'&&!native?.active;return {...r,key:undefined,recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,nativeExecution:{active:!!native?.active,lastIdleOutcome:native?.lastIdleOutcome},workCheckpoint:checkpointStatus(r,now()),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }

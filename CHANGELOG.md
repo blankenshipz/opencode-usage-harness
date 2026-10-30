@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — workflow recovery and honest optimization
+
+- Make invalid checkpoint fields actionable; clarify human-action status and Git-hook discipline.
+- Expose same-child intent-rebind recovery without automatic execution or relaxed gates.
+- Preserve GitHub CLI config references across isolated launcher environments.
+- Use medium effort for new ordinary Claude builder assignments in the example policy.
+- Separate protected compression skips from unsupported formats and explicitly report absent observed savings.
+
 ## Unreleased — bounded Claude telemetry recovery
 
 - Share private Claude usage snapshots and in-flight lookups across processes.

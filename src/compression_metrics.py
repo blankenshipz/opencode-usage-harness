@@ -8,6 +8,7 @@ def compression_metrics(directory, *, session_ids, cutoff_ms, now_ms):
     count = before = after = invalid = 0
     strategies = Counter()
     skipped = Counter()
+    skipped_chars = Counter()
     overhead_ms = overhead_events = retrievals = invalid_diagnostics = 0
     diagnostic_files = diagnostic_events = 0
     # Never open original.txt or chunks.jsonl. No provider-dollar estimates.
@@ -63,6 +64,9 @@ def compression_metrics(directory, *, session_ids, cutoff_ms, now_ms):
                                 raise ValueError('invalid diagnostics reason')
                             if reason != 'prepared':
                                 skipped[reason] += 1
+                                observed_chars = data.get('original_chars')
+                                if type(observed_chars) is int and 0 <= observed_chars <= 1024 * 1024:
+                                    skipped_chars[reason] += observed_chars
                             processing = data.get('processing_ms')
                             if processing is not None:
                                 if not isinstance(processing, int) or not 0 <= processing <= 600000:
@@ -82,6 +86,8 @@ def compression_metrics(directory, *, session_ids, cutoff_ms, now_ms):
             'reduced_chars': before - after, 'strategies': dict(strategies), 'invalid_records': invalid,
             'diagnostics_status': 'observed' if diagnostic_events else 'no_observations' if diagnostic_files else 'unavailable',
             'skipped_reasons': dict(skipped),
+            'skipped_observed_chars': dict(skipped_chars),
+            'savings_status': 'observed_prepared_projections' if count else 'no_observed_savings',
             'processing_overhead_ms': {'total': overhead_ms, 'events': overhead_events,
                                        'average': overhead_ms / overhead_events if overhead_events else None},
             'native_original_retrievals': retrievals,

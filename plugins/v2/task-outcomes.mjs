@@ -24,6 +24,10 @@ const checkModes = ['live', 'local', 'synthetic'];
 const resultStatuses = ['passed', 'failed', 'blocked', 'not_run'];
 const resultFreshness = ['fresh', 'reused', 'unrun', 'unknown'];
 const blockerKinds = ['authorization', 'tool_permission', 'environment', 'credential', 'implementation'];
+const enumValue = (value, name, allowed) => {
+  if (!allowed.includes(value)) throw new Error(`task-outcomes: invalid ${name}; expected one of ${allowed.join(', ')}`);
+  return value;
+};
 const text = (value, name, max = 128) => {
   if (typeof value !== 'string' || !value.trim() || value.length > max || /[\r\n]/.test(value)) throw new Error(`task-outcomes: invalid ${name}`);
   return value;
@@ -97,7 +101,7 @@ function normalizeContract(value) {
     if (!check || typeof check !== 'object' || Array.isArray(check)) throw new Error(`task-outcomes: invalid contract.checks[${index}]`);
     const id = text(check.id, `contract.checks[${index}].id`); if (ids.has(id)) throw new Error('task-outcomes: duplicate contract check id'); ids.add(id);
     const description = text(check.description, `contract.checks[${index}].description`, 500);
-    if (!checkModes.includes(check.mode)) throw new Error('task-outcomes: invalid contract check mode');
+    enumValue(check.mode, `contract.checks[${index}].mode`, checkModes);
     const artifact = check.artifact === undefined ? undefined : text(check.artifact, `contract.checks[${index}].artifact`);
     return artifact === undefined ? { id, description, mode: check.mode } : { id, description, mode: check.mode, artifact };
   });
@@ -108,7 +112,8 @@ function normalizeResults(value) {
   const ids = new Set(); return value.map((result, index) => {
     if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error(`task-outcomes: invalid results[${index}]`);
     const id = text(result.id, `results[${index}].id`); if (ids.has(id)) throw new Error('task-outcomes: duplicate result id'); ids.add(id);
-    if (!resultStatuses.includes(result.status) || !checkModes.includes(result.mode)) throw new Error('task-outcomes: invalid result status or mode');
+    enumValue(result.status, `results[${index}].status`, resultStatuses);
+    enumValue(result.mode, `results[${index}].mode`, checkModes);
     let artifact;
     if (result.artifact !== undefined) {
       if (!result.artifact || typeof result.artifact !== 'object' || Array.isArray(result.artifact)) throw new Error(`task-outcomes: invalid results[${index}].artifact`);
@@ -116,7 +121,8 @@ function normalizeResults(value) {
       artifact = { subject: text(result.artifact.subject, `results[${index}].artifact.subject`), revision: text(result.artifact.revision, `results[${index}].artifact.revision`, 500), generation: result.artifact.generation };
     }
     const freshness = result.freshness ?? 'unknown';
-    if (!resultFreshness.includes(freshness) || (result.status === 'not_run' && freshness === 'fresh') || (freshness === 'unrun' && result.status !== 'not_run')) throw new Error(`task-outcomes: invalid results[${index}].freshness`);
+    enumValue(freshness, `results[${index}].freshness`, resultFreshness);
+    if ((result.status === 'not_run' && freshness === 'fresh') || (freshness === 'unrun' && result.status !== 'not_run')) throw new Error(`task-outcomes: invalid results[${index}].freshness; freshness does not agree with status`);
     const sourceReceipt = result.sourceReceipt === undefined ? undefined : receiptReference(result.sourceReceipt, `results[${index}].sourceReceipt`);
     if ((freshness === 'reused') !== (sourceReceipt !== undefined)) throw new Error(`task-outcomes: reused results require a sourceReceipt reference`);
     const normalized = { id, status: result.status, mode: result.mode, evidence: text(result.evidence, `results[${index}].evidence`, 500), freshness };
@@ -125,7 +131,8 @@ function normalizeResults(value) {
   });
 }
 function normalizeBlocker(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || !blockerKinds.includes(value.kind)) throw new Error('task-outcomes: invalid blocker');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('task-outcomes: invalid blocker');
+  enumValue(value.kind, 'blocker.kind', blockerKinds);
   return { kind: value.kind, evidence: text(value.evidence, 'blocker.evidence', 2000), nextAction: text(value.nextAction, 'blocker.nextAction', 2000) };
 }
 
@@ -170,8 +177,13 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
       const progressEvidence = normalizeProgressEvidence(args.progressEvidence);
       const attempt = args.attempt === undefined ? undefined : normalizeAttempt(args.attempt, now());
       if (attempt && !sharedContract) throw new Error('task-outcomes: verification attempts require a shared intent and bound worker');
-      if (!scopes.includes(args.scope) || !statuses.includes(args.status) || (args.escalationReason !== undefined && !reasons.includes(args.escalationReason))) throw new Error('task-outcomes: invalid scope, status or reason');
-      if (args.progressState !== undefined && (!progressStates.includes(args.progressState) || args.status !== (args.progressState === 'needs_user_action' ? 'blocked' : 'in_progress'))) throw new Error('task-outcomes: progressState must agree with status');
+      enumValue(args.scope, 'scope', scopes);
+      enumValue(args.status, 'status', statuses);
+      if (args.escalationReason !== undefined) enumValue(args.escalationReason, 'escalationReason', reasons);
+      if (args.progressState !== undefined) {
+        enumValue(args.progressState, 'progressState', progressStates);
+        if (args.status !== (args.progressState === 'needs_user_action' ? 'blocked' : 'in_progress')) throw new Error('task-outcomes: progressState must agree with status');
+      }
       if (args.dependencySessionIDs !== undefined && (args.progressState !== 'waiting_dependency' || !Array.isArray(args.dependencySessionIDs) || args.dependencySessionIDs.length < 1 || args.dependencySessionIDs.length > 8 || new Set(args.dependencySessionIDs).size !== args.dependencySessionIDs.length || args.dependencySessionIDs.some(id => typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(id) || id === sessionID))) throw new Error('task-outcomes: invalid dependencySessionIDs');
       if (args.progressState === 'waiting_dependency' && !args.dependencySessionIDs?.length) throw new Error('task-outcomes: waiting_dependency requires dependencySessionIDs');
       for (const count of ['repairs', 'userCorrections']) if (args[count] !== undefined && (!Number.isSafeInteger(args[count]) || args[count] < 0 || args[count] > 1000)) throw new Error(`task-outcomes: invalid ${count}`);
@@ -192,7 +204,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
         if (args.status === 'completed') { if (!results) throw new Error('task-outcomes: task completion requires results for every contracted check'); const byID = new Map(results.map(result => [result.id, result])); if (byID.size !== stored.checks.length || stored.checks.some(check => !byID.has(check.id))) throw new Error('task-outcomes: completion results must match every contracted check id'); for (const check of stored.checks) { const result = byID.get(check.id); if (result.status !== 'passed' || result.mode !== check.mode) throw new Error(`task-outcomes: contracted check ${check.id} must pass with mode ${check.mode}`); } }
       }
       const key = JSON.stringify([sessionID, taskID]), timestamp = now(), startedAt = tasks.get(key); if (startedAt === undefined) { if (tasks.size >= 512) tasks.delete(tasks.keys().next().value); tasks.set(key, timestamp); }
-      const actor = messages.get(JSON.stringify([sessionID, call.messageID])), selected = args.selected && Object.fromEntries(Object.entries(args.selected).map(([k, v]) => [k, text(v, k)])); if (selected?.effort && !efforts.includes(selected.effort)) throw new Error('task-outcomes: invalid effort'); if (args.validationEvidence && (!Array.isArray(args.validationEvidence) || args.validationEvidence.length > 8 || args.validationEvidence.some(v => typeof v !== 'string' || v.length > 500))) throw new Error('task-outcomes: invalid evidence');
+      const actor = messages.get(JSON.stringify([sessionID, call.messageID])), selected = args.selected && Object.fromEntries(Object.entries(args.selected).map(([k, v]) => [k, text(v, k)])); if (selected?.effort) enumValue(selected.effort, 'selected.effort', efforts); if (args.validationEvidence && (!Array.isArray(args.validationEvidence) || args.validationEvidence.length > 8 || args.validationEvidence.some(v => typeof v !== 'string' || v.length > 500))) throw new Error('task-outcomes: invalid evidence');
       const appendRecord = async artifacts => {
         const observedArtifactGenerations = [];
         for (const result of results ?? []) {

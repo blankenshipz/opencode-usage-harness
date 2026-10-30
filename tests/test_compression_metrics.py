@@ -27,7 +27,7 @@ class CompressionMetricsTest(unittest.TestCase):
             telemetry = root.parent / 'telemetry'; telemetry.mkdir()
             records = [
                 {'version': 1, 'type': 'candidate', 'session_id': 's', 'created_ms': 50,
-                 'reason': 'unsupported_tool', 'processing_ms': 4,
+                 'reason': 'protected_tool', 'processing_ms': 4, 'original_chars': 7000,
                  'token_estimate': {'status': 'unavailable', 'reason': 'no-model-specific-tokenizer'}},
                 {'version': 1, 'type': 'candidate', 'session_id': 's', 'created_ms': 60,
                  'reason': 'prepared', 'processing_ms': 6,
@@ -41,7 +41,9 @@ class CompressionMetricsTest(unittest.TestCase):
             (telemetry / 'compression-diagnostics.jsonl').write_text('\n'.join(
                 item if isinstance(item, str) else json.dumps(item) for item in records))
             result = compression_metrics(root, session_ids={'s'}, cutoff_ms=10, now_ms=100)
-            self.assertEqual(result['skipped_reasons'], {'unsupported_tool': 1})
+            self.assertEqual(result['skipped_reasons'], {'protected_tool': 1})
+            self.assertEqual(result['skipped_observed_chars'], {'protected_tool': 7000})
+            self.assertEqual(result['savings_status'], 'no_observed_savings')
             self.assertEqual(result['processing_overhead_ms'], {'total': 10, 'events': 2, 'average': 5})
             self.assertEqual(result['native_original_retrievals'], 1)
             self.assertEqual(result['diagnostics_status'], 'observed')
