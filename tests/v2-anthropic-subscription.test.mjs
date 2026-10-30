@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createV2Guard } from '../plugins/v2/subscription-guard.mjs';
 import { createAnthropicUsageReader } from '../plugins/v2/anthropic-subscription.mjs';
-import { createQuotaCache } from '../plugins/v2/quota-cache.mjs';
+import { CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS, createQuotaCache } from '../plugins/v2/quota-cache.mjs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -172,14 +172,16 @@ test('Anthropic guard sanitizes usage diagnostics and coalesces concurrent selec
   failed.cleanup();
 });
 
-test('Anthropic hook admits only bounded stale disabled financial evidence and blocks enabled, auth, and applicable exhaustion', async () => {
+test('Anthropic hook admits stale disabled financial evidence through the 24-hour verification bound and blocks enabled, auth, and applicable exhaustion', async () => {
   const clock = { now: Date.parse('2026-10-26T00:00:00.000Z') }; let calls = 0;
   const failure = transient => Object.assign(new Error('network'), { code: 'SUBSCRIPTION_ANTHROPIC_USAGE_CHECK_FAILED', detail: { reason: 'http_error', http_status: transient } });
   const h = await setup({ clock, usage: async () => ++calls === 1 ? { extra_usage: { is_enabled: false } } : Promise.reject(failure(429)) });
   await h.hooks.get('model.request')(event());
   clock.now += 61_000;
   await h.hooks.get('model.request')(event());
-  clock.now += 300_001;
+  clock.now = Date.parse('2026-10-26T00:00:00.000Z') + CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS - 1;
+  await h.hooks.get('model.request')(event());
+  clock.now++;
   await assert.rejects(h.hooks.get('model.request')(event()), /usage verification failed/); h.cleanup();
   for (const usage of [
     async () => ({ extra_usage: { is_enabled: true } }),
@@ -201,6 +203,21 @@ test('Anthropic hook admits only bounded stale disabled financial evidence and b
   await assert.rejects(displayFamily.hooks.get('model.request')(event('anthropic', 'claude-fable-5-1')), /exhausted/); displayFamily.cleanup();
   const otherVersion = await setup({ usage: async () => ({ extra_usage: { is_enabled: false }, limits: [{ kind: 'weekly_scoped', model: 'claude-fable-4', used_percent: 100 }] }) });
   await otherVersion.hooks.get('model.request')(event('anthropic', 'claude-fable-5-1')); otherVersion.cleanup();
+});
+
+test('Anthropic guard rejects a slow transient refresh that crosses the exact 24-hour verification boundary', async () => {
+  const started = Date.parse('2026-10-26T00:00:00.000Z');
+  const clock = { now: started }; let calls = 0;
+  const h = await setup({ clock, usage: async () => {
+    if (++calls === 1) return { extra_usage: { is_enabled: false } };
+    clock.now = started + CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS;
+    throw Object.assign(new Error('network'), { code: 'SUBSCRIPTION_ANTHROPIC_USAGE_CHECK_FAILED', detail: { reason: 'http_error', http_status: 503 } });
+  } });
+  try {
+    await h.hooks.get('model.request')(event());
+    clock.now = started + CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS - 1;
+    await assert.rejects(h.hooks.get('model.request')(event()), /usage verification failed/);
+  } finally { h.cleanup(); }
 });
 
 test('OpenAI continues through its existing Codex quota path when Anthropic is present in the inventory', async () => {

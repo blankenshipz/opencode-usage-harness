@@ -117,10 +117,12 @@ stored in cache records. Credential rotation starts a new verification boundary.
 
 A timeout, network failure, HTTP 429 or server failure is not quota exhaustion.
 After a transient failure the last verified snapshot may support inference only
-while its original disabled-usage-credits evidence is at most five minutes old.
+while its original disabled-usage-credits evidence is less than 24 hours old.
 Cache reads and failed lookups never extend that deadline. Routing preserves the
-original timestamp and exposes stale/cooldown metadata; its existing two-minute
-freshness requirement still limits model-selection decisions.
+original timestamp and exposes stale/cooldown metadata. Recovery snapshots are
+unknown for quota pacing, even within the ordinary advisory freshness limit.
+Cached HTTP failures retain their sanitized numeric status; legacy records with
+no status remain unknown, and later non-HTTP failures clear the prior status.
 
 Failed lookups enter a cooldown. Numeric and HTTP-date Retry-After hints are
 retained with a one-day safety bound; absent or zero hints use
@@ -137,7 +139,7 @@ No API-key fallback, account substitution, credit purchase or inference retry is
 introduced. The selected OAuth connection and endpoint checks still run for each
 request.
 
-The five-minute interval is a bounded trust window, not a provider-side billing
+The 24-hour interval is a bounded trust window, not a provider-side billing
 lock: an account setting changed during it may not be observed immediately. Keep
 usage credits disabled in the account UI. Codex keeps its independent account,
 credit and quota checks; this Claude recovery policy does not relax them.

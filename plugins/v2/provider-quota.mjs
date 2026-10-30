@@ -115,8 +115,9 @@ export function normalizeClaudeQuota(raw, { now = Date.now(), maxAgeMs = DEFAULT
     verified_at: Number.isFinite(raw.quota_cache.verified_at) ? iso(raw.quota_cache.verified_at) : null,
     cooldown_until: Number.isFinite(raw.quota_cache.cooldown_until) ? iso(raw.quota_cache.cooldown_until) : null,
     error: typeof raw.quota_cache.error === 'string' ? raw.quota_cache.error : null,
+    http_status: Number.isInteger(raw.quota_cache.http_status) && raw.quota_cache.http_status >= 100 && raw.quota_cache.http_status <= 599 ? raw.quota_cache.http_status : null,
   };
-  if (!raw || typeof raw !== 'object' || checked === null || now - checked > maxAgeMs || checked > now + 5_000) { pool.reason = 'stale_or_invalid'; return pool; }
+  if (!raw || typeof raw !== 'object' || pool.cache?.stale || checked === null || now - checked > maxAgeMs || checked > now + 5_000) { pool.reason = 'stale_or_invalid'; return pool; }
   pool.checked_at = iso(checked);
   const windows = [];
   const shares = Array.isArray(raw.weekly_scoped_shares) ? raw.weekly_scoped_shares : [];

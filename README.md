@@ -250,7 +250,8 @@ OAuth identity, current Codex admission and the configured financial attestation
 subscription OAuth and disabled usage credits. Claude shares usage telemetry across
 routing and admission, and rejects confirmed applicable exhaustion. On a transient
 lookup failure, admission may use an existing verification of disabled usage credits
-for at most five minutes from its original successful read. Expired financial evidence,
+for less than 24 hours from its original successful read. Quota telemetry is still
+fresh for only 60 seconds and stale telemetry remains unsuitable for routing. Expired financial evidence,
 authentication failures, and enabled or unknown usage credits still block admission.
 The provider remains the final included-quota hard stop; no Codex-style subprocess
 is required for Claude.
@@ -272,8 +273,10 @@ Codex retains its short-lived file cache and cross-process lock. Claude uses a
 Transient failures trigger a cooldown (respecting Retry-After, with bounded
 exponential backoff when needed), not repeated requests from each worker. Quota
 estimates older than two minutes remain unsuitable for candidate selection.
-The separate five-minute financial-verification limit never moves forward on a
-cache hit or failed lookup; stale quota does not mean unused capacity. See
+The separate 24-hour Claude financial-verification limit never moves forward on a
+cache hit or failed lookup; stale quota does not mean unused capacity. A changed
+Claude setting can remain unobserved until the next successful usage read, so keep
+usage credits disabled in the account as well. See
 [Claude telemetry caching](docs/CLAUDE-SUBSCRIPTION.md#shared-telemetry-and-bounded-recovery).
 
 **If a usable account window for the role’s provider is more than ten percentage
@@ -553,8 +556,9 @@ stays neutral until reviewed task evidence supports a preference.
 Anthropic usage-check failures now retain a sanitized reason (HTTP status, timeout,
 network failure or invalid response) and bounded retry-after seconds when available.
 Concurrent checks share the selected OAuth credential's private cache. Transient
-failures may reuse still-valid disabled-overage verification; failures themselves
-never grant admission. Auth failures, known exhaustion and expired financial evidence
+failures may reuse disabled-overage verification only until the original successful
+verification is 24 hours old; failures themselves never grant admission. Auth failures,
+known exhaustion and expired financial evidence
 remain blocking. This does not retry inference or switch accounts/providers. A stored expired
 OAuth token tested outside the runtime is not proof that runtime refresh is broken.
 

@@ -5,6 +5,9 @@
 - Share private Claude usage snapshots and in-flight lookups across processes.
 - Back off after transient telemetry failures; permit bounded reuse of verified
   disabled-overage evidence without treating a failed lookup as quota exhaustion.
+- Keep Claude quota telemetry fresh for 60 seconds while allowing disabled-overage
+  recovery for less than 24 hours from its original successful verification;
+  failed checks never extend that horizon and stale quota remains non-routing data.
 - Keep authentication, financial expiry, unsafe settings and applicable exhausted
   windows blocking; preserve original evidence timestamps and expose cache state.
 - Keep Codex admission independent; no automatic inference retry or paid fallback.

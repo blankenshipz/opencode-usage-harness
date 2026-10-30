@@ -36,7 +36,7 @@ export function assertAnthropicCredential(connection, credential) {
 }
 
 // Shared by admission and advisory routing. Never tries another account or API key.
-import { createQuotaCache } from './quota-cache.mjs';
+import { CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS, createQuotaCache } from './quota-cache.mjs';
 const usageFailureReasons = new Set(['http_error', 'timeout', 'network_error', 'invalid_response']);
 const retryAfterLimitSeconds = 86_400;
 
@@ -83,7 +83,7 @@ export function normalizeAnthropicUsageFailure(error) {
   return usageFailure(timeout ? 'timeout' : 'network_error');
 }
 
-const defaultQuotaCache = createQuotaCache();
+const defaultQuotaCache = createQuotaCache({ hardTtlMs: CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS });
 function accountExhausted(value) {
   return [value?.five_hour, value?.seven_day].some(window => Number(window?.utilization ?? window?.percent ?? window?.used_percent ?? window?.usedPercent) >= 100 || window?.locked_reason);
 }
@@ -150,7 +150,8 @@ export function createAnthropicUsageReader({ cache = defaultQuotaCache } = {}) {
     catch { throw usageFailure('invalid_response'); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw usageFailure('invalid_response');
     return { ...body, checked_at: new Date().toISOString() };
-    }, { safe: value => value?.extra_usage?.is_enabled === false && !accountExhausted(value), sanitize: sanitizeAnthropicUsage });
+    }, { safe: value => value?.extra_usage?.is_enabled === false && !accountExhausted(value), sanitize: sanitizeAnthropicUsage,
+      staleTtlMs: CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS });
   };
 }
 export const fetchAnthropicUsage = createAnthropicUsageReader();

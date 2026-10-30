@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { validateFinancial } from '../../config/guard-validation.mjs';
 import { anthropicPackage, assertAnthropicOverrides, assertAnthropicBaseURL, assertAnthropicHTTPURL,
   assertAnthropicCredential, fetchAnthropicUsage, normalizeAnthropicUsageFailure, readSelectedClaudeUsage, anthropicUsageExhausted, sanitizeAnthropicUsage } from './anthropic-subscription.mjs';
-import { createQuotaCache } from './quota-cache.mjs';
+import { CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS, createQuotaCache } from './quota-cache.mjs';
 import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
 import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
 import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
@@ -95,12 +95,13 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
   }, env = process.env, now = () => new Date().toISOString(), recordCompletion = value => persistCompletion({
     database: statePath('telemetry', 'completions.sqlite3'), value, python: env.HARNESS_PYTHON || 'python3', env,
   }), registry = createRegistry(), readAnthropicUsage = fetchAnthropicUsage, anthropicQuotaCache } = {}) {
-  const quotaCache = anthropicQuotaCache ?? createQuotaCache({ now: () => Date.parse(now()) });
+  const quotaCache = anthropicQuotaCache ?? createQuotaCache({ now: () => Date.parse(now()), hardTtlMs: CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS });
   // The default reader already owns the process-shared cache used by routing.
   // Injected readers are raw test/integration adapters and need that wrapper.
   const cachedAnthropicUsage = readAnthropicUsage === fetchAnthropicUsage ? readAnthropicUsage : access => quotaCache('anthropic', access, () => readAnthropicUsage(access), {
     safe: usage => usage?.extra_usage?.is_enabled === false && !anthropicUsageExhausted(usage),
     sanitize: sanitizeAnthropicUsage,
+    staleTtlMs: CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS,
   });
   async function quota(operation) {
     const started = performance.now();
@@ -174,7 +175,7 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     try { usage = await cachedAnthropicUsage(access); }
     catch (error) { throw normalizeAnthropicUsageFailure(error); }
     const verifiedAt = Number(usage?.quota_cache?.verified_at);
-    if (usage?.quota_cache && (!Number.isFinite(verifiedAt) || verifiedAt > Date.parse(now()) || Date.parse(now()) - verifiedAt > 300_000))
+    if (usage?.quota_cache && (!Number.isFinite(verifiedAt) || verifiedAt > Date.parse(now()) || Date.parse(now()) - verifiedAt >= CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS))
       throw new Error('Subscription guard: Anthropic financial verification has expired. Admission remains blocked.');
     if (usage?.extra_usage?.is_enabled !== false)
       throw new Error('Subscription guard: Anthropic usage credits must be disabled before inference.');

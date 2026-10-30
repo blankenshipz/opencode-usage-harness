@@ -55,6 +55,16 @@ test('stale data is unknown rather than zero', () => {
   assert.deepEqual(result.windows, []);
 });
 
+test('stale Claude recovery evidence remains stale for routing and exposes only its sanitized status', () => {
+  const result = normalizeClaudeQuota({
+    checked_at: new Date(now - 61_000).toISOString(), extra_usage: { is_enabled: false },
+    quota_cache: { stale: true, verified_at: now - 61_000, cooldown_until: now + 1_000, error: 'http_error', http_status: 429 },
+  }, { now });
+  assert.equal(result.reason, 'stale_or_invalid');
+  assert.equal(result.cache.stale, true);
+  assert.equal(result.cache.http_status, 429);
+});
+
 test('live inactive limit metadata does not deny a valid paid account', () => {
   const result = normalizeClaudeQuota({
     checked_at: new Date(now).toISOString(),
