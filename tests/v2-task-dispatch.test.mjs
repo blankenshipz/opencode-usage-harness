@@ -11,9 +11,30 @@ import { createV2TaskOutcomes } from '../plugins/v2/task-outcomes.mjs';
 import { setIntent } from '../plugins/v2/task-intent.mjs';
 import { createRegistry } from '../plugins/v2/dispatch-registry.mjs';
 import { createWorkerProgress } from '../plugins/v2/worker-progress.mjs';
+import { summarizeTaskDispatchStatus } from '../plugins/v2/task-dispatch-status-summary.mjs';
 const agents = JSON.parse(fs.readFileSync(new URL('./fixtures/agents.json', import.meta.url)));
 const intent = {outcome:'Working release',target:'Local backend',nonGoals:[],authorizedEffects:['Local changes'],assumptions:[],checks:[{id:'backend',description:'Actual backend check',mode:'local'}],sourceMessageIDs:['msg_user']};
 const base = { background:false,intentRevision:1,checkIds:['backend'],taskId:'release',workKey:'backend',operation:'implement',agent:'builder',description:'Fix backend',prompt:'Implement requested backend checks',requiredCapabilities:['edit','shell'],writePaths:['backend'] };
+test('status summary keeps routing and recovery actions while excluding prompt history and receipts', () => {
+ const summary = summarizeTaskDispatchStatus({owners:[{taskId:'release',workKey:'backend',childID:'child-1',parentID:'root',agent:'builder',operation:'implement',intentRevision:3,checkIds:['backend'],admissionGeneration:4,compactionID:'compact-4',compactionOutcome:{id:'compact-4',status:'failed'},routing:{selected:'openai/model#high',effortDecision:{selected:'openai/model#high',reason:'fixture'}},recordedState:'denied',effectiveState:'denied',nativeExecution:{active:false},collection:{action:'task_dispatch_collect',taskId:'release',workKey:'backend',sessionID:'child-1',generation:4},writePaths:['backend'],externalWrites:['/tmp/owned'],externalGrant:{grantID:'grant-1',expiresAt:99,externalRoot:'/secret'},workCheckpoint:{due:true,highContext:{used:9},taskReview:{due:false},limits:{steps:30}},verificationAttempt:{id:'attempt-1',phase:'ready',expiresAt:88,expired:false,readiness:{receiver:true,observer:true,recorder:true},livenessVerified:false,selfReported:true,receipt:'SECRET receipt',evidence:'SECRET evidence'},denial:{category:'native_permission',action:'recover'},rebind:{action:'rebind_same_child'},continuationOwner:{action:'recover_same_child'},activeDescendants:['grandchild'],attention:{progressState:'needs_user_action',nextAction:'inspect'},prompt:'SECRET prompt',history:['SECRET history'],completionReceipt:{assistantID:'SECRET receipt'}}],userActions:[{action:'resume_same_child',sessionID:'child-1'}],taskWork:{steps:2,continuations:1,due:false,limits:{steps:240,continuations:12},history:['SECRET']}});
+ assert.equal(summary.owners[0].taskId,'release'); assert.equal(summary.owners[0].routing.selected,'openai/model#high');
+ assert.equal(summary.owners[0].routing.effort,'high'); assert.deepEqual(summary.owners[0].collection.sessionID,'child-1');
+ assert.equal(summary.owners[0].compactionID,'compact-4'); assert.equal(summary.owners[0].compactionOutcome.status,'failed');
+ assert.equal(summary.owners[0].agent,'builder'); assert.equal(summary.owners[0].intentRevision,3); assert.deepEqual(summary.owners[0].workCheckpoint,{due:true,highContext:{used:9},taskReview:{due:false},limits:{steps:30}});
+ assert.equal(summary.owners[0].blocker.nextAction,'inspect'); assert.deepEqual(summary.owners[0].activeDescendants,['grandchild']);
+ assert.equal(summary.owners[0].verificationAttempt.phase,'ready'); assert.equal(summary.owners[0].verificationAttempt.expiresAt,88); assert.equal(summary.owners[0].verificationAttempt.receipt,undefined); assert.deepEqual(summary.owners[0].externalGrant,{grantID:'grant-1',expiresAt:99});
+ const encoded=JSON.stringify(summary); assert.equal(encoded.includes('SECRET'),false); assert.equal(summary.owners[0].prompt,undefined); assert.equal(summary.owners[0].completionReceipt,undefined);
+ assert.equal(summarizeTaskDispatchStatus({owners:[{routing:{selected:'provider/model'}}]}).owners[0].routing.effort,undefined);
+ const expired=summarizeTaskDispatchStatus({owners:[{verificationAttempt:{id:'attempt-1',phase:'expired',expired:true,failureKey:'device_timeout',livenessVerified:false,selfReported:true}}]}); assert.equal(expired.owners[0].verificationAttempt.phase,'expired'); assert.equal(expired.owners[0].verificationAttempt.failureKey,'device_timeout');
+});
+test('summary input is optional and default status remains the full status shape', async t => {
+ const h=await harness(t); await h.call({...base,background:true});
+ const full=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
+ const summarized=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);
+ assert.equal(typeof full.owners[0].routing.source,'string');
+ assert.equal(summarized.owners[0].description,undefined); assert.equal(summarized.owners[0].prompt,undefined);
+ assert.equal(summarized.owners[0].taskId,'release'); assert.equal(summarized.owners[0].writePaths.includes('backend'),true);
+});
 test('status neither reconciles nor delivers or exposes another root recovery',async t=>{
  const h=await harness(t);
  const {quotaRecoveryReceipt,enqueueQuotaRecovery}=await import('../plugins/v2/quota-recovery.mjs');
@@ -458,7 +479,7 @@ test('context checkpoint is cooperative, durable and excludes unrelated or legac
  const h=await harness(t);const id=(await h.call({...base,background:true})).metadata.sessionID;
  const context=()=>({sessionID:id,system:[]});
  for(let n=0;n<29;n++){const e=context();await h.hooks.get('context')(e);assert.equal(e.system.length,0);}
- const e=context();await h.hooks.get('context')(e);assert.match(e.system[0].text,/Work checkpoint due/);
+ const e=context();await h.hooks.get('context')(e);assert.match(e.system[0].text,/Progress checkpoint due/);
  assert.equal(h.calls.length,1);assert.equal(h.sessions.find(s=>s.id===id).active,true);
  const unrelated={sessionID:'root',system:[]};await h.hooks.get('context')(unrelated);assert.deepEqual(unrelated.system,[]);
  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);

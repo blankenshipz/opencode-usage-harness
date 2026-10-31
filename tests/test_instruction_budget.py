@@ -37,6 +37,20 @@ class InstructionBudgetTest(unittest.TestCase):
         ):
             self.assertIn(phrase, routing)
 
+    def test_coordination_guidance_avoids_bookkeeping_churn(self):
+        data = self.load()
+        routing = data["routing"].lower()
+        leaf = data["leaf"].lower()
+        for phrase in (
+            "stable integration owner", "end-to-end executable slice",
+            "meaningful implementation and verification", "summary:true",
+            "full status only to resolve a specific evidence gap", "real context pressure",
+            "blanket git holds", "serialized commongit coordination scope",
+            "native command permissions and approvals still apply",
+        ):
+            self.assertIn(phrase, routing)
+        self.assertIn("rather than stopping for routine bookkeeping", leaf)
+
 
 if __name__ == "__main__":
     unittest.main()

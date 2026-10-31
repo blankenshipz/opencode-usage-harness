@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — productive checkpoints
+
+- Turn elapsed-time/step checkpoint reminders into progress reassessments, without forcing a handoff during useful authorized work.
+- Add optional compact dispatch status with exact generation, compaction, collection and human-attempt recovery metadata.
+- Permit verifier fixture/script edits under assigned `.artifacts` paths while retaining production edit and secret-file denials.
+- Prefer an integrated executable journey, meaningful implementation/verification chunks, and selective context refresh over repeated bookkeeping.
+- Clarify shared Git coordination through explicit existing ownership scopes; no new lock service or automatic permission bypass.
+
 ## Unreleased — native wait visibility
 
 - Distinguish pending native questions and permissions from execution, including sessions still marked running. Keep inaccessible or malformed wait evidence unknown and preserve caller ancestry checks.

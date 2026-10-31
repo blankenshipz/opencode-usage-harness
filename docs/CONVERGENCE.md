@@ -28,7 +28,7 @@ shared intent; pass only relevant checks and a bounded target:
 The field is optional for backward compatibility. Every newly admitted assignment
 gets a cooperative slice: 10 minutes or 30 prepared primary model steps. On the
 next existing primary context preparation, a stable reminder asks the worker to
-collect its current operation, record evidence and return one next action. No tool
+report changed evidence and reassess scope while continuing useful authorized implementation and targeted verification. Return when the objective is verified, a real blocker prevents progress, or a changed approach is needed—not solely because a timer elapsed. No tool
 is cancelled, no request is scheduled, and no worker is replaced. A running test
 can exceed the budget. Preparation counts are not completed inference counts;
 titles and compaction use separate hooks and are excluded. The reminder is guidance,
@@ -130,3 +130,5 @@ ordinary work. These controls do not establish a performance improvement until a
 real workload is observed. Large contexts should be compacted selectively at phase
 boundaries with current ownership, authorization, evidence and failure identity
 preserved; no timer-based history rewriting is added.
+
+For routine decision boundaries use `task_dispatch_status({taskId, summary:true})`. It retains exact generation, collection, compaction and recovery identifiers without repeating full ownership history or receipts. Omit `summary` only to investigate a specific missing detail. Neither view starts work.

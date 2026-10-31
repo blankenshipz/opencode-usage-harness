@@ -69,3 +69,11 @@ test('checkpoint targets are bounded and sustained dispatch uses native backgrou
   assert.equal(backgroundDispatch({ operation: 'implement', background: false }), false);
   assert.equal(backgroundDispatch({ operation: 'inspect', background: true }), true);
 });
+
+test('progress checkpoint does not require timer-only handoff or redispatch', async () => {
+  const {checkpointReminder, checkpointHandoff} = await import('../plugins/v2/work-checkpoint.mjs');
+  assert.match(checkpointReminder, /Continue the assigned implementation and targeted verification/);
+  assert.match(checkpointReminder, /timer alone is not a reason to yield, compact, redispatch/);
+  assert.match(checkpointHandoff({objective:'fix',expectedEvidence:'test'}), /do not return solely/);
+  assert.match(checkpointHandoff(), /unless blocked or a changed approach is needed/);
+});

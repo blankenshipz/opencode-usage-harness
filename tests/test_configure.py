@@ -54,6 +54,20 @@ class ConfigureTests(unittest.TestCase):
         bad=policy(good);bad['roles']['builder'][0]['taskFit']={'invented':good}
         with self.assertRaises(ValueError):profile(models,routing_policy=bad)
 
+    def test_verifier_artifacts_keep_secret_denials_and_production_readonly(self):
+        import fnmatch
+        p = profile({t: 'openai/example#medium' for t in ('FAST','BALANCED','STRONG','MAXIMUM')})
+        rules = p['agents']['harness-verifier']['permissions']
+        def effect(resource):
+            matches = [r['effect'] for r in rules if r['action'] == 'edit' and fnmatch.fnmatchcase(resource,r['resource'])]
+            return matches[-1]
+        for resource in ('.artifacts/check/test_case.py','/workspace/.artifacts/check/input.json'):
+            self.assertEqual(effect(resource), 'allow')
+        for resource in ('app/main.py','/workspace/app/main.py','.artifacts/check/.env',
+                         '.artifacts/check/auth.json','.artifacts/check/private.key',
+                         '.artifacts/check/external-write-grants.json'):
+            self.assertEqual(effect(resource), 'deny')
+
     def test_namespace_helper_is_idempotent_and_preserves_hidden_compatibility(self):
         agents = {'router': {'system': 'router', 'permissions': [
             {'action': 'subagent', 'resource': 'builder', 'effect': 'allow'},

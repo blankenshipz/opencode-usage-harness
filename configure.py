@@ -162,12 +162,20 @@ def profile(models, package_root=ROOT, routing_policy=None):
             rules.append({'action':'edit','resource':protected,'effect':'deny'})
         if role == 'verifier':
             rules.append({'action':'edit','resource':'*','effect':'deny'})
+            # Verification may need fresh fixtures/scripts, not production repairs.
+            # Native permissions are lexical; this is not a filesystem sandbox.
+            rules += [{'action':'edit','resource':p,'effect':'allow'}
+                      for p in ('.artifacts/*', '*/.artifacts/*')]
+            rules += [{'action':'edit','resource':p,'effect':'deny'} for p in
+                      ('*.env','*.env.*','*auth.json','*.pem','*.key',
+                       '*anthropic-financial-policy.json','*external-write-grants.json')]
+
         identity_guidance = ('\nUse visible harness-* IDs for new handoffs. When continuing an existing worker, '
                              'pass its exact stored agent ID and sessionID; never rename or adopt it.')
         definition = {'description':f'harness {role.replace("-", " ")}', 'mode':'primary' if role == 'router' else 'all',
             'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance, 'permissions':rules}
         if role == 'verifier':
-            definition['system'] += '\nExecute the assigned checks and report commands, exit codes and findings. Do not implement repairs. Shell execution can write artifacts; retain declared workspace ownership and all native approvals. This role is not a read-only sandbox.'
+            definition['system'] += '\nExecute the assigned checks and report commands, exit codes and findings. Do not implement production repairs. Create verification scripts and fixtures only in the explicitly assigned .artifacts directory; reserve that directory in writePaths before writing. Never use artifact paths or symlinks to evade a production edit denial. Shell execution can write artifacts; retain declared workspace ownership and all native approvals. This role is not a read-only sandbox.'
         agents[visible_role(role)] = definition
         agents[role] = {**definition, 'description':role.replace('-', ' '), 'hidden':True}
     for builtin in ('build','plan','general','explore'):

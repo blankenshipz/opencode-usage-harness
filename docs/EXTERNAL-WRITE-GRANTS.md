@@ -16,7 +16,7 @@ required field:
   "grants": [{
     "version": 1,
     "grantID": "migration-grant-20261031",
-    "workspace": "/Users/example/Code/source",
+    "workspace": "/workspace/source",
     "rootID": "ses_root",
     "parentID": "ses_root",
     "childID": "ses_existing_builder",
@@ -26,7 +26,7 @@ required field:
     "checkIds": ["copy", "verify"],
     "agent": "builder",
     "operation": "implement",
-    "externalRoot": "/Users/example/Code/live-skills",
+    "externalRoot": "/workspace/destination",
     "expiresAt": "2026-11-01T00:00:00.000Z",
     "revoked": false
   }]

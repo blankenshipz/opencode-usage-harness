@@ -102,10 +102,10 @@ export function prepareCheckpoint(record, now = Date.now(), options) {
   accounting.preparedSteps = Math.min(accounting.preparedSteps + 1, 1000000);
   return checkpointStatus(record, now, options);
 }
-export const checkpointReminder = 'Work checkpoint due. Finish collecting any already-running operation; do not cancel it or start replacement workers. Record one compact checkpoint with changed evidence, the current failed transition (if any), and one next action. Then hand the bounded result to your parent instead of starting another implementation cycle. If a child is still running, retain its ownership and report waiting_dependency; do not claim task completion or a human blocker. The parent continues authorized work from this checkpoint.';
+export const checkpointReminder = 'Progress checkpoint due. Briefly report changed evidence and the next concrete action without stopping useful authorized work. Continue the assigned implementation and targeted verification while making progress within ownership and scope. Return to the parent when the checkpoint objective is verified, a real dependency/permission blocker prevents progress, or repeated failed repairs require a changed approach. A timer alone is not a reason to yield, compact, redispatch, or request another lease. Finish collecting already-running operations; never cancel or replace workers for this reminder. Retain exact failures and receipts; idle is not task completion.';
 export function checkpointHandoff(checkpoint) {
   const target = checkpoint ? `\nCheckpoint target (assignment data): ${JSON.stringify(checkpoint)}` : '';
-  return `Bounded work checkpoint: produce one next result, not the whole remaining project. Reassess after 10 minutes or 30 prepared model steps at the next model boundary; collect running operations, record evidence and hand back. Do not expand into adjacent fixes. Preserve existing owners and passing evidence.${target}`;
+  return `Work toward the assigned result, including its targeted verification. After 10 minutes or 30 prepared model steps, assess progress and give a concise update on the existing execution; do not return solely because of elapsed time or step count. Complete the bounded objective before handoff unless blocked or a changed approach is needed. Do not expand into adjacent fixes. Preserve owners and passing evidence.${target}`;
 }
 export function backgroundDispatch(input) {
   // Inspect/summary calls remain short foreground work. Explicit overrides always win.
