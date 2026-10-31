@@ -32,7 +32,7 @@ class InstructionBudgetTest(unittest.TestCase):
         routing = data["routing"].lower()
         for phrase in (
             "complexity:'routine'|'standard'|'complex'", "risk:'normal'|'high'", "resetmodel:true",
-            "legacy sessions adopt", "compact:true", "wait idle", "completed/idle", "one bounded lane",
+            "legacy sessions adopt", "compact:true", "wait idle", "completed/idle", "one worker per bounded lane",
             "cumulative review", "permission loop", "completed boundary",
         ):
             self.assertIn(phrase, routing)
@@ -42,7 +42,7 @@ class InstructionBudgetTest(unittest.TestCase):
         routing = data["routing"].lower()
         leaf = data["leaf"].lower()
         for phrase in (
-            "stable integration owner", "end-to-end executable slice",
+            "stable integration owner", "end-to-end slice",
             "meaningful implementation and verification", "summary:true",
             "full status only to resolve a specific evidence gap", "real context pressure",
             "blanket git holds", "serialized commongit coordination scope",
@@ -50,6 +50,19 @@ class InstructionBudgetTest(unittest.TestCase):
         ):
             self.assertIn(phrase, routing)
         self.assertIn("rather than stopping for routine bookkeeping", leaf)
+
+    def test_delivery_denial_and_writer_continuation_contracts_are_explicit(self):
+        routing = self.load()["routing"].lower()
+        for phrase in (
+            "executable acceptance command", "input/output contract",
+            "delivery/publication have separate owners/checks", "stale parked delivery",
+            "explicit current gate", "content-rights/review gates",
+            "exact actor, action and resource", "never retry the denied action",
+            "retain admitted writepaths", "nondeploy operation changes",
+            "implicit same-key continuations", "readonly-to-writer",
+            "reject empty[]", "exact overlapping paths",
+        ):
+            self.assertIn(phrase, routing)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,8 @@ test('an external-only continuation retains its empty local scope when writePath
  await h.sourceHarness.call({...input('source',[path.join(h.destination,'external-only')]),sessionID:childID,externalWriteGrantID:'migration-grant'});
  await h.sourceHarness.call({...input('source',undefined),sessionID:childID});
  await h.sourceHarness.registry(h.source,async state=>assert.deepEqual(state.records[0].writePaths,[]));
+ await assert.rejects(h.sourceHarness.call({...input('source',[]),sessionID:childID}),/existing write-capable continuation requires explicit non-empty writePaths/);
+ await assert.rejects(h.sourceHarness.call({...input('source',undefined),sessionID:childID,operation:'inspect',requiredCapabilities:['shell']}),/operation|grant/i);
 });
 test('an active untracked destination session blocks an external grant',async t=>{
  const h=await setup(t);const initial=await h.sourceHarness.call(input('source',['local']));const childID=initial.metadata.sessionID;await h.grant({childID});
@@ -75,7 +77,7 @@ async function interruptedAdmission(h, { foreignOwner=false }={}) {
 }
 test('a dead childless admission binds its matching active recovered child to the old lease before existing return',async t=>{
  const h=await setup(t);const prior=await interruptedAdmission(h);
- const result=await h.sourceHarness.call(input('source',[]));assert.equal(result.metadata.sessionID,prior.childID);assert.equal(result.metadata.status,'running');
+ const result=await h.sourceHarness.call(input('source',['.']));assert.equal(result.metadata.sessionID,prior.childID);assert.equal(result.metadata.status,'running');
  await h.globalRegistry('all-writers',async state=>{const lease=state.leases.find(item=>item.token===prior.token);assert.equal(lease.childID,prior.childID);});
 });
 test('a candidate already owned by another record rejects without reassigning the old lease',async t=>{

@@ -31,7 +31,11 @@ export function assertWriterLeaseAvailable(state, candidate, { delegatedOwner } 
     throw new Error('task-dispatch: invalid global writer lease');
   for (const lease of state.leases ?? []) {
     if (lease.token===candidate.token || (lease.workspace===candidate.workspace && lease.key===candidate.key) || delegatedOwner?.(lease,candidate)) continue;
-    if (writerPathsOverlap(lease.paths,candidate.paths)) throw new Error(`task-dispatch: global overlapping writer lease owned by ${lease.childID ?? lease.key}; wait for its active owner`);
+    if (writerPathsOverlap(lease.paths,candidate.paths)) {
+      const requested=candidate.paths.filter(path => lease.paths.some(other => containsPath(path,other) || containsPath(other,path)));
+      const conflicting=lease.paths.filter(path => candidate.paths.some(other => containsPath(path,other) || containsPath(other,path)));
+      throw new Error(`task-dispatch: global overlapping writer lease owned by ${lease.childID ?? lease.key}; requested paths: ${requested.join(', ')}; conflicting paths: ${conflicting.join(', ')}; wait for its active owner`);
+    }
   }
 }
 export function reserveWriterLease(state, candidate, options) {

@@ -5,7 +5,7 @@ import { writerPathsOverlap, pruneWriterLeases, reserveWriterLease, finishWriter
 const lease=(token,key,paths,extra={})=>({token,key,workspace:'/workspace',paths,...extra});
 test('global leases reject ancestor and child path collisions but retain disjoint writers',()=>{
  const state={leases:[]};reserveWriterLease(state,lease('a','a',['/dst/source']),{sessions:[]});
- assert.throws(()=>reserveWriterLease(state,lease('b','b',['/dst/source/file']),{sessions:[]}),/overlapping/);
+ assert.throws(()=>reserveWriterLease(state,lease('b','b',['/dst/source/file']),{sessions:[]}),error=>/overlapping/.test(error.message)&&error.message.includes('owned by a')&&error.message.includes('requested paths: /dst/source/file')&&error.message.includes('conflicting paths: /dst/source'));
  reserveWriterLease(state,lease('c','c',['/dst/other']),{sessions:[]});assert.equal(state.leases.length,2);
  assert.equal(writerPathsOverlap(['/dst/source'],['/dst/source/file']),true);
 });

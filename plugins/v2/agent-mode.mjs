@@ -58,3 +58,11 @@ export async function guardNativeDispatch({ registry, workspace, loadSessions, c
     if (collision) throw new Error(`task-dispatch: native mode cannot start while registered writer ${collision.childID ?? collision.workKey} is active in this workspace.`);
   });
 }
+
+// Presentation only: keep native authorization as the execution boundary.
+// Coordinators cannot directly mutate files or execute shell; exposing those
+// tools invites role mistakes and misleading project-wide denial reports.
+export function hideCoordinatorMutationTools(event) {
+  if (!event?.tools || !['router', 'coordinator'].includes(canonicalHarnessRole(event.agent))) return;
+  for (const name of ['edit', 'write', 'patch', 'apply_patch', 'shell', 'bash']) delete event.tools[name];
+}

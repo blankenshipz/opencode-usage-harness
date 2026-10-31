@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — scoped continuations and delivery
+
+- Retain admitted writer scopes across non-deploy continuation operation changes; require explicit scope when adding write authority instead of silently reserving the workspace.
+- Explain ownership conflicts with requested and conflicting paths.
+- Hide direct mutation/shell tools from harness router and coordinator contexts; native permissions remain authoritative.
+- Keep publication/delivery assignments current and separate from feature acceptance, and agree on an executable producer/evaluator contract early.
+
 ## Unreleased — productive checkpoints
 
 - Turn elapsed-time/step checkpoint reminders into progress reassessments, without forcing a handoff during useful authorized work.

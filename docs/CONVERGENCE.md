@@ -25,6 +25,19 @@ shared intent; pass only relevant checks and a bounded target:
 }
 ```
 
+Before expansion, agree one executable acceptance command and its input/output
+contract with the producing worker and evaluator. Feature completion is separate
+from delivery or publication: assign that work and its current gate explicitly.
+A stale parked delivery assignment may resume only under current intent and a
+current gate; it never pushes, approves, or bypasses content-rights or review
+gates. Denials report the actor, action, and resource, leaving unrelated work
+authorized; another route must not retry the denied action.
+
+An admitted writer retains its `writePaths` through non-`deploy` operation
+changes and implicit continuation of the same work key. A read-only continuation
+becoming a writer must name paths explicitly; `[]` is rejected instead of falling
+back to a workspace root, and conflicts identify the exact overlapping paths.
+
 The field is optional for backward compatibility. Every newly admitted assignment
 gets a cooperative slice: 10 minutes or 30 prepared primary model steps. On the
 next existing primary context preparation, a stable reminder asks the worker to

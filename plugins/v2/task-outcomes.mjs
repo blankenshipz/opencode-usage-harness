@@ -1,4 +1,4 @@
-import { isNativeAgent } from './agent-mode.mjs';
+import { isNativeAgent, hideCoordinatorMutationTools } from './agent-mode.mjs';
 import { progressEvidenceSchema, normalizeProgressEvidence } from './convergence.mjs';
 import { attemptSchema, normalizeAttempt } from './verification-attempt.mjs';
 import { createMilestoneStore, installMilestoneSignals } from './milestones.mjs';
@@ -143,6 +143,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
   return { id: 'subscription.task-outcomes', async setup(ctx) {
     const shared = await installTaskDispatch(ctx,dispatchOptions);
     if (ctx.session?.hook) await ctx.session.hook('context', async event => {
+      hideCoordinatorMutationTools(event);
       if (!isNativeAgent(event.agent) || !event.tools) return;
       // Preserve the real native subagent tool, quota status and permissions.
       // Harness workflow tools must not leak instructions into native chats.

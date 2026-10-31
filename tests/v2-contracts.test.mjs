@@ -7,20 +7,20 @@ import { createV2TaskOutcomes } from '../plugins/v2/task-outcomes.mjs';
 function harness(plugin, connection = { type: 'credential', method: 'oauth' },
   credential = { type: 'oauth', methodID: 'chatgpt-headless', metadata: { accountID: 'same-account' } }, events = [],
   inventory = { provider: { package: '@opencode/ai/providers/openai', settings: { baseURL: 'https://chatgpt.com/backend-api/codex' } }, models: [] }) {
-  const tools = new Map(), hooks = new Map(), transforms = [];
+  const tools = new Map(), hooks = new Map(), hookRegistrations = [], transforms = [];
   const ctx = {
     provider: { transform: async callback => transforms.push(callback) },
     agent: { list: async () => ({ data: inventory.agents ?? [{ id: 'router', name: 'router', mode: 'primary', model: { providerID: 'openai', id: 'gpt-6-luna', variant: 'low' } }] }) },
     model: { list: async () => ({ data: inventory.models }) },
     tool: { transform: async callback => callback({ get: name => name === "subagent" ? { execute: async () => { throw new Error("unused native subagent"); } } : tools.get(name), update: () => {}, add: tool => tools.set(tool.name, tool) }) },
-    session: { hook: async (name, callback) => hooks.set(name, callback) },
+    session: { hook: async (name, callback) => { hookRegistrations.push({name,callback}); hooks.set(name, callback); } },
     integration: { connection: { active: async () => connection, resolve: async () => credential } },
     event: { subscribe: ({ signal }) => ({ async *[Symbol.asyncIterator]() {
       for (const event of events) { if (signal.aborted) break; yield event; }
     } }) },
   };
   ctx.provider.get = async ({ providerID }) => ({ data: inventory.providers?.[providerID] ?? inventory.provider });
-  return plugin.setup(ctx).then(cleanup => ({ tools, hooks, transforms, cleanup }));
+  return plugin.setup(ctx).then(cleanup => ({ tools, hooks, hookRegistrations, transforms, cleanup }));
 }
 
 const event = (providerID = 'openai', kind = 'primary') => ({
@@ -325,4 +325,20 @@ test('V2 completion telemetry retries once and a failed record does not stop lat
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(calls, ['m1', 'm1', 'm2']);
   h.cleanup();
+});
+
+test('coordinator context hides direct mutation tools but retains read and delegation surfaces', async () => {
+  const h = await harness(createV2TaskOutcomes({dispatchOptions:{registry:async (_workspace, callback)=>callback({records:[]},async()=>{}),loadSessions:async()=>[]}}));
+  for (const agent of ['router','harness-router','coordinator','harness-coordinator']) {
+    const tools = Object.fromEntries(['read','grep','glob','execute','task_dispatch','task_dispatch_status','edit','write','patch','apply_patch','shell','bash'].map(k=>[k,{name:k}]));
+    for (const hook of h.hookRegistrations.filter(h=>h.name==='context')) await hook.callback({agent, tools, system:[], messages:[]});
+    assert.deepEqual(Object.keys(tools), ['read','grep','glob','execute','task_dispatch','task_dispatch_status']);
+  }
+});
+test('mutation tool presentation leaves native agents and assigned workers unchanged', async () => {
+  const {hideCoordinatorMutationTools} = await import('../plugins/v2/agent-mode.mjs');
+  for (const agent of ['build','plan','general','explore','harness-builder','harness-verifier','custom-router',undefined]) {
+    const tools={edit:{},write:{},patch:{},shell:{}};
+    hideCoordinatorMutationTools({agent,tools});assert.deepEqual(Object.keys(tools),['edit','write','patch','shell']);
+  }
 });

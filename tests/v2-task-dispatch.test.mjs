@@ -241,26 +241,49 @@ test('prefixed coordinator shares duplicate ownership guard and old child IDs st
 });
 test('writers have disjoint ownership; deployment waits for existing writers',async t=>{
  const h=await harness(t);await h.call({...base,background:true});
- await assert.rejects(h.call({...base,workKey:'again',writePaths:['backend/api']}),/overlapping/);
+ await assert.rejects(h.call({...base,workKey:'again',writePaths:['backend/api']}),error=>/overlapping/.test(error.message)&&error.message.includes('owned by ses_1')&&error.message.includes('requested paths: /project/backend/api')&&error.message.includes('conflicting paths: /project/backend'));
  await h.call({...base,workKey:'mobile',writePaths:['mobile'],background:true});
  await assert.rejects(h.call({...base,workKey:'deploy',operation:'deploy',requiredCapabilities:['shell']}),/overlapping/);
  h.sessions.filter(s=>s.id!=='root').forEach(s=>s.active=false);
  await h.call({...base,workKey:'deploy',operation:'deploy',requiredCapabilities:['shell'],background:true});
  await assert.rejects(h.call({...base,workKey:'another-deploy',operation:'deploy',requiredCapabilities:['shell']}),/overlapping/);
 });
-test('continuation path retention cannot erase fresh writer or deploy workspace ownership',async t=>{
+test('continuation path retention keeps admitted scope across operations without widening read-only or deploy ownership',async t=>{
  const h=await harness(t);const inspect=(await h.call({...base,background:true})).metadata.sessionID;
  h.sessions.push({id:'active-writer',parentID:'root',agent:'builder',directory:'/project',active:true});
  await h.registry('/project',async(state,save)=>{Object.assign(state.records[0],{operation:'inspect',writePaths:[]});state.records.push({key:'other-writer',rootID:'root',parentID:'root',childID:'active-writer',taskId:'other',workKey:'writer',agent:'builder',writePaths:['backend'],state:'running'});await save();});
- await assert.rejects(h.call({...base,sessionID:inspect,background:true,writePaths:undefined}),/overlapping/);
+ await assert.rejects(h.call({...base,sessionID:inspect,background:true,writePaths:undefined}),/empty read-only scope requires explicit non-empty writePaths/);
 
  const deploy=await harness(t);const implement=(await deploy.call({...base,background:true})).metadata.sessionID;
  await deploy.call({...base,sessionID:implement,background:true,writePaths:['backend/api']});
  await deploy.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['backend/api']));
  deploy.sessions.push({id:'mobile-writer',parentID:'root',agent:'builder',directory:'/project',active:true});
  await deploy.registry('/project',async(state,save)=>{state.records.push({key:'mobile-writer',rootID:'root',parentID:'root',childID:'mobile-writer',taskId:'mobile',workKey:'writer',agent:'builder',writePaths:['mobile'],state:'running'});await save();});
- await assert.rejects(deploy.call({...base,sessionID:implement,operation:'verify',requiredCapabilities:['shell'],background:true,writePaths:undefined}),/overlapping/);
+ await deploy.call({...base,sessionID:implement,operation:'verify',requiredCapabilities:['shell'],background:true,writePaths:undefined});
+ await deploy.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['backend/api']));
  await assert.rejects(deploy.call({...base,sessionID:implement,operation:'deploy',requiredCapabilities:['shell'],background:true,writePaths:undefined}),/overlapping/);
+});
+test('same-child continuations retain narrow paths for explicit and implicit operation changes',async t=>{
+ const h=await harness(t);const child=(await h.call({...base,background:true})).metadata.sessionID;
+ h.sessions.push({id:'mobile-writer',parentID:'root',agent:'builder',directory:'/project',active:true});
+ await h.registry('/project',async(state,save)=>{state.records.push({key:'mobile-writer',rootID:'root',parentID:'root',childID:'mobile-writer',taskId:'mobile',workKey:'writer',agent:'builder',writePaths:['mobile'],state:'running'});await save();});
+ await h.call({...base,sessionID:child,operation:'inspect',requiredCapabilities:['shell'],background:true,writePaths:undefined});
+ await h.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['backend']));
+ h.sessions.find(session=>session.id===child).active=false;
+ const retained=await h.call({...base,operation:'verify',requiredCapabilities:['shell'],background:true,writePaths:undefined});
+ assert.equal(retained.content,'OK');assert.equal(h.calls.at(-1).sessionID,child);
+ await assert.rejects(h.call({...base,sessionID:child,operation:'verify',requiredCapabilities:['shell'],background:true,writePaths:[]}),/requires explicit non-empty writePaths/);
+});
+test('an edit-capable inspect continuation cannot widen an empty read-only scope by omission',async t=>{
+ const h=await harness(t);const child=(await h.call({...base,background:true})).metadata.sessionID;
+ await h.registry('/project',async(state,save)=>{Object.assign(state.records[0],{operation:'inspect',writePaths:[]});await save();});
+ await assert.rejects(h.call({...base,sessionID:child,operation:'inspect',requiredCapabilities:['shell'],background:true,writePaths:undefined}),/empty read-only scope requires explicit non-empty writePaths/);
+ await h.registry('/project',async(state,save)=>{delete state.records[0].writePaths;await save();});
+ await assert.rejects(h.call({...base,sessionID:child,operation:'inspect',requiredCapabilities:['shell'],background:true,writePaths:undefined}),/legacy continuation without a recorded write scope requires explicit non-empty writePaths/);
+});
+test('legacy child continuations without a record must declare non-empty writer paths',async t=>{
+ const h=await harness(t);h.sessions.push({id:'legacy-child',parentID:'root',agent:'builder',directory:'/project',active:false});
+ for (const writePaths of [undefined,[]]) await assert.rejects(h.call({...base,sessionID:'legacy-child',operation:'inspect',requiredCapabilities:['shell'],background:true,writePaths}),/legacy continuation without a recorded write scope requires explicit non-empty writePaths/);
 });
 test('legacy active workers block new writers; direct-child adoption preserves ownership',async t=>{
  const h=await harness(t);h.sessions.push({id:'legacy',parentID:'root',agent:'builder',directory:'/project',active:true});

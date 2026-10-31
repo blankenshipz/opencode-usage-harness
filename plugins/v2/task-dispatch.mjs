@@ -391,13 +391,35 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           const owner = state.records.find(r => r.childID === requested);
           if (owner && owner.key !== key) throw new Error(`task-dispatch: child belongs to taskId ${owner.taskId}, workKey ${owner.workKey}; retain that ownership identity`);
           if (record?.childID && record.childID !== requested) throw new Error('task-dispatch: workKey already owns another child; resume that child');
+          if (!record && input.operation !== 'deploy' && writes.length && (input.writePaths === undefined || (Array.isArray(input.writePaths) && input.writePaths.length === 0)))
+            throw new Error('task-dispatch: a legacy continuation without a recorded write scope requires explicit non-empty writePaths before it can perform a write-capable operation');
           if (reconcileCompaction(record, child, now)) await save();
-          // A continuation cannot silently widen a non-empty ownership set by
-          // omitting paths. An empty prior inspect scope must not suppress the
-          // fresh workspace reservation for implement/verify, and deploy always
-          // retains its exclusive workspace reservation. Explicit path changes
-          // still take the normal overlap and ownership route below.
-          if (record && input.sessionID && input.writePaths === undefined && record.operation === input.operation && input.operation !== 'deploy' && ((record.writePaths?.length ?? 0) > 0 || record.externalGrant || writes.length === 0)) writes = record.writePaths ?? writes;
+          // An owned continuation keeps its admitted local scope when it omits
+          // paths, even if its next bounded operation changes. This applies to
+          // both an explicit sessionID and the child resolved from the same
+          // work key. Deploy remains workspace-exclusive. A prior empty
+          // read-only scope never authorizes a later writer to claim the
+          // workspace by omission.
+          const hasRecordedLocalScope = record && Object.hasOwn(record,'writePaths');
+          const priorLocalWrites = record?.writePaths ?? [];
+          // `paths` accounts for both declared capabilities and the role's
+          // effective edit capability, so an edit-capable inspect request is
+          // treated as a writer when it would otherwise receive `.`.
+          const requestedLocalWriter = writes.length > 0;
+          if (record && input.writePaths === undefined && input.operation !== 'deploy') {
+            if (priorLocalWrites.length) writes = priorLocalWrites;
+            // An external-only owner has no local scope to retain, but its
+            // separately recorded grant is revalidated below for this exact
+            // operation. Do not classify it as a read-only owner here.
+            else if (record.externalGrant) writes = [];
+            else if (!hasRecordedLocalScope && requestedLocalWriter) throw new Error('task-dispatch: a legacy continuation without a recorded write scope requires explicit non-empty writePaths before it can perform a write-capable operation');
+            else if (requestedLocalWriter) throw new Error('task-dispatch: a continuation from an empty read-only scope requires explicit non-empty writePaths before it can perform a write-capable operation');
+          }
+          // An explicit empty array used to fall through to the workspace
+          // default. On an existing writer that is ambiguous and must be
+          // corrected rather than broadening its retained ownership.
+          if (record && Array.isArray(input.writePaths) && input.writePaths.length === 0 && requestedLocalWriter)
+            throw new Error('task-dispatch: an existing write-capable continuation requires explicit non-empty writePaths; [] cannot mean the workspace');
           if (staleRebind) {
             if (!input.sessionID) throw new Error(`task-intent: explicitly resume child ${requested} with sessionID and the current revision to deliver the correction. Recovery: ${JSON.stringify(rebindRecovery(record,intent))}`);
             if (child.active) throw new Error(`task-intent: child ${requested} is still active on a superseded revision; wait for it to become idle before explicitly rebinding. Recovery: ${JSON.stringify(rebindRecovery(record,intent))}`);
@@ -446,7 +468,11 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           for (const other of state.records) {
             if (other.key === key || other.childID === context.sessionID || descendant(sessions,context.sessionID,other.childID)) continue;
             const active = other.inFlight || sessions.some(s => s.active && (s.id === other.childID || descendant(sessions,s.id,other.childID)));
-            if (active && overlaps(writes, other.writePaths ?? [])) throw new Error(`task-dispatch: overlapping writes/deployment owned by ${other.childID ?? other.workKey}; wait for that owner and collect its evidence. Recovery: ${JSON.stringify(recovery(sessions,other.childID,context.sessionID,state.records))}`);
+            if (active && overlaps(writes, other.writePaths ?? [])) {
+              const requestedPaths=writes.filter(candidate => (other.writePaths ?? []).some(otherPath => overlaps([candidate],[otherPath]))).map(candidate => path.resolve(workspace,candidate));
+              const conflictingPaths=(other.writePaths ?? []).filter(otherPath => writes.some(candidate => overlaps([candidate],[otherPath]))).map(otherPath => path.resolve(workspace,otherPath));
+              throw new Error(`task-dispatch: overlapping writes/deployment owned by ${other.childID ?? other.workKey}; requested paths: ${requestedPaths.join(', ')}; conflicting paths: ${conflictingPaths.join(', ')}; wait for that owner and collect its evidence. Recovery: ${JSON.stringify(recovery(sessions,other.childID,context.sessionID,state.records))}`);
+            }
           }
           const legacy = busy.find(s => !state.records.some(r => r.childID === s.id) && agents.some(a => (a.id ?? a.name) === s.agent && hasCapability(a,'edit')));
           if (legacy) throw new Error(`task-dispatch: existing untracked worker ${legacy.id} may own workspace edits; finish or coordinate through its parent before starting another writer. Recovery: ${JSON.stringify(recovery(sessions,legacy.id,context.sessionID,state.records))}`);
