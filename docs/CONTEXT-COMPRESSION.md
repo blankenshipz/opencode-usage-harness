@@ -30,9 +30,9 @@ When adding a provider:
 4. Measure actual token usage and retrieval quality per family. Character savings
    are not universal token savings; tokenization and prompt caching differ. A
    future token estimator belongs behind a model-specific metrics interface,
-   not inside the lossless transformation or billing guard.
+   not inside the deterministic projection or billing guard.
 
-The current live profile still enables only OpenAI with its existing safeguards.
+Projection is independent of whether an installation enables one subscription pool or several; provider authentication and financial admission remain separate.
 Provider-hosted tools that bypass OpenCode's local tool hooks need a separately
 validated integration; shared compression cannot cover that path automatically.
 See the [subscription adapter contract](SUBSCRIPTION-POOLS.md#adapter-contract-before-enabling-a-provider).
@@ -45,7 +45,12 @@ See also [compression diagnostics](COMPRESSION-DIAGNOSTICS.md), [passive cache m
   keys. Rectangular arrays become explicit columns + rows, retaining every row
   and value in order. It never samples or summarizes away records.
 - Plain grep/glob path lists can share a common directory prefix, retaining every
-  suffix and match. Outputs not matching that format pass through.
+  suffix and match. Large recognized native search output (at least 16KiB) can
+  instead receive a bounded preview: up to 24 files, 64 grep matching lines and
+  three lines per file, within 12KiB of preview text. Exact omission counts and
+  narrowing guidance make this explicitly incomplete; the exact original must
+  be stored successfully before the preview is published. Narrow and unfamiliar
+  formats retain their native output. These previews use no model inference.
 - Recognized simple test/build shell commands can collapse **exact consecutive**
   repeated lines with explicit counts and source line ranges. Distinct errors,
   timestamps, paths and numbers are not normalized. Other shell results and the

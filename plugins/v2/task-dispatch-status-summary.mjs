@@ -45,11 +45,21 @@ function routingSummary(value) {
   return { ...own(value, 'selected'), ...own(value, 'effort'), ...(effort === undefined || value.effort !== undefined ? {} : { effort }) };
 }
 
+function contextSummary(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const summary = {};
+  for (const key of ['status', 'tokens', 'basis', 'observedAt', 'messageID', 'pressure', 'recommended', 'when', 'action', 'eligibleForCompaction', 'blockedReason', 'parentID', 'childID', 'advice']) {
+    if (value[key] !== undefined) summary[key] = value[key];
+  }
+  return summary;
+}
+
 function ownerSummary(owner) {
   const summary = {};
   for (const key of ['taskId', 'workKey', 'childID', 'parentID', 'agent', 'operation', 'intentRevision', 'checkIds', 'admissionGeneration', 'compactionID', 'compactionOutcome', 'recordedState', 'effectiveState', 'nativeExecution', 'collection', 'writePaths', 'rebind', 'needsRebind', 'denial', 'continuationOwner', 'activeDescendants', 'inFlight']) {
     if (owner?.[key] !== undefined) summary[key] = owner[key];
   }
+  if (owner?.context !== undefined) summary.context = contextSummary(owner.context);
   if (typeof owner?.publication?.revision === 'string') summary.publication = { revision: owner.publication.revision, ...own(owner.publication, 'checkout') };
   if (owner?.routing !== undefined) summary.routing = routingSummary(owner.routing);
   if (owner?.workCheckpoint !== undefined) summary.workCheckpoint = checkpointSummary(owner.workCheckpoint);
@@ -67,6 +77,7 @@ export function summarizeTaskDispatchStatus(status) {
   if (!status || typeof status !== 'object' || Array.isArray(status)) return status;
   return {
     owners: Array.isArray(status.owners) ? status.owners.map(ownerSummary) : [],
+    ...(status.selfContext === undefined ? {} : { selfContext: contextSummary(status.selfContext) }),
     ...own(status, 'quotaRecoveryPending'),
     ...(status.taskWork === undefined ? {} : { taskWork: taskWorkSummary(status.taskWork) }),
     ...own(status, 'userActions'),

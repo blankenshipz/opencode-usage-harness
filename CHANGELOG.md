@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — measured context and bounded search
+
+- Preserve completed context usage across streaming messages and invalidate pre-compaction observations; unknown is no longer zero.
+- Surface owner-bound safe-checkpoint compaction advice without status-side execution or new permission gates.
+- Bound large recognized search previews, report omissions and preserve exact originals for native retrieval.
+
+
 ## Unreleased — scoped Git publication
 
 - Separate frozen-commit publication from checkout-exclusive deployment.

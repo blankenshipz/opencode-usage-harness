@@ -3,6 +3,11 @@
 import { previewDiff } from './diff-preview.mjs';
 const MAX_BYTES = 1024 * 1024;
 const useful = (before, after) => before.length - after.length >= 512 && after.length <= before.length * 0.85;
+const SEARCH_PREVIEW_MIN_CHARS = 16 * 1024;
+const SEARCH_PREVIEW_MAX_CHARS = 12 * 1024;
+const SEARCH_PREVIEW_MAX_FILES = 24;
+const SEARCH_PREVIEW_MAX_MATCHES_PER_FILE = 3;
+const SEARCH_PREVIEW_MAX_MATCHES = 64;
 
 // Retain token spellings: JSON.parse/stringify would round large integers and
 // discard duplicate keys. Parse only to validate, then remove lexical whitespace.
@@ -90,6 +95,67 @@ function pathPrefix(text) {
     lines: lines.map(x => pathLine(x) ? [x.slice(prefix.length)] : x) });
 }
 
+// These formats are emitted by the native grep/glob tools. Keep the grammar
+// deliberately narrow: an unrecognized result must remain native output.
+function nativePath(line) {
+  return /^(?:\/?[\w.@+-]+\/)+[^\r\n]+$/.test(line);
+}
+function globPreview(text) {
+  const paths = text.split('\n');
+  if (paths.at(-1) === '') paths.pop();
+  if (paths.length <= SEARCH_PREVIEW_MAX_FILES || !paths.every(nativePath)) return undefined;
+  const shown = [];
+  for (const entry of paths) {
+    if (shown.length >= SEARCH_PREVIEW_MAX_FILES || previewLength(shown, entry) > SEARCH_PREVIEW_MAX_CHARS) break;
+    shown.push(entry);
+  }
+  if (!shown.length) return undefined;
+  return `[harness search-preview; native glob returned ${paths.length} files; showing ${shown.length}; omitted ${paths.length - shown.length} files. Narrow with a more specific path or pattern. Exact results are available from the saved snapshot.]\n${shown.join('\n')}`;
+}
+function previewLength(lines, next) {
+  return lines.reduce((size, line) => size + line.length + 1, 0) + next.length + 1;
+}
+function grepPreview(text) {
+  const lines = text.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  const heading = /^Found (\d+) matches$/.exec(lines[0] ?? '');
+  if (!heading) return undefined;
+  const groups = [];
+  for (let i = 1; i < lines.length;) {
+    // This is native tool truncation, not a form we reinterpret.
+    if (/^\(Results are truncated: showing first \d+ results\. Consider using a more specific path or pattern\.\)$/.test(lines[i])) {
+      if (++i !== lines.length) return undefined;
+      break;
+    }
+    const file = lines[i];
+    if (!file?.endsWith(':') || !nativePath(file.slice(0, -1))) return undefined;
+    i++;
+    const matches = [];
+    while (i < lines.length && /^  Line \d+: /.test(lines[i])) matches.push(lines[i++]);
+    if (!matches.length) return undefined;
+    groups.push({ file, matches });
+    if (i === lines.length) break; // Native output may omit its final separator.
+    if (lines[i] !== '') return undefined;
+    i++;
+  }
+  const totalMatches = groups.reduce((count, group) => count + group.matches.length, 0);
+  if (totalMatches <= SEARCH_PREVIEW_MAX_MATCHES && groups.length <= SEARCH_PREVIEW_MAX_FILES) return undefined;
+  const shown = [], usedFiles = new Set(); let shownMatches = 0;
+  for (const group of groups) {
+    if (usedFiles.size >= SEARCH_PREVIEW_MAX_FILES || shownMatches >= SEARCH_PREVIEW_MAX_MATCHES) break;
+    const entries = group.matches.slice(0, Math.min(SEARCH_PREVIEW_MAX_MATCHES_PER_FILE, SEARCH_PREVIEW_MAX_MATCHES - shownMatches));
+    const candidate = [group.file, ...entries, ''];
+    if (previewLength(shown, candidate.join('\n')) > SEARCH_PREVIEW_MAX_CHARS) break;
+    shown.push(...candidate); usedFiles.add(group.file); shownMatches += entries.length;
+  }
+  if (!shownMatches) return undefined;
+  return `[harness search-preview; native grep reported ${heading[1]} matches; this result listed ${totalMatches} matching lines in ${groups.length} files; showing ${shownMatches} matching lines in ${usedFiles.size} files; omitted ${totalMatches - shownMatches} matching lines and ${groups.length - usedFiles.size} files from this preview. Narrow with a more specific path or pattern. Exact results are available from the saved snapshot.]\nFound ${heading[1]} matches\n${shown.join('\n')}`;
+}
+function searchPreview(text, kind) {
+  if (text.length < SEARCH_PREVIEW_MIN_CHARS) return undefined;
+  return kind === 'glob' ? globPreview(text) : kind === 'grep' ? grepPreview(text) : undefined;
+}
+
 export function compactToolText(text, kind) {
   if (typeof text !== 'string' || text.length < 4096 || Buffer.from(text, 'utf8').toString('utf8') !== text || Buffer.byteLength(text) > MAX_BYTES || !['shell', 'grep', 'glob', 'json', 'diff'].includes(kind)) return undefined;
   const candidates = [];
@@ -101,7 +167,11 @@ export function compactToolText(text, kind) {
   }
   // JSON strings must never be rewritten as line logs or path lists.
   if (minified === undefined && kind === 'shell') candidates.push({ text: repeatLines(text), strategy: 'exact-repeat-lines' });
-  if (minified === undefined && ['grep', 'glob'].includes(kind)) candidates.push({ text: pathPrefix(text), strategy: 'path-prefix' });
+  if (minified === undefined && ['grep', 'glob'].includes(kind)) {
+    candidates.push({ text: searchPreview(text, kind), strategy: 'search-preview', lossless: false,
+      preservation: 'this search preview omits results; the exact native original is saved for retrieval.' });
+    candidates.push({ text: pathPrefix(text), strategy: 'path-prefix' });
+  }
   const best = candidates.filter(x => typeof x.text === 'string' && useful(text, x.text)).sort((a,b) => a.text.length-b.text.length)[0];
   return best ? { ...best, originalChars: text.length, compactedChars: best.text.length } : undefined;
 }

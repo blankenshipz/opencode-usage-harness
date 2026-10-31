@@ -50,7 +50,7 @@ solely to obtain a completion flag. Status inspection never collects or starts w
 ## Cumulative work and compact continuation
 
 The cooperative ten-minute/30-model-step slice remains. It asks the worker to
-collect the current operation and return evidence; it never kills tools. Lifetime
+give a concise progress update on the current execution; it never forces a return or kills tools. Lifetime
 prepared-step and continuation counts survive redispatch. After 120 steps or six
 continuations per work key, the next idle-worker admission requires
 `workReview: {hypothesis, evidenceReference}`. The whole root/task also aggregates
@@ -62,17 +62,38 @@ Legacy records initialize from their known current slice, not fabricated history
 Long uninterrupted runs still rely on cooperative checkpoint return; there is no
 hard mid-request cancellation or guaranteed spending ceiling.
 
-At a completed boundary, a worker whose observed last input context is at least
-120,000 tokens receives an advisory. This includes cache-read input and is not a
-measure of charged allowance. The parent can dispatch the same child with
-`compact: true` and a retained `checkpoint` objective/evidence. It must be idle,
-with no active descendants and new observed context. The harness invokes native
-same-session compaction, retains ownership, and returns a compaction-pending status.
-Admission alone is not completion: resumption waits for the matching durable
-compaction outcome and idle state. The next continuation refreshes the full shared
-intent. Compaction can use included inference; it is not free, automatic on every
-turn, or implemented by cloning a worker. Native compaction failures require
-inspection rather than repeated unchanged compaction calls.
+Context observations use the newest completed valid assistant usage after the
+latest successful compaction. Input plus cache-read/write counters are included;
+these are context measurements, not charged allowance. A streaming placeholder
+cannot overwrite a valid observation with zero. Missing or invalid usage stays
+unknown. The latest assistant identity remains independent for exact compaction
+binding. The lookup scans at most 64 recent assistant messages.
+
+Full and summary status expose `selfContext` for the caller and `context` for each
+owned child, with observation identity/time, pressure and a safe next action.
+The checkpoint status includes the same high-context advisory at 120,000 observed
+input tokens (or 80% when a context limit is known). Before another substantial
+continuation, collect current results, retain a concise checkpoint, then use
+`compact:true` on the same child when `eligibleForCompaction` is true. Active tools
+or descendants, pending admission, stale intent, denied work, an uncollected or
+mismatched generation, and another responsible parent prevent that recommendation
+from being ready. Context-pressure fields are advice, not new execution permission or a token-based
+admission gate. Explicit compaction of a background execution must first preserve
+its exact current-generation terminal receipt; compaction cannot erase uncollected
+proof. A verified source-evidence snapshot survives an admitted compaction failure
+for explicit same-child recovery. A missing or mismatched snapshot requires
+inspection; a compaction-only generation is never relabeled as a task result.
+Compaction cannot rebind stale intent: deliver the correction through the same
+child first. A final completed task needs no compaction.
+
+Status never collects, compacts or resumes work. Native same-session compaction
+must be explicitly admitted by the existing parent with the retained checkpoint;
+its ordinary authorization still applies. Wait for the matching durable outcome
+and idle state, then continue the same worker with refreshed full intent. Do not
+interrupt tools, clone a worker, retry a failed compaction unchanged, or manufacture
+work to obtain savings. Compaction can consume subscription capacity. Root
+`selfContext` makes pressure visible without inventing a cross-parent compaction
+route or automatically starting native compaction.
 
 Keep one bounded lane root → worker. Use a coordinator only for genuinely parallel
 or multi-component integration. Batch intent/receipt bookkeeping at meaningful

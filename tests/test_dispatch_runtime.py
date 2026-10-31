@@ -45,12 +45,78 @@ class DispatchRuntimeTest(unittest.TestCase):
             connection.execute("alter table session_v2 add column model text")
             connection.execute("alter table session_v2 add column metadata text")
             connection.execute("update session_v2 set model=?,metadata=?", (json.dumps({"id":"balanced","providerID":"demo","variant":"medium","private":"SECRET"}), json.dumps({"private":"SECRET","harnessMigration":{"historical":True,"canonicalSessionID":"original"}})))
-            connection.execute("insert into session_message values ('assistant','root','assistant',3,?)", (json.dumps({"tokens":{"input":200,"cache":{"read":120000}},"content":[{"type":"text","text":"SECRET"}]}),))
+            connection.execute("insert into session_message values ('assistant','root','assistant',3,?)", (json.dumps({"time":{"completed":3},"tokens":{"input":200,"cache":{"read":120000}},"content":[{"type":"text","text":"SECRET"}]}),))
         result = sessions(db_path=db)[0]
         self.assertEqual(result["model"], {"id":"balanced","providerID":"demo","variant":"medium"})
         self.assertEqual(result["contextTokens"], 120200)
         self.assertEqual(result["canonicalSessionID"], "original")
         self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_context_usage_uses_latest_completed_valid_observation_and_preserves_newest_binding(self):
+        db = self.fixture()
+        with sqlite3.connect(db) as connection:
+            connection.executemany(
+                "insert into session_message values (?, 'root', 'assistant', ?, ?)",
+                [
+                    ("completed", 3, json.dumps({"time": {"completed": 30}, "tokens": {"input": 4, "cache": {"read": 5, "write": 6}}})),
+                    ("inflight", 4, json.dumps({"tokens": {"input": 99}})),
+                ],
+            )
+        result = sessions(db_path=db)[0]
+        self.assertEqual(result["lastAssistantID"], "inflight")
+        self.assertEqual(result["contextTokens"], 15)
+        self.assertEqual(result["contextObservedAt"], 30)
+        self.assertEqual(result["contextMessageID"], "completed")
+
+    def test_context_usage_omits_unknown_invalid_and_precompaction_observations(self):
+        db = self.fixture()
+        with sqlite3.connect(db) as connection:
+            connection.execute("insert into session_message values ('old','root','assistant',3,?)", (json.dumps({"time": {"completed": 3}, "tokens": {"input": 10}}),))
+            connection.execute("insert into session_message values ('compact','root','compaction',4,?)", (json.dumps({"reason": "manual", "status": "completed"}),))
+            connection.execute("insert into session_message values ('bad','root','assistant',5,?)", (json.dumps({"time": {"completed": 5}, "tokens": {"input": float('nan')}}),))
+        result = sessions(db_path=db)[0]
+        self.assertEqual(result["lastAssistantID"], "bad")
+        self.assertNotIn("contextTokens", result)
+        self.assertNotIn("contextObservedAt", result)
+        self.assertNotIn("contextMessageID", result)
+
+    def test_context_usage_keeps_successful_auto_boundary_past_newer_manual_failure(self):
+        db = self.fixture()
+        with sqlite3.connect(db) as connection:
+            connection.execute("insert into session_message values ('old','root','assistant',3,?)", (json.dumps({"time": {"completed": 3}, "tokens": {"input": 10}}),))
+            connection.execute("insert into session_message values ('auto','root','compaction',4,?)", (json.dumps({"reason": "auto", "status": "completed"}),))
+            connection.execute("insert into session_message values ('manual-failed','root','compaction',5,?)", (json.dumps({"reason": "manual", "status": "failed"}),))
+            connection.execute("insert into session_message values ('new','root','assistant',6,?)", (json.dumps({"time": {"completed": 6}, "tokens": {"input": 7}}),))
+        result = sessions(db_path=db)[0]
+        self.assertEqual(result["lastCompaction"], {"id": "manual-failed", "status": "failed"})
+        self.assertEqual(result["contextTokens"], 7)
+        self.assertEqual(result["contextMessageID"], "new")
+
+    def test_context_usage_scan_is_bounded_and_reports_unknown(self):
+        db = self.fixture()
+        with sqlite3.connect(db) as connection:
+            connection.execute("insert into session_message values ('old','root','assistant',3,?)", (json.dumps({"time": {"completed": 3}, "tokens": {"input": 10}}),))
+            connection.executemany(
+                "insert into session_message values (?, 'root', 'assistant', ?, ?)",
+                [(f"invalid-{seq}", seq, json.dumps({"time": {"completed": seq}, "tokens": {"input": -1}})) for seq in range(4, 68)],
+            )
+        result = sessions(db_path=db)[0]
+        self.assertEqual(result["lastAssistantID"], "invalid-67")
+        self.assertNotIn("contextTokens", result)
+
+    def test_context_usage_accepts_true_zero_and_rejects_failed_or_cancelled(self):
+        db = self.fixture()
+        with sqlite3.connect(db) as connection:
+            connection.executemany(
+                "insert into session_message values (?, 'root', 'assistant', ?, ?)",
+                [
+                    ("valid-zero", 3, json.dumps({"finish": "stop", "time": {"completed": 3}, "tokens": {"input": 0, "cache": {"read": 0, "write": 0}}})),
+                    ("cancelled", 4, json.dumps({"finish": "cancelled", "time": {"completed": 4}, "tokens": {"input": 99}})),
+                ],
+            )
+        result = sessions(db_path=db)[0]
+        self.assertEqual(result["lastAssistantID"], "cancelled")
+        self.assertEqual(result["contextTokens"], 0)
 
     def test_defaults_are_state_dir_and_database_is_required(self):
         with patch.dict(os.environ, {"HARNESS_STATE_DIR": "/tmp/harness-state"}, clear=True):

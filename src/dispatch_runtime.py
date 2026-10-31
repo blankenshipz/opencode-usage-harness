@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import sqlite3
 import sys
 from pathlib import Path
@@ -40,6 +41,66 @@ def intent_sources(session_id: str, *, db_path: str | Path | None = None) -> lis
         return sources
 
 
+def _completed_context_observation(raw: str, message_id: object) -> tuple[object, object] | None:
+    """Return (completed time, context token count) for a usable assistant."""
+    try:
+        item = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(item, dict) or item.get("error"):
+        return None
+    if item.get("finish") in ("error", "cancelled", "aborted"):
+        return None
+    timing = item.get("time")
+    completed = timing.get("completed") if isinstance(timing, dict) else None
+    if not isinstance(completed, (int, float)) or isinstance(completed, bool) or not math.isfinite(completed) or completed <= 0:
+        return None
+    tokens = item.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+
+    # Native providers use tokens.cache.read/write.  Keep older flat names
+    # readable only when the native cache object is absent, while treating
+    # present invalid values as invalid rather than silently turning them into
+    # zero.
+    values = []
+    present = False
+    if "input" in tokens:
+        present = True
+        value = tokens["input"]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            return None
+        values.append(value)
+    cache = tokens.get("cache")
+    if "cache" in tokens:
+        if isinstance(cache, dict):
+            for key in ("read", "write"):
+                if key in cache:
+                    present = True
+                    value = cache[key]
+                    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+                        return None
+                    values.append(value)
+        elif isinstance(cache, (int, float)) and not isinstance(cache, bool) and math.isfinite(cache) and cache >= 0:
+            present = True
+            values.append(cache)
+        else:
+            return None
+    else:
+        for aliases in (("cache_read", "cacheRead"), ("cache_write", "cacheWrite")):
+            for key in aliases:
+                if key in tokens:
+                    present = True
+                    value = tokens[key]
+                    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+                        return None
+                    values.append(value)
+                    break
+    if not present:
+        return None
+    return completed, sum(values)
+
+
 def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
     # Pinned V2 contract: claim() sets this historically named column; release()
     # clears it. Non-null means claimed execution, not proof of useful progress.
@@ -60,18 +121,31 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
                     item["canonicalSessionID"] = migration["canonicalSessionID"]
             except (ValueError, TypeError, AttributeError):
                 pass
-            latest = connection.execute("SELECT id,json_extract(data,'$.tokens.input'),json_extract(data,'$.tokens.cache.read') FROM session_message WHERE session_id=? AND type='assistant' ORDER BY seq DESC LIMIT 1", (row[0],)).fetchone()
+            latest = connection.execute("SELECT id FROM session_message WHERE session_id=? AND type='assistant' ORDER BY seq DESC LIMIT 1", (row[0],)).fetchone()
             if latest:
-                try:
-                    values = [latest[1] or 0, latest[2] or 0]
-                    if all(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 for v in values):
-                        item["contextTokens"] = sum(values)
-                        item["lastAssistantID"] = latest[0]
-                except (ValueError, TypeError, AttributeError):
-                    pass
+                # This binding is independent of usage validity: an in-flight
+                # newest assistant still identifies the native compaction point.
+                item["lastAssistantID"] = latest[0]
             compact = connection.execute("SELECT id,json_extract(data,'$.status') FROM session_message WHERE session_id=? AND type='compaction' AND json_extract(data,'$.reason')='manual' ORDER BY seq DESC LIMIT 1", (row[0],)).fetchone()
             if compact and compact[1] in ('running', 'completed', 'failed'):
                 item['lastCompaction'] = {'id': compact[0], 'status': compact[1]}
+            # A later failed/running manual compaction does not erase the last
+            # successful boundary.  Any completed compaction is a boundary.
+            boundary = connection.execute("SELECT seq FROM session_message WHERE session_id=? AND type='compaction' AND json_extract(data,'$.status')='completed' ORDER BY seq DESC LIMIT 1", (row[0],)).fetchone()
+            query = "SELECT id,data FROM session_message WHERE session_id=? AND type='assistant'"
+            params: list[object] = [row[0]]
+            if boundary:
+                query += " AND seq>?"
+                params.append(boundary[0])
+            query += " ORDER BY seq DESC LIMIT 64"
+            for assistant_id, assistant_data in connection.execute(query, params):
+                observation = _completed_context_observation(assistant_data, assistant_id)
+                if observation is not None:
+                    completed, context_tokens = observation
+                    item["contextTokens"] = context_tokens
+                    item["contextObservedAt"] = completed
+                    item["contextMessageID"] = assistant_id
+                    break
             rows.append(item)
         return rows
 

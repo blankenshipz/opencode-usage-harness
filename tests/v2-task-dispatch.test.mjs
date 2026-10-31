@@ -821,3 +821,62 @@ test('review provenance binds a completed implementation owner and rejects forge
  await assert.rejects(h.call({...review,workKey:'required-without-owner',routing:{complexity:'complex',risk:'high',reviewIndependence:'required'}}),/needs routing\.reviewOfChildID/);
  assert.equal(h.calls.length,3);
 });
+
+
+test('summary exposes observed context and safe checkpoint action without starting work',async t=>{
+ const h=await harness(t);const first=await h.call({...base,background:true});const id=first.metadata.sessionID;
+ const child=h.sessions.find(s=>s.id===id);Object.assign(child,{contextTokens:450000,contextObservedAt:1234,contextMessageID:'msg_usage',lastAssistantID:'msg_last'});
+ let compactCalls=0;h.ctx.session.compact=async()=>{compactCalls++;};
+ const calls=h.calls.length;
+ let status=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].workCheckpoint.highContext.used,450000);assert.equal(status.owners[0].context.blockedReason,'wait_for_current_work');assert.equal(status.selfContext.status,'unknown');
+ child.active=false;
+ status=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].context.action,'collect_then_compact_same_child');assert.equal(status.owners[0].context.eligibleForCompaction,false);
+ await h.registry('/project',async(state,save)=>{Object.assign(state.records[0],{state:'completed',completionReceipt:{generation:1}});await save();});
+ status=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].context.eligibleForCompaction,true,JSON.stringify(status.owners[0].context));assert.equal(status.owners[0].context.action,'compact_same_child');assert.equal(status.owners[0].context.childID,id);
+ assert.equal(h.calls.length,calls);assert.equal(compactCalls,0);
+ const summary=summarizeTaskDispatchStatus({selfContext:{status:'known',tokens:5,prompt:'SECRET'},owners:[{context:{status:'unknown',prompt:'SECRET'}}]});
+ assert.equal(JSON.stringify(summary).includes('SECRET'),false);
+});
+
+
+test('compaction preserves an uncollected background generation until its exact receipt is collected',async t=>{
+ let available=true;const receipt={promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3};
+ const h=await harness(t,undefined,undefined,{loadCompletionReceipt:async()=>available?receipt:null});
+ const started=await h.call({...base,background:true});const id=started.metadata.sessionID;
+ const child=h.sessions.find(s=>s.id===id);Object.assign(child,{active:false,lastAssistantID:'answer',contextTokens:450000});
+ let compactCalls=0;h.ctx.session.compact=async()=>{compactCalls++;};
+ const input={...base,sessionID:id,compact:true,checkpoint:{objective:'Retain validated repair',expectedEvidence:'receipt-current'}};
+ await assert.rejects(h.call(input),/collect the current background generation before compaction/);
+ assert.equal(compactCalls,0);assert.equal(h.calls.length,1);
+ await h.registry('/project',async state=>{assert.equal(state.records[0].state,'running');assert.equal(state.records[0].admissionGeneration,1);assert.equal(state.records[0].compactedThrough,undefined);});
+ await h.call({taskId:'release',workKey:'backend',sessionID:id,generation:1},'task_dispatch_collect');
+ available=false;await assert.rejects(h.call(input),/compaction completion receipt no longer matches/);assert.equal(compactCalls,0);
+ available=true;await h.call(input);assert.equal(compactCalls,1);assert.equal(h.calls.length,1);
+});
+
+
+test('failed background compaction recovery retains the previously verified source receipt only',async t=>{
+ let available=true;const receipt={promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3};
+ const h=await harness(t,undefined,undefined,{loadCompletionReceipt:async()=>available?receipt:null});
+ const started=await h.call({...base,background:true});const id=started.metadata.sessionID;const child=h.sessions.find(s=>s.id===id);Object.assign(child,{active:false,lastAssistantID:'answer',contextTokens:450000});
+ await h.call({taskId:'release',workKey:'backend',sessionID:id,generation:1},'task_dispatch_collect');
+ const compactions=[];h.ctx.session.compact=async input=>compactions.push(input);
+ const input={...base,sessionID:id,compact:true,checkpoint:{objective:'Retain validated repair',expectedEvidence:'receipt-current'}};
+ await h.call(input);available=false;child.lastCompaction={id:compactions[0].id,status:'failed'};child.lastAssistantID='failed-compaction-assistant';
+ let status=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].context.action,'inspect_failed_compaction');assert.equal(status.owners[0].context.eligibleForCompaction,false);
+ await h.call({...input,checkpoint:{objective:'Changed recovery approach',expectedEvidence:'failure-receipt'}});assert.equal(compactions.length,2);assert.equal(h.calls.length,1);
+ child.lastCompaction={id:compactions[1].id,status:'failed'};child.lastAssistantID='next-failed-compaction';await h.call({taskId:'release'},'task_dispatch_status');
+ await h.registry('/project',async(state,save)=>{state.records[0].compactionSourceEvidence.childID='other';await save();});
+ await assert.rejects(h.call(input),/compaction recovery source evidence is unavailable or mismatched/);assert.equal(compactions.length,2);
+});
+
+test('compaction cannot treat a stale assignment as delivery of current intent',async t=>{
+ const h=await harness(t);const first=await h.call({...base,background:false});const child=h.sessions.find(s=>s.id===first.metadata.sessionID);child.lastAssistantID='answer';let compactions=0;h.ctx.session.compact=async()=>{compactions++;};
+ await h.call({action:'set',taskId:'release',expectedRevision:1,intent:{...intent,target:'Corrected target',sourceMessageIDs:['msg_correction']}},'task_intent');
+ await assert.rejects(h.call({...base,sessionID:child.id,intentRevision:2,compact:true,checkpoint:{objective:'Retain result',expectedEvidence:'receipt'}}),/deliver the current intent.*before compaction/);
+ assert.equal(compactions,0);assert.equal(h.calls.length,1);
+});

@@ -57,6 +57,40 @@ function contextAdvisory(knownContext) {
   return used >= HIGH_CONTEXT_TOKENS ? { used, advisory: 'Known context is high. Reassess the next hypothesis with retained evidence before adding more work.' } : undefined;
 }
 
+// An observation describes a completed model input, not an in-flight placeholder.
+// Unknown usage stays unknown; metadata is allowlisted so status never exports prompts.
+export function observedContext(native) {
+  const tokens = native?.contextTokens;
+  if (!Number.isFinite(tokens) || tokens < 0) return { status: 'unknown' };
+  const observation = { status: 'known', tokens, basis: 'last_completed_model_input', pressure: contextAdvisory({ tokens }) ? 'high' : 'normal' };
+  if (Number.isFinite(native.contextObservedAt) && native.contextObservedAt > 0) observation.observedAt = native.contextObservedAt;
+  if (typeof native.contextMessageID === 'string' && native.contextMessageID.length <= 160) observation.messageID = native.contextMessageID;
+  return observation;
+}
+
+// Advice only. A status read never compacts, resumes, collects or releases a lease.
+export function contextMaintenance(record, native, { callerID, activeDescendants = [], compactionAvailable = false, needsRebind = false } = {}) {
+  const observation = observedContext(native);
+  const pressure = contextAdvisory(observation);
+  if (!pressure) return { ...observation, pressure: observation.status === 'known' ? 'normal' : 'unknown' };
+  let blockedReason;
+  if (!native || typeof native.active !== 'boolean') blockedReason = 'native_state_unknown';
+  else if (native.active || activeDescendants.length) blockedReason = 'wait_for_current_work';
+  else if (record.parentID !== callerID) blockedReason = 'recorded_parent_required';
+  else if (record.denial) blockedReason = 'resolve_recorded_denial';
+  else if (record.inFlight || record.state === 'compacting') blockedReason = 'admitted_operation_pending';
+  else if (needsRebind) blockedReason = 'current_intent_rebind_required';
+  else if (record.state === 'awaiting_recovery' && record.compactionOutcome?.id === record.compactionID && record.compactionOutcome?.status === 'failed') blockedReason = 'inspect_failed_compaction';
+  else if (record.state !== 'completed') blockedReason = 'collect_current_result_first';
+  else if (record.completionBinding?.background && (record.completionReceipt?.generation !== record.admissionGeneration || record.completionBinding.generation !== record.admissionGeneration)) blockedReason = 'current_generation_receipt_required';
+  else if (!native.lastAssistantID || native.lastAssistantID === record.compactedThrough) blockedReason = 'no_new_observed_context';
+  else if (!compactionAvailable) blockedReason = 'native_compaction_unavailable';
+  return { ...observation, pressure: 'high', recommended: true, when: 'before_next_substantial_continuation',
+    action: blockedReason === 'inspect_failed_compaction' ? 'inspect_failed_compaction' : blockedReason === 'collect_current_result_first' ? 'collect_then_compact_same_child' : 'compact_same_child',
+    eligibleForCompaction: !blockedReason, ...(blockedReason ? { blockedReason } : {}), parentID: record.parentID, childID: record.childID,
+    advice: 'If more substantial work remains, retain current results and checkpoint, then explicitly compact and resume this same child through its recorded parent. Finish active tools first. Completion alone needs no compaction; never create a replacement or inference from status.' };
+}
+
 export function normalizeReviewAcknowledgement(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
       Object.keys(value).some(key => !['hypothesis', 'evidenceReference'].includes(key)) ||

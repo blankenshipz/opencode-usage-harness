@@ -1,6 +1,6 @@
 import { readRoutingQuota, readRoutingPolicy, selectDispatchModel, modelReference, TASK_TYPES } from './dispatch-routing.mjs';
 import { observeAdmission, convergenceAdvice, userActions, recordProgress, normalizeProgressEvidence } from './convergence.mjs';
-import { checkpointSchema, normalizeCheckpoint, beginCheckpoint, acknowledgeTaskReview, normalizeReviewAcknowledgement, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
+import { checkpointSchema, normalizeCheckpoint, observedContext, contextMaintenance, beginCheckpoint, acknowledgeTaskReview, normalizeReviewAcknowledgement, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
 import path from 'node:path';
 import { realpath } from 'node:fs/promises';
@@ -163,14 +163,28 @@ function collectionEligibility({ record, child, sessions, rootID, current, calle
 // `reviewOf` predates durable worker provenance and remains a routing hint for
 // compatible callers.  A child ID is the only way a managed dispatch may make
 // a verified family claim or require cross-family review.
-async function validateBackgroundReceipt(owner, child, loadCompletionReceipt) {
+async function validateBackgroundReceipt(owner, child, loadCompletionReceipt, purpose = 'review author') {
   const receipt=owner.completionReceipt,binding=owner.completionBinding;
   if (!binding?.background) return;
   if (!receipt || receipt.generation!==owner.admissionGeneration || receipt.generation!==binding.generation || receipt.marker!==binding.marker || receipt.promptHash!==binding.promptHash || !receipt.promptID || !receipt.assistantID || !receipt.idleID)
-    throw new Error('task-dispatch: review author completion receipt is missing or does not bind its admitted background generation');
+    throw new Error(`task-dispatch: ${purpose} completion receipt is missing or does not bind its admitted background generation`);
   const observed=await loadCompletionReceipt({sessionID:owner.childID,marker:binding.marker,promptHash:`${binding.promptHash},${binding.prefixedPromptHash}`});
   if (!observed || ['promptID','assistantID','assistantSeq','idleID','idleSeq'].some(key=>observed[key]!==receipt[key]))
-    throw new Error('task-dispatch: review author completion receipt no longer matches the native terminal chain');
+    throw new Error(`task-dispatch: ${purpose} completion receipt no longer matches the native terminal chain`);
+}
+function compactionSourceEvidence(record, childID) {
+  const receipt=record.completionReceipt, binding=record.completionBinding;
+  if (!receipt || !binding?.background) return undefined;
+  return { childID, sourceGeneration:receipt.generation, intentRevision:record.intentRevision, checkIds:record.checkIds,
+    binding:{generation:binding.generation,marker:binding.marker,promptHash:binding.promptHash,prefixedPromptHash:binding.prefixedPromptHash},
+    receipt:Object.fromEntries(['generation','marker','promptHash','promptID','assistantID','assistantSeq','idleID','idleSeq'].map(key=>[key,receipt[key]])) };
+}
+function hasRetainedCompactionEvidence(record, childID) {
+  const saved=record.compactionSourceEvidence;
+  if (record.state!=='awaiting_recovery' || record.compactionOutcome?.id!==record.compactionID || record.compactionOutcome?.status!=='failed' || !saved || saved.compactionID!==record.compactionID) return false;
+  const {compactionID,...identity}=saved;
+  const expected=compactionSourceEvidence(record,childID);
+  return expected && Number.isInteger(saved.sourceGeneration) && saved.sourceGeneration===record.completionBinding.generation && JSON.stringify(identity)===JSON.stringify(expected);
 }
 async function resolveReviewProvenance({ input, state, sessions, rootID, record, requested, loadCompletionReceipt }) {
   const routing=input.routing;
@@ -589,10 +603,20 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           hasActiveDescendant:Boolean(requested && sessions.some(session=>session.active&&descendant(sessions,session.id,requested)))});
         if (routedInput.routing?.reviewProvenance) routing.reviewProvenance=routedInput.routing.reviewProvenance;
         if (routedInput.routing?.reviewIndependence) routing.reviewIndependence=routedInput.routing.reviewIndependence;
+        let retainedCompactionEvidence;
         if (input.compact) {
+          if (staleRebind) throw new Error('task-dispatch: deliver the current intent to this same child before compaction; compaction cannot rebind stale intent');
           if (!requested || !checkpoint || !ctx.session?.compact) throw new Error('task-dispatch: compaction requires an existing worker, retained checkpoint and supported native compact API');
           if (sessions.some(s=>s.active&&(s.id===requested||descendant(sessions,s.id,requested)))) throw new Error('task-dispatch: wait for this worker and its descendants before checkpoint compaction');
           if (!child.lastAssistantID || child.lastAssistantID===record.compactedThrough) throw new Error('task-dispatch: no new observed context to compact');
+          if (record.completionBinding?.background) {
+            if (!hasRetainedCompactionEvidence(record,requested)) {
+              if (record.state === 'awaiting_recovery' && record.compactionOutcome?.id === record.compactionID && record.compactionOutcome?.status === 'failed') throw new Error('task-dispatch: compaction recovery source evidence is unavailable or mismatched; inspect the retained source receipt; do not collect a compaction-only generation as a task result');
+              if (record.state !== 'completed') throw new Error('task-dispatch: collect the current background generation before compaction; preserve its exact terminal receipt');
+              await validateBackgroundReceipt(record,child,loadCompletionReceipt,'compaction');
+            }
+            retainedCompactionEvidence=compactionSourceEvidence(record,requested);
+          }
         }
         const contextAdvice=checkpointStatus(record,now(),{knownContext:{tokens:child?.contextTokens}})?.highContext;
         // Native delivery has not yet acknowledged the corrected assignment.
@@ -608,7 +632,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         // Assignment binding starts at admission so an accepted child can record checkpoints while
         // its native call is still running. Delivery acknowledgement is tracked separately below.
         const generation=(record.admissionGeneration ?? 0)+1;
-        Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now(),admissionGeneration:generation,publication:input.operation === 'publish' ? { revision: input.publication.revision, checkout: publicationScope.checkout } : undefined,
+        Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now(),admissionGeneration:generation,publication:input.operation === 'publish' ? { revision: input.publication.revision, checkout: publicationScope.checkout } : undefined,compactionSourceEvidence:input.compact?retainedCompactionEvidence:undefined,
           ...(externalGrant ? { externalWrites, externalGrant:{grantID:externalGrant.grantID,externalRoot:externalGrant.externalRoot} } : { externalWrites:[], externalGrant:undefined }) });
         beginCheckpoint(record, checkpoint, now());
         const canonicalWorkspace=await canonicalWriterPath(workspace);
@@ -621,7 +645,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
             {sessions,delegatedOwner:lease=>lease.childID===context.sessionID || (lease.childID&&descendant(sessions,context.sessionID,lease.childID))});
           await saveGlobal();
         }
-        await save(); return { key,childID:requested,intent,fullIntent,convergence,routing,contextAdvice,lastAssistantID:child?.lastAssistantID,generation,restoreBinding,writerLease:absoluteWrites.length>0 };
+        await save(); return { key,childID:requested,intent,fullIntent,convergence,routing,contextAdvice,lastAssistantID:child?.lastAssistantID,retainedCompactionEvidence,generation,restoreBinding,writerLease:absoluteWrites.length>0 };
        }); } catch(error) {
          // Native execution has not begun. Remove only this admission's provisional reservation.
          if (globalState.leases?.some(lease=>lease.token===token)) { globalState.leases=globalState.leases.filter(lease=>lease.token!==token);await saveGlobal(); }
@@ -653,7 +677,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       try {
         if (input.compact) {
           compactionID='msg_'+crypto.randomUUID().replaceAll('-','');
-          await update({state:'compacting',compactionID,compactionOutcome:undefined,compactionFailed:undefined,continuationOwnerID:admission.childID});
+          await update({state:'compacting',compactionID,compactionOutcome:undefined,compactionFailed:undefined,continuationOwnerID:admission.childID,compactionSourceEvidence:admission.retainedCompactionEvidence?{...admission.retainedCompactionEvidence,compactionID}:undefined});
           await ctx.session.compact({sessionID:admission.childID,id:compactionID});
           await update({state:'compacting',inFlight:null,compactedThrough:admission.lastAssistantID,deliveredIntentRevision:undefined,deliveredCheckIds:undefined});
           return {content:'Native same-session compaction admitted. Wait for idle, then resume this worker; full intent will be refreshed. No replacement worker created.',metadata:{sessionID:admission.childID,status:'compacting'}};
@@ -663,7 +687,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           : `${renderIntentReference(admission.intent,input.checkIds)}\n\nNext action:\n${input.prompt}`;
         const marker=`task-dispatch-generation-${crypto.randomUUID()}`;
         const publicationHandoff = input.operation === 'publish' ? `\n\nPublication binding: publish only frozen commit ${input.publication.revision} from checkout ${publicationScope.checkout}, never HEAD. Use a non-force push, let repository hooks run, and preserve native permission prompts, denials, and history. This scope coordination does not authorize a command or any new workspace access.` : '';
-        const baseHandoff = `${handoff}${publicationHandoff}\n\n${checkpointHandoff(checkpoint)}${admission.contextAdvice ? "\nHigh context: at the next completed boundary retain a concise checkpoint and ask the parent for same-session compact:true before further work." : ""}`;
+        const baseHandoff = `${handoff}${publicationHandoff}\n\n${checkpointHandoff(checkpoint)}${admission.contextAdvice ? "\nHigh context: at the next completed boundary retain a concise checkpoint and ask the parent for same-session compact:true before further substantial work. Do not request compaction while tools are active or for a final completion-only report." : ""}`;
         const markedHandoff = `${baseHandoff}\n\nDispatch completion marker: ${marker}`;
         const boundedHandoff = admission.convergence ? `${markedHandoff}\n\nConvergence advisory: ${admission.convergence.advisory}` : markedHandoff;
         const promptHash=crypto.createHash('sha256').update(boundedHandoff).digest('hex');
@@ -750,12 +774,13 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         }
         if (delivered) await save();
       } catch { /* status remains read-safe; the durable receipt stays pending for a later explicit retry */ }
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,key:undefined,recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},workCheckpoint:checkpointStatus(r,now()),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,key:undefined,recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }
       const currentRecovery = entry => state.records.some(r => r.rootID===rootID && r.parentID===entry.target.parentID && r.childID===entry.target.childID && r.admissionGeneration===entry.target.generation);
-      const status={owners,quotaRecoveryPending:pendingQuotaRecovery(state).filter(currentRecovery),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))};
+      const self=sessions.find(s=>s.id===context.sessionID);
+      const status={owners,selfContext:observedContext(self),quotaRecoveryPending:pendingQuotaRecovery(state).filter(currentRecovery),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))};
       return {content:JSON.stringify(input.summary===true?summarizeTaskDispatchStatus(status):status)};
     })});
   });

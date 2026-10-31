@@ -39,9 +39,9 @@ export function createOutputStore(directory = statePath('tool-output-store'), op
     const reference = digest(JSON.stringify([event.sessionID, event.messageID, event.id, index, hash]));
     const destination = path.join(directory, reference);
     const chunksPath = path.join(destination, 'chunks.jsonl');
-    const preservation = compacted.lossless === false
+    const preservation = compacted.preservation ?? (compacted.lossless === false
       ? 'unchanged context omitted; every file, hunk, and changed line retained; this preview is not an applyable patch.'
-      : 'all values/entries retained.';
+      : 'all values/entries retained.');
     const projected = `${compacted.text}\n${marker} ${compacted.strategy}; ${preservation} Exact original snapshot: ${path.join(destination, 'original.txt')}. For bounded retrieval use native read on ${chunksPath}, offset=1, limit=3; ignore native read headers and strip each N: line prefix; each stored line is a JSON string, concatenate decoded strings in order. Snapshot is not current source.]`;
     // Include the retrieval instructions in the saving; compression must pay for itself.
     if (Buffer.byteLength(projected) > 24 * 1024 || projected.split('\n').length > 1500) return skip('projection_over_budget');

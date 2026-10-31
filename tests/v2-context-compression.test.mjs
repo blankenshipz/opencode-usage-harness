@@ -164,6 +164,47 @@ test('diff preview marker is honest and the saved snapshot remains exact',async 
  const [record]=(await fs.readdir(f.directory)).filter(x=>!x.startsWith('.'));
  assert.equal(await fs.readFile(path.join(f.directory,record,'original.txt'),'utf8'),original);
 });
+test('large native grep receives a bounded, recoverable preview with exact omission counts',async t=>{
+ const f=await fixture(t);
+ const lines=['Found 2100 matches'];
+ for(let i=0;i<700;i++) lines.push(`/workspace/src/feature-${i}.ts:`,`  Line ${i * 3 + 1}: match ${i}-a with enough text to make this result large`, `  Line ${i * 3 + 2}: match ${i}-b with enough text to make this result large`, `  Line ${i * 3 + 3}: match ${i}-c with enough text to make this result large`,'');
+ const original=lines.join('\n');
+ const e={...base,tool:'grep',input:{pattern:'private-token-value'},status:'completed',result:{content:original}};
+ await f.before(e);await f.after(e);
+ assert.ok(original.length > 150 * 1024);
+ assert.match(e.result.content,/harness search-preview; native grep reported 2100 matches/);
+ assert.match(e.result.content,/showing 64 matching lines in 22 files; omitted 2036 matching lines and 678 files/);
+ assert.match(e.result.content,/Narrow with a more specific path or pattern/);
+ assert.match(e.result.content,/this search preview omits results; the exact native original is saved for retrieval/);
+ assert.doesNotMatch(e.result.content,/all values\/entries retained|every file, hunk, and changed line retained/);
+ assert.ok(e.result.content.length < 16 * 1024);
+ const [record]=(await fs.readdir(f.directory)).filter(x=>!x.startsWith('.'));
+ assert.equal(await fs.readFile(path.join(f.directory,record,'original.txt'),'utf8'),original);
+ const metadata=await fs.readFile(path.join(f.directory,record,'metadata.json'),'utf8');
+ assert.ok(!metadata.includes('private-token-value'));
+});
+test('narrow and unrecognized grep/glob results retain native output',async t=>{
+ const f=await fixture(t);
+ const narrow=['Found 2 matches','/workspace/src/a.ts:','  Line 3: alpha','','/workspace/src/b.ts:','  Line 9: beta',''].join('\n');
+ const unrecognized=Array.from({length:500},(_,i)=>`result ${i}: arbitrary non-native output`).join('\n');
+ for(const [tool,content] of [['grep',narrow],['grep',unrecognized],['glob',unrecognized]]) {
+  const e={...base,id:`${tool}-${content.length}`,tool,status:'completed',result:{content}};
+  await f.before(e);await f.after(e);assert.equal(e.result.content,content);
+ }
+});
+test('large native glob receives a bounded file preview',async t=>{
+ const f=await fixture(t);
+ const original=Array.from({length:600},(_,i)=>`/shard-${i}/generated-file-${i}.ts`).join('\n');
+ const e={...base,tool:'glob',status:'completed',result:{content:original}};
+ await f.before(e);await f.after(e);
+ assert.match(e.result.content,/native glob returned 600 files; showing 24; omitted 576 files/);
+ assert.match(e.result.content,/Narrow with a more specific path or pattern/);
+ assert.match(e.result.content,/this search preview omits results; the exact native original is saved for retrieval/);
+ assert.doesNotMatch(e.result.content,/all values\/entries retained|every file, hunk, and changed line retained/);
+ assert.ok(e.result.content.length < 16 * 1024);
+ const [record]=(await fs.readdir(f.directory)).filter(x=>!x.startsWith('.'));
+ assert.equal(await fs.readFile(path.join(f.directory,record,'original.txt'),'utf8'),original);
+});
 test('diagnostics distinguish capacity from unprofitable projections',async t=>{
  const f=await fixture(t),reasons=[];
  const original=source,c=compactToolText(source,'json');

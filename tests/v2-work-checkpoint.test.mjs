@@ -77,3 +77,29 @@ test('progress checkpoint does not require timer-only handoff or redispatch', as
   assert.match(checkpointHandoff({objective:'fix',expectedEvidence:'test'}), /do not return solely/);
   assert.match(checkpointHandoff(), /unless blocked or a changed approach is needed/);
 });
+
+
+test('context maintenance is generation-bound advice at a safe same-owner checkpoint', async () => {
+  const {contextMaintenance, observedContext} = await import('../plugins/v2/work-checkpoint.mjs');
+  const record={parentID:'parent',childID:'child',state:'completed',admissionGeneration:3,completionBinding:{background:true,generation:3},completionReceipt:{generation:3}};
+  const native={id:'child',active:false,lastAssistantID:'msg_new',contextTokens:450000,contextObservedAt:1234,contextMessageID:'msg_usage'};
+  const options={callerID:'parent',compactionAvailable:true};
+  const ready=contextMaintenance(record,native,options);
+  assert.equal(ready.eligibleForCompaction,true);assert.equal(ready.when,'before_next_substantial_continuation');assert.equal(ready.tokens,450000);assert.equal(ready.messageID,'msg_usage');
+  const cases=[
+    [{...record,state:'running'},native,options,'collect_current_result_first'],
+    [record,{...native,active:true},options,'wait_for_current_work'],
+    [record,native,{...options,activeDescendants:['grandchild']},'wait_for_current_work'],
+    [record,native,{...options,callerID:'other'},'recorded_parent_required'],
+    [{...record,denial:{category:'native_permission'}},native,options,'resolve_recorded_denial'],
+    [record,native,{...options,needsRebind:true},'current_intent_rebind_required'],
+    [{...record,completionReceipt:{generation:2}},native,options,'current_generation_receipt_required'],
+    [record,native,{...options,compactionAvailable:false},'native_compaction_unavailable'],
+    [record,{...native,active:undefined},options,'native_state_unknown'],
+  ];
+  for(const [r,n,o,reason] of cases){const result=contextMaintenance(r,n,o);assert.equal(result.eligibleForCompaction,false);assert.equal(result.blockedReason,reason);}
+  assert.deepEqual(observedContext({}),{status:'unknown'});
+  assert.equal(observedContext({contextTokens:0}).tokens,0);
+  assert.equal(observedContext({contextTokens:Infinity}).status,'unknown');
+  assert.equal(contextMaintenance(record,{...native,contextTokens:10},options).recommended,undefined);
+});
