@@ -117,6 +117,31 @@ export function modelReference(ref) {
   if (!ref || typeof ref !== 'object') return;
   return modelReference(`${ref.providerID}/${ref.id}${ref.variant ? '#'+ref.variant : ''}`);
 }
+function modelParts(ref) {
+  const normalized=modelReference(ref);
+  const match=normalized?.match(/^([^/]+)\/([^#]+)#([^#]+)$/);
+  return match ? {ref:normalized,providerID:match[1],id:match[2],variant:match[3]} : undefined;
+}
+function catalogHasVariant(catalog, { providerID, id, variant }) {
+  return Array.isArray(catalog) && catalog.some(model => model?.providerID===providerID && model?.id===id
+    && Array.isArray(model.variants) && model.variants.some(item => (typeof item==='string' ? item : item?.id)===variant));
+}
+function continuationEffortDecision({ input, record, child, selected, override, catalog, hasActiveDescendant=false }) {
+  if (input.continuationEffort !== 'reassess') return undefined;
+  const base={requested:'reassess',prior:selected,provenance:'explicit_safe_checkpoint_request'};
+  if (input.model !== undefined || override) return {...base,applied:false,selected:override ?? selected,reason:'explicit_or_manual_model_override'};
+  if (child?.active || hasActiveDescendant || record?.state!=='completed') return {...base,applied:false,selected,reason:'not_completed_idle_boundary'};
+  if (input.routing?.reviewIndependence==='required' || record?.routing?.reviewProvenance)
+    return {...base,applied:false,selected,reason:'required_review_affinity'};
+  const role=canonicalHarnessRole(input.agent) ?? input.agent;
+  if (role!=='builder' || input.operation!=='implement' || input.routing?.risk!=='normal' || input.routing?.complexity==='complex')
+    return {...base,applied:false,selected,reason:'not_ordinary_implementation'};
+  const parts=modelParts(selected);
+  if (!parts || parts.variant!=='high') return {...base,applied:false,selected,reason:'selected_effort_not_high'};
+  const medium={...parts,variant:'medium',ref:`${parts.providerID}/${parts.id}#medium`};
+  if (!catalogHasVariant(catalog,medium)) return {...base,applied:false,selected,reason:'medium_variant_unavailable'};
+  return {...base,applied:true,selected:medium.ref,reason:'same_model_medium_supported',catalog:'current_model_catalog'};
+}
 export function quotaPace(quota, now=Date.now(), provider='openai') {
   const checked=Date.parse(quota?.pools ? quota.pools[provider]?.checked_at : quota?.checked_at);
   if (!Number.isFinite(checked) || now-checked>120000 || checked>now+5000) return 'unknown';
@@ -128,7 +153,7 @@ export function quotaPace(quota, now=Date.now(), provider='openai') {
   return 'normal';
 }
 // Model selection does not grant provider access or bypass the subscription guard.
-export function selectDispatchModel({input,agent,agents,record,child,quota}) {
+export function selectDispatchModel({input,agent,agents,record,child,quota,hasActiveDescendant=false}) {
   const configured=modelReference(agent.model), observed=modelReference(child?.model);
   const explicit=modelReference(input.model);
   const reviewModel=modelReference(input.routing?.reviewProvenance?.model) ?? modelReference(input.routing?.reviewOf);
@@ -150,13 +175,22 @@ export function selectDispatchModel({input,agent,agents,record,child,quota}) {
   // continuation, including an explicit model that was already admitted.
   if (requiredCrossFamily && record?.routing?.reviewProvenance && record.routing?.selected) {
     const persistedFit=storedTaskFit(record.routing.taskFit);
-    return {selected:requireIndependent(record.routing.selected),configured,observed,source:'continuation_affinity',pace,modelOverride:override,...(persistedFit ? {taskFit:persistedFit} : {})};
+    const effortDecision=continuationEffortDecision({input,record,child,selected:record.routing.selected,override,catalog:quota?.catalog,hasActiveDescendant});
+    return {selected:requireIndependent(record.routing.selected),configured,observed,source:'continuation_affinity',pace,modelOverride:override,...(persistedFit ? {taskFit:persistedFit} : {}),...(effortDecision ? {effortDecision} : {})};
+  }
+  // A user or observed manual model remains authoritative even at a safe
+  // boundary.  Keep the reassessment receipt so the retained effort is auditable.
+  if (input.continuationEffort==='reassess' && record?.routing?.selected && override) {
+    const effortDecision=continuationEffortDecision({input,record,child,selected:record.routing.selected,override,catalog:quota?.catalog,hasActiveDescendant});
+    return {selected:requireIndependent(override),configured,observed,source:'explicit_override',pace,modelOverride:override,...(effortDecision ? {effortDecision} : {})};
   }
   let selected=override??configured, source=override?'explicit_override':'configured_role';
   // Never reinterpret an admitted generation or change its provider on retry.
   if (!override && record?.routing?.selected) {
     const persistedFit=storedTaskFit(record.routing.taskFit);
-    return {selected:requireIndependent(record.routing.selected),configured,observed,source:'continuation_affinity',pace,modelOverride:override,...(persistedFit ? {taskFit:persistedFit} : {})};
+    const effortDecision=continuationEffortDecision({input,record,child,selected:record.routing.selected,override,catalog:quota?.catalog,hasActiveDescendant});
+    const selected=effortDecision?.selected ?? record.routing.selected;
+    return {selected:requireIndependent(selected),configured,observed,source:effortDecision?.applied?'safe_checkpoint_effort':'continuation_affinity',pace,modelOverride:override,...(persistedFit ? {taskFit:persistedFit} : {}),...(effortDecision ? {effortDecision} : {})};
   }
   // Required independence is an admission constraint, rather than a diversity
   // preference.  It may only use a currently eligible policy candidate; a

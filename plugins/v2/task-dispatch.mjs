@@ -48,7 +48,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   writePaths: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1 } },
   sessionID: { type: 'string', minLength: 1 }, model: { type: 'string' }, background: { type: 'boolean' }, refreshIntent: { type: 'boolean' },
   checkpoint: checkpointSchema,
-  compact: {type:'boolean'}, resetModel: {type:'boolean'},
+  compact: {type:'boolean'}, resetModel: {type:'boolean'}, continuationEffort:{type:'string',enum:['reassess']},
   workReview: {type:'object',additionalProperties:false,properties:{hypothesis:{type:'string',minLength:1,maxLength:500},evidenceReference:{type:'string',minLength:1,maxLength:500}},required:['hypothesis','evidenceReference']},
   routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']},taskType:{type:'string',enum:TASK_TYPES},reviewOf:{type:'string',minLength:3,maxLength:240},reviewOfChildID:{type:'string',minLength:1,maxLength:240},reviewIndependence:{type:'string',enum:['preferred','required']}},required:['complexity','risk']},
   recovery: { type: 'object', additionalProperties: false, properties: {
@@ -264,6 +264,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
       if (input.model !== undefined && !modelReference(input.model)) throw new Error('task-dispatch: invalid explicit model reference');
       if (input.resetModel !== undefined && typeof input.resetModel !== 'boolean') throw new Error('task-dispatch: invalid resetModel');
+      if (input.continuationEffort !== undefined && input.continuationEffort !== 'reassess') throw new Error('task-dispatch: invalid continuationEffort');
       const catalog = await ctx.agent.list(), agents = catalog.data ?? catalog;
       const agent = agents.find(a => (a.id ?? a.name) === input.agent);
       if (!agent || agent.disabled) throw new Error(`task-dispatch: role ${input.agent} is unavailable`);
@@ -406,7 +407,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           state.workReviews.push({rootID,taskId:input.taskId,steps:total.steps,continuations:total.continuations,...review,at:now()});
         }
         const routedInput=await resolveReviewProvenance({input,state,sessions,rootID,record,requested,loadCompletionReceipt});
-        const routing=selectDispatchModel({input:routedInput,agent,agents,record,child,quota});
+        const routing=selectDispatchModel({input:routedInput,agent,agents,record,child,quota,
+          hasActiveDescendant:Boolean(requested && sessions.some(session=>session.active&&descendant(sessions,session.id,requested)))});
         if (routedInput.routing?.reviewProvenance) routing.reviewProvenance=routedInput.routing.reviewProvenance;
         if (routedInput.routing?.reviewIndependence) routing.reviewIndependence=routedInput.routing.reviewIndependence;
         if (input.compact) {

@@ -94,7 +94,14 @@ uncertainty alone is not a reason to escalate.
 
 By default, every role sharing a tier also shares its configured reasoning variant.
 There is no automatic low/medium/high effort optimizer or measured price ranking.
-Customize role references explicitly when different efforts are appropriate. The
+At an explicit `continuationEffort: "reassess"` request, a completed, idle,
+ordinary normal-risk `builder` implementation may move from `#high` to `#medium`
+only when the current catalog advertises the same provider and base model at
+`#medium`. The routing record reports the request, outcome, reason, and catalog
+provenance. It never changes a running, failed, denied, cross-family-review, or
+explicitly/manual-model-overridden worker; unavailable medium variants retain the
+admitted route with an explicit reason. Customize role references explicitly when
+different efforts are appropriate. The
 public generator selects STRONG for the router; it does not dynamically demote the
 primary router. An existing private profile may have different role assignments.
 
@@ -239,6 +246,8 @@ A missing, stale or failed read is **unknown**, not zero usage or extra capacity
 | Financial evidence | Credit-risk metadata plus separate account/financial verification. | Usage credits (`extra_usage.is_enabled`) must be explicitly disabled, unless an operator installs the exact local app-managed-credit acknowledgement described in [Claude connection setup](docs/CLAUDE-SUBSCRIPTION.md#optional-app-managed-usage-credits). |
 | Access outside OpenCode | `codex-quota` provides human-readable or JSON output, refresh and admission checks. | The standalone `subscription-quota.mjs` has no selected OpenCode OAuth context, so it reports Claude as `unknown [adapter_unavailable]`; use the in-session tool for Claude. |
 
+Recent short-window consumption is also exposed as an **advisory burn rate and approximate exhaustion time**, using fresh samples from the same selected credential and reset window. It adds no polling, admission gates or worker budgets. Claude supplies the private identity needed for this history; the current Codex adapter reports this new trend as unknown (its existing window pacing still works). See [short-window pacing](docs/SHORT-WINDOW-PACING.md) for freshness and identity limits.
+
 The explicit `codex_quota` tool remains Codex-only. The shared tool and automatic
 routing query only enabled subscription providers; a Claude-only profile does not
 need a Codex login or CLI. A local `/quota` shortcut can call the shared tool, but
@@ -319,7 +328,7 @@ ceiling or a promised percentage saving.
 
 | Optimization | Behavior and limits |
 |---|---|
-| **Short instructions and focused handoffs** | Revisioned task intent carries the goal, authorization and checks; handoffs add bounded objectives, files and evidence. Agents are instructed to batch bookkeeping at meaningful transitions rather than repeat raw context. |
+| **Short instructions and focused handoffs** | Revisioned task intent carries the goal, authorization and checks; handoffs add bounded objectives, changed files, current checks and unresolved findings, linking retained evidence instead of repeating logs. Exact tool-schema names and required fields avoid repeated malformed calls. Agents are instructed to batch bookkeeping at meaningful transitions rather than repeat raw context. |
 | **Large-file read control** | The guard blocks broad reads over the 350-line threshold while allowing targeted ranges. A focused smaller worker can return a summary; terminal workers cannot recursively delegate. An eligible writer can request a reasoned one-use direct-read exception. Agents are told not to page through a whole file to evade the guard; ordinary permissions still apply. |
 | **Recoverable tool-result compression** | Automatic V2 middleware compacts eligible new JSON, rectangular arrays and plain search listings, collapses exact consecutive repetitions in recognized test/build logs, and shortens unchanged Git diff context. Every JSON row/value and every diff change remains represented. It adds no inference call. |
 | **Exact originals on demand** | A profitable projection is published only after its exact original is stored privately. Retrieval uses bounded native reads under existing permissions. Source reads, edits, patches, unknown tools and nested CodeMode fallback text are not rewritten. Malformed, oversized or unprofitable results pass through. A snapshot is not proof of current file contents. |

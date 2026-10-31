@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { packageRoot } from './paths.mjs';
+import { defaultShortWindowPacingStore, SHORT_WINDOW_PACING_IDENTITY } from './short-window-pacing.mjs';
 
 const exec = promisify(execFile);
 const DEFAULT_MAX_AGE_MS = 120_000;
@@ -148,7 +149,8 @@ export function catalogProviders(catalog) {
   // The supported V2 ctx.model.list delegates to Model.available (enabled only).
   return [...new Set(catalog.filter(model => model && model.enabled !== false).map(model => model.providerID).filter(id => ['openai','anthropic'].includes(id)))];
 }
-export async function readProviderQuotas({ readCodex, readClaude, providers = ['openai','anthropic'], now, timeoutMs = 25_000 } = {}) {
+export async function readProviderQuotas({ readCodex, readClaude, providers = ['openai','anthropic'], now, timeoutMs = 25_000,
+  pacingStore = defaultShortWindowPacingStore } = {}) {
   const clock = () => now ?? Date.now();
   const readers = {
     openai: readCodex ?? (() => readCodexQuota({ timeoutMs })),
@@ -158,9 +160,15 @@ export async function readProviderQuotas({ readCodex, readClaude, providers = ['
   const pools = Object.fromEntries(await Promise.all([...new Set(providers)].map(async provider => {
     try {
       const raw = await readers[provider]();
-      return [provider,(provider === 'openai' ? normalizeCodexQuota : normalizeClaudeQuota)(raw,{now:clock()})];
+      const pool = (provider === 'openai' ? normalizeCodexQuota : normalizeClaudeQuota)(raw,{now:clock()});
+      // A reader may provide a private Symbol-keyed selected-credential
+      // fingerprint. Never copy it to normalized telemetry or tool output.
+      try { pool.advisory = { short_window_pacing: await pacingStore.observe(pool, { identity: raw?.[SHORT_WINDOW_PACING_IDENTITY] }) }; }
+      catch { pool.advisory = { short_window_pacing: { status: 'unknown', reason: 'persistence_unavailable', windows: [] } }; }
+      return [provider,pool];
     } catch(error) {
-      return [provider,{...basePool(provider,clock()),reason:error?.code === 'ADAPTER_UNAVAILABLE' ? 'adapter_unavailable' : errorReason(error)}];
+      return [provider,{...basePool(provider,clock()),reason:error?.code === 'ADAPTER_UNAVAILABLE' ? 'adapter_unavailable' : errorReason(error),
+        advisory: { short_window_pacing: { status: 'unknown', reason: 'telemetry_unavailable', windows: [] } }}];
     }
   })));
   return { version:1,checked_at:iso(clock()),pools };

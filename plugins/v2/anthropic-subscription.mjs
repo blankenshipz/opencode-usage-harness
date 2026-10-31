@@ -37,6 +37,8 @@ export function assertAnthropicCredential(connection, credential) {
 
 // Shared by admission and advisory routing. Never tries another account or API key.
 import { CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS, createQuotaCache } from './quota-cache.mjs';
+import { SHORT_WINDOW_PACING_IDENTITY } from './short-window-pacing.mjs';
+import crypto from 'node:crypto';
 const usageFailureReasons = new Set(['http_error', 'timeout', 'network_error', 'invalid_response']);
 const retryAfterLimitSeconds = 86_400;
 
@@ -160,5 +162,11 @@ export async function readSelectedClaudeUsage(ctx, reader = fetchAnthropicUsage)
   const credential = await ctx.integration.connection.resolve(connection);
   assertAnthropicCredential(connection, credential);
   if (typeof credential.access !== 'string' || !credential.access) fail('Anthropic OAuth access unavailable.');
-  return reader(credential.access);
+  const usage = await reader(credential.access);
+  // This identifies the selected credential only for local pacing history. It
+  // is non-enumerable and Symbol-keyed, so neither JSON telemetry nor cache
+  // snapshots can expose a credential-derived identifier. A rotation creates a
+  // new history, which intentionally yields unknown advice until resampled.
+  Object.defineProperty(usage, SHORT_WINDOW_PACING_IDENTITY, { value: crypto.createHash('sha256').update(credential.access).digest('hex') });
+  return usage;
 }

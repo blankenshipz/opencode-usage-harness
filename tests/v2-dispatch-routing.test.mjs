@@ -82,6 +82,38 @@ test('reset clears override metadata but cannot reroute an admitted generation',
  assert.equal(result.selected,'openai/sol#medium');assert.equal(result.modelOverride,undefined);assert.equal(result.source,'continuation_affinity');
 });
 
+test('an explicit safe-checkpoint effort reassessment can use the advertised medium variant of the same model',()=>{
+ const q={...multi(),catalog:structuredClone(catalog)};q.catalog.find(model=>model.providerID==='anthropic'&&model.id==='sonnet').variants.push({id:'medium'});
+ const admitted={selected:'anthropic/sonnet#high'};
+ const input={agent:'builder',operation:'implement',continuationEffort:'reassess',routing:{complexity:'standard',risk:'normal'}};
+ const result=selectDispatchModel({...base,input,quota:q,record:{state:'completed',routing:admitted},child:{model:admitted.selected,active:false}});
+ assert.equal(result.selected,'anthropic/sonnet#medium');assert.equal(result.source,'safe_checkpoint_effort');
+ assert.deepEqual(result.effortDecision,{requested:'reassess',prior:'anthropic/sonnet#high',provenance:'explicit_safe_checkpoint_request',applied:true,selected:'anthropic/sonnet#medium',reason:'same_model_medium_supported',catalog:'current_model_catalog'});
+});
+test('effort reassessment retains an admitted high route outside a successful idle boundary or without a supported medium variant',()=>{
+ const admitted={selected:'anthropic/sonnet#high'};
+ const input={agent:'builder',operation:'implement',continuationEffort:'reassess',routing:{complexity:'standard',risk:'normal'}};
+ for (const [state,active,reason] of [['running',true,'not_completed_idle_boundary'],['paused',false,'not_completed_idle_boundary']]) {
+  const result=selectDispatchModel({...base,input,quota:multi(),record:{state,routing:admitted},child:{model:admitted.selected,active}});
+  assert.equal(result.selected,admitted.selected);assert.equal(result.effortDecision.reason,reason);assert.equal(result.effortDecision.applied,false);
+ }
+ const unsupported=selectDispatchModel({...base,input,quota:multi(),record:{state:'completed',routing:admitted},child:{model:admitted.selected,active:false}});
+ assert.equal(unsupported.selected,admitted.selected);assert.equal(unsupported.effortDecision.reason,'medium_variant_unavailable');
+});
+test('effort reassessment retains high when an otherwise idle completed child has active descendants',()=>{
+ const q={...multi(),catalog:structuredClone(catalog)};q.catalog.find(model=>model.providerID==='anthropic'&&model.id==='sonnet').variants.push({id:'medium'});
+ const admitted={selected:'anthropic/sonnet#high'};
+ const result=selectDispatchModel({...base,input:{agent:'builder',operation:'implement',continuationEffort:'reassess',routing:{complexity:'standard',risk:'normal'}},quota:q,record:{state:'completed',routing:admitted},child:{model:admitted.selected,active:false},hasActiveDescendant:true});
+ assert.equal(result.selected,admitted.selected);assert.equal(result.effortDecision.reason,'not_completed_idle_boundary');
+});
+test('explicit model overrides remain authoritative over safe-checkpoint effort reassessment',()=>{
+ const q={...multi(),catalog:structuredClone(catalog)};q.catalog.find(model=>model.providerID==='anthropic'&&model.id==='sonnet').variants.push({id:'medium'});
+ const admitted={selected:'anthropic/sonnet#high'};
+ const input={agent:'builder',operation:'implement',model:'anthropic/sonnet#high',continuationEffort:'reassess',routing:{complexity:'standard',risk:'normal'}};
+ const result=selectDispatchModel({...base,input,quota:q,record:{state:'completed',routing:admitted},child:{model:admitted.selected,active:false}});
+ assert.equal(result.selected,input.model);assert.equal(result.source,'explicit_override');assert.equal(result.effortDecision.reason,'explicit_or_manual_model_override');
+});
+
 test('routine single-pool pacing uses that role provider rather than another subscription',()=>{
  const q=multi();q.pools.anthropic=pool('anthropic',20);q.pools.openai=pool('openai',-40);delete q.routingPolicy;
  const a={id:'builder',model:'anthropic/sonnet#high'},fast={id:'quick-builder',model:'anthropic/haiku#medium'};

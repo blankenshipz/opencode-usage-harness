@@ -18,7 +18,7 @@ export const isNativeAgent = agent => typeof agent === 'string' && nativeAgents.
 // A native caller can deliberately enter the harness contract, but a harness
 // caller cannot become native merely by omitting one required field.
 export const isHarnessDispatchInput = input => !!input && typeof input === 'object' &&
-  ['taskId', 'workKey', 'operation', 'requiredCapabilities', 'writePaths', 'checkpoint', 'workReview', 'routing', 'refreshIntent', 'compact', 'recovery'].some(key => key in input);
+  ['taskId', 'workKey', 'operation', 'requiredCapabilities', 'writePaths', 'checkpoint', 'workReview', 'routing', 'refreshIntent', 'compact', 'continuationEffort', 'recovery'].some(key => key in input);
 
 const descendant = (sessions, childID, ancestorID) => {
   const seen = new Set(); let current = sessions.find(session => session.id === childID);

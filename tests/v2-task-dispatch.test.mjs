@@ -500,6 +500,26 @@ test('dispatch supplies configured model on continuation and preserves explicit 
  await h.call({...base,sessionID:id,background:false,model:'demo/strong#high'});
  await h.call({...base,sessionID:id,background:false});assert.equal(h.calls.at(-1).model,'demo/strong#high');
 });
+test('an explicit completed idle continuation can reassess only to a catalog-supported medium effort',async t=>{
+ const h=await harness(t,undefined,undefined,{loadQuota:async()=>({catalog:[{providerID:'anthropic',id:'sonnet',variants:[{id:'high'},{id:'medium'}]}]})});
+ const list=h.ctx.agent.list;h.ctx.agent.list=async()=>({data:(await list()).data.map(a=>a.id==='builder'?{...a,model:'anthropic/sonnet#high'}:a)});
+ const first=await h.call({...base,background:false,routing:{complexity:'standard',risk:'normal'}});
+ await h.call({...base,background:false,sessionID:first.metadata.sessionID,continuationEffort:'reassess',routing:{complexity:'standard',risk:'normal'}});
+ assert.equal(h.calls.at(-1).sessionID,first.metadata.sessionID);assert.equal(h.calls.at(-1).model,'anthropic/sonnet#medium');
+ await h.registry('/project',async state=>{
+  const routing=state.records[0].routing;
+  assert.equal(routing.source,'safe_checkpoint_effort');assert.equal(routing.effortDecision.reason,'same_model_medium_supported');
+ });
+});
+test('effort reassessment retains high when the completed direct child still has an active descendant',async t=>{
+ const h=await harness(t,undefined,undefined,{loadQuota:async()=>({catalog:[{providerID:'anthropic',id:'sonnet',variants:[{id:'high'},{id:'medium'}]}]})});
+ const list=h.ctx.agent.list;h.ctx.agent.list=async()=>({data:(await list()).data.map(a=>a.id==='builder'?{...a,model:'anthropic/sonnet#high'}:a)});
+ const first=await h.call({...base,background:false,routing:{complexity:'standard',risk:'normal'}});
+ h.sessions.push({id:'active-descendant',parentID:first.metadata.sessionID,agent:'scout',directory:'/project',active:true});
+ await h.call({...base,background:false,sessionID:first.metadata.sessionID,continuationEffort:'reassess',routing:{complexity:'standard',risk:'normal'}});
+ assert.equal(h.calls.at(-1).model,'anthropic/sonnet#high');
+ await h.registry('/project',async state=>assert.equal(state.records[0].routing.effortDecision.reason,'not_completed_idle_boundary'));
+});
 test('historical transcript refuses dispatch and model inference with canonical recovery',async t=>{
  const h=await harness(t);h.sessions[0].canonicalSessionID='canonical';
  await assert.rejects(h.call(base),/canonical/);assert.equal(h.calls.length,0);
