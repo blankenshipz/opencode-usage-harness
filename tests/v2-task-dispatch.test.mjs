@@ -614,12 +614,25 @@ test('status distinguishes an idle native worker from stale recorded running wor
  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];
  assert.equal(status.recordedState,'running');assert.equal(status.effectiveState,'awaiting_result_collection');assert.deepEqual(status.nativeExecution,{active:false,lastIdleOutcome:'succeeded'});assert.equal(h.calls.length,1);
 });
+test('status collection eligibility matches collect structural checks and reports the recorded parent',async t=>{
+ const h=await harness(t);const started=await h.call({...base,background:true});const child=h.sessions.find(s=>s.id===started.metadata.sessionID);child.active=false;
+ let owner=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];
+ assert.equal(owner.collection.eligibleForInspection,true);assert.equal(owner.collection.blockedReason,undefined);assert.equal(owner.collection.responsibleParentID,'root');
+ await h.registry('/project',async(state,save)=>{state.records[0].completionBinding.generation=99;await save();});owner=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];assert.equal(owner.collection.eligibleForInspection,false);assert.equal(owner.collection.blockedReason,'completion binding does not match the recorded generation');
+ await h.registry('/project',async(state,save)=>{state.records[0].completionBinding.generation=state.records[0].admissionGeneration;await save();});
+ child.agent='scout';owner=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];assert.equal(owner.collection.eligibleForInspection,false);assert.equal(owner.collection.blockedReason,'child role does not match the recorded role');
+ child.agent='builder';child.model='openai/other#medium';owner=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];assert.equal(owner.collection.eligibleForInspection,false);assert.equal(owner.collection.blockedReason,'child model does not match the recorded model');
+ child.model=undefined;await h.registry('/project',async(state,save)=>{state.records[0].intentRevision=2;await save();});owner=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];assert.equal(owner.collection.eligibleForInspection,false);assert.equal(owner.collection.blockedReason,'recorded intent is stale');
+ owner=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status',child.id)).content).owners[0];assert.equal(owner.collection.eligibleForInspection,false);assert.equal(owner.collection.blockedReason,'caller is not the recorded parent');
+});
 test('background collection requires an exact generation receipt and is idempotent',async t=>{
  let reads=0;const h=await harness(t,undefined,undefined,{loadCompletionReceipt:async()=>{reads++;return {promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3};}});
  const started=await h.call({...base,background:true});const id=started.metadata.sessionID;h.sessions.find(s=>s.id===id).active=false;
  const collect={taskId:'release',workKey:'backend',sessionID:id,generation:1};
  const first=JSON.parse((await h.call(collect,'task_dispatch_collect')).content);assert.equal(first.status,'completed');assert.equal(reads,1);
+ let status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];assert.equal(status.collection.terminalEvidenceVerified,true);
  const second=JSON.parse((await h.call(collect,'task_dispatch_collect')).content);assert.equal(second.status,'completed');assert.equal(reads,1);
+ await h.registry('/project',async(state,save)=>{state.records[0].completionReceipt.generation=0;await save();});status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];assert.equal(status.collection.terminalEvidenceVerified,false);
  await assert.rejects(h.call({...collect,generation:2},'task_dispatch_collect'),/parent, task, work key, child, and generation exactly/);
 });
 test('background collection rejects foreign parent, active descendants, and legacy bindings',async t=>{

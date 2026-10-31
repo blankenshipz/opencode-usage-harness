@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — truthful handoff and publication guidance
+
+- Remove an accidental blanket “never push” instruction: authorized publication proceeds after required gates.
+- Align background-result collection eligibility with the actual generation/owner/intent/model checks, with actionable structural blockers.
+- Distinguish queued steering from native execution and document compact cross-conversation evidence contracts without cross-parent takeover.
+
+
 ## Unreleased — scoped continuations and delivery
 
 - Retain admitted writer scopes across non-deploy continuation operation changes; require explicit scope when adding write authority instead of silently reserving the workspace.

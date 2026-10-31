@@ -29,9 +29,29 @@ Before expansion, agree one executable acceptance command and its input/output
 contract with the producing worker and evaluator. Feature completion is separate
 from delivery or publication: assign that work and its current gate explicitly.
 A stale parked delivery assignment may resume only under current intent and a
-current gate; it never pushes, approves, or bypasses content-rights or review
-gates. Denials report the actor, action, and resource, leaving unrelated work
+current gate. Publication proceeds when authorized and its required gates pass;
+this never grants approval or bypasses content-rights or review gates. Denials report the actor, action, and resource, leaving unrelated work
 authorized; another route must not retry the denied action.
+
+Queued instructions are delivery state, not proof that work started. At a meaningful
+boundary, check the admitted child and generation plus fresh native activity before
+sending another reminder. An idle background worker needs its exact result collected;
+a stale intent or mismatched binding needs owner reconciliation, not repeated collection.
+Status reports the structural collection blocker and whether that exact generation
+already has a collected terminal receipt. It does not read new terminal evidence or
+resume inference. A collected execution receipt is not project acceptance.
+
+Across conversations, pass a compact artifact under existing read/write permissions:
+producer revision and artifact hash, contract version, check receipt, intended consumer,
+and unresolved differences. The consuming owner verifies that evidence and assigns its
+own worker. This does not authorize cross-parent control or copying restricted data.
+Agree canonical text, schemas, dependency setup and the producer/evaluator interface
+through the executable acceptance command before broadening parallel work.
+
+Git serialization protects actual shared metadata writes. Do not keep a conversational
+Git hold after its owner is idle merely because feature work remains. Inspect current
+ownership; an unknown or in-flight lease still requires reconciliation, not deletion.
+Publication success needs a verified remote branch/commit or PR, not a local plan.
 
 An admitted writer retains its `writePaths` through non-`deploy` operation
 changes and implicit continuation of the same work key. A read-only continuation
@@ -145,3 +165,12 @@ boundaries with current ownership, authorization, evidence and failure identity
 preserved; no timer-based history rewriting is added.
 
 For routine decision boundaries use `task_dispatch_status({taskId, summary:true})`. It retains exact generation, collection, compaction and recovery identifiers without repeating full ownership history or receipts. Omit `summary` only to investigate a specific missing detail. Neither view starts work.
+
+### Remaining coordination limitation
+
+Compaction outcome is reconciled when dispatch/status observes the native record.
+There is no guaranteed durable parent notification for every compaction completion.
+The parent must observe the matching compaction ID and continue the same child when
+authorized. Status inspection never starts work. A future notification outbox would
+need exact parent/generation binding, restart-safe deduplication and explicit
+non-resuming delivery; automatic worker wake-ups are not implemented.
