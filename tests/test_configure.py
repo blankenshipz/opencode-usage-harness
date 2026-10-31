@@ -15,10 +15,13 @@ class ConfigureTests(unittest.TestCase):
         self.assertEqual(p['enabled_providers'],['openai'])
         self.assertEqual(p['permissions'][0]['effect'],'ask')
         protected = {'action':'edit','resource':'*anthropic-financial-policy.json','effect':'deny'}
+        external_grants = {'action':'edit','resource':'*external-write-grants.json','effect':'deny'}
         self.assertIn(protected, p['permissions'])
+        self.assertIn(external_grants, p['permissions'])
         for role in ('scout','builder','quick-builder','reviewer'):
             self.assertIn({'action':'large_file_summary','resource':'*','effect':'deny'},p['agents'][role]['permissions'])
             self.assertIn(protected,p['agents'][role]['permissions'])
+            self.assertIn(external_grants,p['agents'][role]['permissions'])
         self.assertEqual(len(p['plugins']),4)
         for name in ('build','plan','general','explore'):
             self.assertFalse(p['agents'][name]['disabled'])

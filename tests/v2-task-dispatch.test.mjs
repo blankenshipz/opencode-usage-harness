@@ -43,7 +43,7 @@ async function harness(t, custom, nativeInput, dispatchOptions={}) {
  const ctx={location:{directory:'/project'},agent:{list:async()=>({data:Object.entries(agents).map(([id,a])=>({id,...a}))})},tool:{transform:async fn=>{assert.notEqual(fn.constructor.name,'AsyncFunction','native editor transformations must be synchronous');return fn({get:n=>tools.get(n),update:(n,fn)=>fn(tools.get(n)),add:tool=>tools.set(tool.name,tool)});}}};
  const registry=createRegistry(dir);await registry('/project',async(state,save)=>{setIntent(state,{rootID:'root',taskId:'release',intent,expectedRevision:0,actorSessionID:'root'});await save();});
  const hooks=new Map();ctx.session={hook:async(name,fn)=>{const previous=hooks.get(name);hooks.set(name,async event=>{if(previous)await previous(event);return fn(event);});}};
- const runtime=await installTaskDispatch(ctx,{registry,loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction'],loadRoutingPolicy:()=>undefined,...dispatchOptions});
+ const runtime=await installTaskDispatch(ctx,{registry,globalRegistry:createRegistry(path.join(dir,'global-writers')),loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction'],loadRoutingPolicy:()=>undefined,...dispatchOptions});
  const call=(input,tool='task_dispatch',sessionID='root')=>tools.get(tool).execute(input,{sessionID,agent:'router',progress:async()=>{}});
  return {call,sessions,calls,tools,ctx,dir,registry,rawNative,hooks,runtime};
 }
@@ -156,7 +156,7 @@ test('denial receipts survive reload and unrelated work remains eligible',async 
  const h=await harness(t,async(input)=>{if(input.description==='Fix backend')throw new Error('Subagent denied: builder');return {content:'other',metadata:{sessionID:'ses_other',status:'completed'},output:{sessionID:'ses_other',status:'completed'}};});
  await assert.rejects(h.call(base),/Subagent denied/);
  const recreated=new Map([['subagent',{...h.rawNative}]]);
- await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
+ await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),globalRegistry:createRegistry(path.join(h.dir,'global-writers')),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
  await assert.rejects(recreated.get('task_dispatch').execute({...base,prompt:'changed after reload'},{sessionID:'root',agent:'router',progress:async()=>{}}),/remains denied/);
  const other=await h.call({...base,workKey:'unrelated',description:'Independent task',writePaths:['mobile']});assert.equal(other.content,'other');
 });
@@ -249,7 +249,7 @@ test('legacy active workers block new writers; direct-child adoption preserves o
 test('ownership survives plugin recreation and failed parents with active descendants',async t=>{
  const h=await harness(t);await h.call({...base,background:true});
  const recreated=new Map([['subagent',{...h.rawNative}]]);
- await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions});
+ await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),globalRegistry:createRegistry(path.join(h.dir,'global-writers')),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions});
  const content=JSON.parse((await recreated.get('task_dispatch_status').execute({},{sessionID:'root'})).content);assert.equal(content.owners[0].childID,'ses_1');
  h.sessions[1].active=false;h.sessions.push({id:'grandchild',parentID:'ses_1',agent:'builder',directory:'/project',active:true});
  await assert.rejects(h.call({...base,workKey:'replacement'}),/overlapping/);
@@ -561,7 +561,7 @@ test('matching compaction outcome survives plugin restart with the same continua
  h.ctx.session.compact=async input=>{compacted=input;};await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'A',expectedEvidence:'receipt-a'}});
  child.lastCompaction={id:compacted.id,status:'completed'};
  const recreated=new Map([['subagent',{...h.rawNative}]]);
- await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:tool=>recreated.set(tool.name,tool)})}},{registry:createRegistry(h.dir),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
+ await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:tool=>recreated.set(tool.name,tool)})}},{registry:createRegistry(h.dir),globalRegistry:createRegistry(path.join(h.dir,'global-writers')),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
  const status=JSON.parse((await recreated.get('task_dispatch_status').execute({taskId:'release'},{sessionID:'root'})).content);
  assert.equal(status.owners[0].state,'awaiting_continuation');assert.equal(status.owners[0].compactionOutcome.id,compacted.id);assert.deepEqual(status.owners[0].continuationOwner,{parentID:'root',childID:child.id,action:'resume_same_child'});assert.equal(h.calls.length,1);
 });
@@ -595,7 +595,7 @@ test('collected background receipts survive plugin recreation and stale native e
  const args={taskId:'release',workKey:'backend',sessionID,generation:1};
  const before=JSON.parse((await h.call(args,'task_dispatch_collect')).content);
  h.tools.set('subagent',{...h.rawNative});
- await installTaskDispatch(h.ctx,{registry:createRegistry(h.dir),loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user'],loadRoutingPolicy:()=>undefined,loadCompletionReceipt});
+ await installTaskDispatch(h.ctx,{registry:createRegistry(h.dir),globalRegistry:createRegistry(path.join(h.dir,'global-writers')),loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user'],loadRoutingPolicy:()=>undefined,loadCompletionReceipt});
  assert.deepEqual(JSON.parse((await h.call(args,'task_dispatch_collect')).content),before);
  receipt=null;
  await assert.rejects(h.call({...base,workKey:'review',operation:'inspect',agent:'builder',requiredCapabilities:['shell'],writePaths:[],routing:{complexity:'standard',risk:'normal',reviewOfChildID:sessionID,reviewIndependence:'preferred'}}),/receipt|evidence|generation/);

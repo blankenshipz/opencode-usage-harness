@@ -3,14 +3,26 @@ import { observeAdmission, convergenceAdvice, userActions, recordProgress, norma
 import { checkpointSchema, normalizeCheckpoint, beginCheckpoint, acknowledgeTaskReview, normalizeReviewAcknowledgement, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
 import path from 'node:path';
+import { realpath } from 'node:fs/promises';
 import crypto from 'node:crypto';
 import { createRegistry, runtimeSessions, runtimeIntentSources, runtimeCompletionReceipt, lineage, descendant, overlaps } from './dispatch-registry.mjs';
+import { authorizeExternalWrites } from './external-write-grant.mjs';
+import { reserveWriterLease, finishWriterLease, writerPathsOverlap } from './global-write-lease.mjs';
 import { intentSchema, getIntent, setIntent, bindIntent, renderIntent, renderIntentReference } from './task-intent.mjs';
-import { packageRoot } from './paths.mjs';
+import { packageRoot, statePath } from './paths.mjs';
 import { createWorkerProgress } from './worker-progress.mjs';
 import { admissionDenial, denialAdvice, receipt, suppression } from './denial-recovery.mjs';
 import { quotaRecoveryReceipt, enqueueQuotaRecovery, deliverQuotaRecovery, pendingQuotaRecovery, quotaRecoverySyntheticInput } from './quota-recovery.mjs';
 import { guardNativeDispatch, isHarnessDispatchInput, isNativeAgent, canonicalHarnessRole } from './agent-mode.mjs';
+// Ordinary workspace aliases remain supported; containment is checked after
+// resolving the nearest existing ancestor. External grants use stricter checks.
+async function canonicalWriterPath(value) {
+  let current=path.resolve(value);const missing=[];
+  for(;;) {
+    try{return path.join(await realpath(current),...missing);}
+    catch(error){if(error.code!=='ENOENT')throw error;const parent=path.dirname(current);if(parent===current)throw error;missing.unshift(path.basename(current));current=parent;}
+  }
+}
 // Eligibility is not a permission grant: the native executor still owns authorization and depth.
 export function hasCapability(agent, capability) {
   const rules = agent.permissions ?? [], action = capability === 'delegate' ? 'subagent' : capability;
@@ -46,7 +58,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   agent: { type: 'string', minLength: 1 }, description: { type: 'string', minLength: 1 }, prompt: { type: 'string', minLength: 1 },
   requiredCapabilities: { type: 'array', uniqueItems: true, items: { type: 'string', enum: ['shell','edit','delegate'] } },
   writePaths: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1 } },
-  sessionID: { type: 'string', minLength: 1 }, model: { type: 'string' }, background: { type: 'boolean' }, refreshIntent: { type: 'boolean' },
+  sessionID: { type: 'string', minLength: 1 }, model: { type: 'string' }, background: { type: 'boolean' }, refreshIntent: { type: 'boolean' }, externalWriteGrantID: { type: 'string', minLength: 1, maxLength: 160 },
   checkpoint: checkpointSchema,
   compact: {type:'boolean'}, resetModel: {type:'boolean'}, continuationEffort:{type:'string',enum:['reassess']},
   workReview: {type:'object',additionalProperties:false,properties:{hypothesis:{type:'string',minLength:1,maxLength:500},evidenceReference:{type:'string',minLength:1,maxLength:500}},required:['hypothesis','evidenceReference']},
@@ -175,7 +187,7 @@ export function taskWorkStatus(state,rootID,taskId) {
   const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
-export async function installTaskDispatch(ctx, { registry = createRegistry(), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, grantPath, configRoot } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -198,15 +210,20 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
     } catch { /* durable pending receipt is retried at a later explicit status boundary */ }
   };
   const paths = (input, agent) => {
-    if (input.operation === 'deploy') return ['.'];
+    if (input.operation === 'deploy') return { local:['.'], external:[] };
     // Executable checks may mutate via shell even when the edit tool is denied.
-    if (input.operation === 'verify' && !input.writePaths?.length) return ['.'];
-    if (input.operation !== 'implement' && input.operation !== 'verify' && !input.requiredCapabilities.includes('edit') && !hasCapability(agent, 'edit')) return [];
-    return (input.writePaths?.length ? input.writePaths : ['.']).map(p => {
-      const relative = path.relative(workspace, path.resolve(workspace, p));
-      if (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative) || /[*?\0]/.test(relative)) throw new Error('task-dispatch: writePaths must be literal workspace-relative paths or directories');
-      return relative || '.';
-    });
+    if (input.operation === 'verify' && !input.writePaths?.length) return { local:['.'], external:[] };
+    if (input.operation !== 'implement' && input.operation !== 'verify' && !input.requiredCapabilities.includes('edit') && !hasCapability(agent, 'edit')) return { local:[], external:[] };
+    const local=[], external=[];
+    for (const p of (input.writePaths?.length ? input.writePaths : ['.'])) {
+      if (typeof p !== 'string' || /[*?\0]/.test(p)) throw new Error('task-dispatch: writePaths must be literal paths or directories');
+      const resolved = path.resolve(workspace, p);
+      const relative = path.relative(workspace, resolved);
+      if (path.isAbsolute(p) && (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative))) { external.push(p); continue; }
+      if (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) throw new Error('task-dispatch: writePaths must be workspace-relative or explicitly granted absolute paths');
+      local.push(relative || '.');
+    }
+    return { local, external };
   };
   // A correction parks affected children at their next model request. Already-running tools finish;
   // the parent must explicitly resume that same child against the new revision.
@@ -304,7 +321,11 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         if (existing) throw new Error(existing.message);
         throw capabilityMismatch(input.agent, missing);
       }
-      let writes = paths(input, agent);
+      const requestedPaths = paths(input, agent);
+      let writes = requestedPaths.local;
+      let externalWrites = requestedPaths.external;
+      if (externalWrites.length && input.operation !== 'implement') throw new Error('task-dispatch: external write grants only permit implement assignments');
+      if (externalWrites.length && !input.externalWriteGrantID) throw new Error('task-dispatch: external absolute writePaths require an operator external write grant before native dispatch');
       // Optional planning telemetry is advisory only. Read it after all local
       // assignment validation so an impossible request has no quota side effect.
       const routingPolicy = loadRoutingPolicy();
@@ -328,7 +349,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
       } }
       quota = { ...(quota ?? {}), routingPolicy: routingPolicy ?? quota?.routingPolicy };
       const token = crypto.randomUUID();
-      const admission = await registry(workspace, async (state, save) => {
+      const admission = await globalRegistry('all-writers', async (globalState, saveGlobal) => {
+       try { return await registry(workspace, async (state, save) => {
         const sessions = await loadSessions(), rootID = lineage(sessions,context.sessionID);
         const historical=sessions.find(s=>s.id===context.sessionID)?.canonicalSessionID ?? sessions.find(s=>s.id===rootID)?.canonicalSessionID;
         if (historical) throw new Error(`task-dispatch: historical transcript only; continue canonical session ${historical}. Do not adopt workers or retry in this copy.`);
@@ -341,6 +363,17 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
               const candidates=sessions.filter(s=>s.parentID===record.parentID&&s.agent===record.agent&&s.title===record.description&&s.created>=record.startedAt);
               if(candidates.length>1&&!input.sessionID) throw new Error('task-dispatch: interrupted admission has multiple candidate children; inspect status and explicitly select its sessionID');
               record.childID=input.sessionID??candidates[0]?.id;
+            }
+            if(record.childID) {
+              const recovered=sessions.find(session=>session.id===record.childID);
+              if(!recovered || context.sessionID!==record.parentID || recovered.parentID!==context.sessionID || recovered.agent!==record.agent || recovered.agent!==input.agent || state.records.some(other=>other.key!==key && other.childID===recovered.id))
+                throw new Error('task-dispatch: interrupted child identity does not match its recorded parent and role');
+              const canonicalWorkspace=await canonicalWriterPath(workspace);
+              const prior=globalState.leases?.find(lease=>lease.token===record.inFlight && lease.key===key && lease.workspace===canonicalWorkspace);
+              if(prior && !prior.childID) {
+                finishWriterLease(globalState,prior.token,{childID:record.childID});
+                await saveGlobal();
+              }
             }
             record.inFlight=null;record.state='paused';await save();
           }
@@ -363,7 +396,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
           // fresh workspace reservation for implement/verify, and deploy always
           // retains its exclusive workspace reservation. Explicit path changes
           // still take the normal overlap and ownership route below.
-          if (record && input.sessionID && input.writePaths === undefined && record.operation === input.operation && input.operation !== 'deploy' && ((record.writePaths?.length ?? 0) > 0 || writes.length === 0)) writes = record.writePaths ?? writes;
+          if (record && input.sessionID && input.writePaths === undefined && record.operation === input.operation && input.operation !== 'deploy' && ((record.writePaths?.length ?? 0) > 0 || record.externalGrant || writes.length === 0)) writes = record.writePaths ?? writes;
           if (staleRebind) {
             if (!input.sessionID) throw new Error(`task-intent: explicitly resume child ${requested} with sessionID and the current revision to deliver the correction. Recovery: ${JSON.stringify(rebindRecovery(record,intent))}`);
             if (child.active) throw new Error(`task-intent: child ${requested} is still active on a superseded revision; wait for it to become idle before explicitly rebinding. Recovery: ${JSON.stringify(rebindRecovery(record,intent))}`);
@@ -379,6 +412,27 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         if (record?.inFlight) throw new Error(`task-dispatch: admission already in flight for ${input.workKey}; inspect task_dispatch_status`);
         const denied = suppression(record,input);
         if (denied) throw new Error(`task-dispatch: admission remains denied (${denied.category}). ${denialAdvice(denied.category)} Inspect task_dispatch_status for the receipt.`);
+        // An omitted continuation path retains its prior grant only after a
+        // fresh read: expiry, revocation, and every binding remain live gates.
+        let externalGrant;
+        if (externalWrites.length || (input.writePaths === undefined && record?.externalGrant)) {
+          const retained = externalWrites.length ? undefined : record.externalGrant;
+          externalGrant = await authorizeExternalWrites({
+            grantID: input.externalWriteGrantID ?? retained?.grantID, workspace, rootID, parentID:context.sessionID,
+            childID:requested, taskId:input.taskId, workKey:input.workKey, intentRevision:intent?.revision,
+            checkIds:intent ? input.checkIds : undefined, agent:input.agent, operation:input.operation,
+            destinations: externalWrites.length ? externalWrites : (record.externalWrites ?? []), now, grantPath, configRoot,
+          });
+          externalWrites = externalGrant.destinations;
+        }
+        // Old/native sessions may not have a global reservation. For an
+        // external destination, conservatively require those workspaces idle.
+        if (externalWrites.length) for (const session of sessions) {
+          if (!session.active || session.id===requested || session.id===context.sessionID || descendant(sessions,context.sessionID,session.id)) continue;
+          if (!session.directory) throw new Error('task-dispatch: active session directory unavailable; external destination quiescence is unverified');
+          if (writerPathsOverlap(externalWrites,[await canonicalWriterPath(session.directory)]))
+            throw new Error(`task-dispatch: external destination has active session ${session.id}; wait for destination quiescence`);
+        }
         // Include pre-upgrade tasks and all descendants, even when a parent failed quota admission.
         const busy = sessions.filter(s => s.active && s.directory === workspace && s.id !== requested && s.id !== context.sessionID && !descendant(sessions,context.sessionID,s.id));
         if (role === 'coordinator' && !requested) {
@@ -430,12 +484,45 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), lo
         // Assignment binding starts at admission so an accepted child can record checkpoints while
         // its native call is still running. Delivery acknowledgement is tracked separately below.
         const generation=(record.admissionGeneration ?? 0)+1;
-        Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now(),admissionGeneration:generation });
+        Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now(),admissionGeneration:generation,
+          ...(externalGrant ? { externalWrites, externalGrant:{grantID:externalGrant.grantID,externalRoot:externalGrant.externalRoot} } : { externalWrites:[], externalGrant:undefined }) });
         beginCheckpoint(record, checkpoint, now());
-        await save(); return { key,childID:requested,intent,fullIntent,convergence,routing,contextAdvice,lastAssistantID:child?.lastAssistantID,generation,restoreBinding };
+        const canonicalWorkspace=await canonicalWriterPath(workspace);
+        const localAbsolute=await Promise.all(writes.map(relative=>canonicalWriterPath(path.resolve(workspace,relative))));
+        if (localAbsolute.some(absolute=>absolute!==canonicalWorkspace&&!absolute.startsWith(canonicalWorkspace+path.sep)))
+          throw new Error('task-dispatch: local write path escapes canonical workspace; an explicit external grant is required');
+        const absoluteWrites=[...localAbsolute,...externalWrites];
+        if (absoluteWrites.length) {
+          reserveWriterLease(globalState,{token,workspace:canonicalWorkspace,key,parentID:context.sessionID,childID:requested,paths:absoluteWrites,ownerPid:process.pid},
+            {sessions,delegatedOwner:lease=>lease.childID===context.sessionID || (lease.childID&&descendant(sessions,context.sessionID,lease.childID))});
+          await saveGlobal();
+        }
+        await save(); return { key,childID:requested,intent,fullIntent,convergence,routing,contextAdvice,lastAssistantID:child?.lastAssistantID,generation,restoreBinding,writerLease:absoluteWrites.length>0 };
+       }); } catch(error) {
+         // Native execution has not begun. Remove only this admission's provisional reservation.
+         if (globalState.leases?.some(lease=>lease.token===token)) { globalState.leases=globalState.leases.filter(lease=>lease.token!==token);await saveGlobal(); }
+         throw error;
+       }
       });
       if (admission.existing) return { content:`Existing child ${admission.existing} is still running or awaiting its admitted compaction outcome. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
-      const update = async patch => registry(workspace,async(state,save)=> { const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly'); Object.assign(r,patch,{updatedAt:Date.now()});await save(); });
+      const update = async patch => globalRegistry('all-writers',async(globalState,saveGlobal)=>registry(workspace,async(state,save)=> {
+        const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly');
+        if(admission.writerLease) {
+          const lease=globalState.leases?.find(item=>item.token===token);
+          if(!lease) throw new Error('task-dispatch: global writer lease changed unexpectedly');
+          if(patch.childID)lease.childID=patch.childID;
+          if(patch.inFlight===null) {
+            // An explicit native permission rejection before any child exists
+            // proves this reservation never became a writer. Ambiguous errors
+            // retain their reservation for operator reconciliation.
+            if(patch.denial?.category==='native_permission' && !lease.childID)
+              globalState.leases=globalState.leases.filter(item=>item.token!==token);
+            else finishWriterLease(globalState,token,{childID:patch.childID??lease.childID});
+          }
+          await saveGlobal();
+        }
+        Object.assign(r,patch,{updatedAt:Date.now()});await save();
+      }));
       let observed = admission.childID;
       let compactionID;
       const visible = workerProgress.attach(context.progress ?? (async () => {}));

@@ -515,6 +515,10 @@ Read [COMPATIBILITY.md](docs/COMPATIBILITY.md) and [SETUP.md](docs/SETUP.md). Th
 
 The generated public profile asks approval for unknown shell commands, pushes, deployments, and destructive actions. Reasoned one-use large-file grants do not require a separate confirmation. Existing file permissions still apply. Your local preference for broader permissions can be configured explicitly.
 
+For an explicitly authorized repository relocation, an operator can issue an expiring external-write grant to an existing worker. It is bound to the workspace, task, owner, intent revision, checks and destination. The dispatcher revalidates it on continuations and coordinates harness-managed destination ownership across workspaces; ordinary requests cannot grant themselves access by naming an absolute path. Native permissions still apply. This permits scoped destination work—it does not relocate sessions, copy files or approve publication automatically.
+
+See [external write grants](docs/EXTERNAL-WRITE-GRANTS.md) for scoped cross-workspace migration, exact bindings, and the requirement to keep native/direct destination writers idle.
+
 ## Update and roll back
 
 Obtain and review the new release source in a separate checkout/directory. Run tests, then:
