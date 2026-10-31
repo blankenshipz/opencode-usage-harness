@@ -158,6 +158,7 @@ def profile(models, package_root=ROOT, routing_policy=None):
                       for child in children for child_id in (child, visible_role(child))]
         if readonly:
             rules += [{'action':a,'resource':'*','effect':'deny'} for a in ('shell','edit')]
+        rules.append({'action':'edit','resource':'*anthropic-financial-policy.json','effect':'deny'})
         if role == 'verifier':
             rules.append({'action':'edit','resource':'*','effect':'deny'})
         identity_guidance = ('\nUse visible harness-* IDs for new handoffs. When continuing an existing worker, '
@@ -182,7 +183,7 @@ def profile(models, package_root=ROOT, routing_policy=None):
     permissions = [{'action':'*','resource':'*','effect':'ask'}]
     permissions += [{'action':a,'resource':'*','effect':'allow'} for a in ('read','glob','grep','edit','webfetch','codex_quota','model_status','task_contract','task_intent','task_artifact','task_dispatch_status','task_outcome','large_file_check','large_file_summary','subscription_quota')]
     for action in ('read','edit'):
-        permissions += [{'action':action,'resource':p,'effect':'deny'} for p in ('*.env','*.env.*','*auth.json','*.pem','*.key')]
+        permissions += [{'action':action,'resource':p,'effect':'deny'} for p in ('*.env','*.env.*','*auth.json','*.pem','*.key','*anthropic-financial-policy.json')]
     for command in ('pwd','git status*','git diff*','git log*','npm test*','npm run test*','pytest*','python3 -m pytest*','go test*','gofmt *'):
         permissions.append({'action':'shell','resource':command,'effect':'allow'})
     return {'$schema':'https://opencode.ai/v2/config.json','enabled_providers':providers,'experimental':{'policies':[{'effect':'deny','action':'provider.use','resource':'*'}]+[{'effect':'allow','action':'provider.use','resource':provider} for provider in providers]},'share':'disabled','update':'disable',
@@ -218,7 +219,7 @@ def main():
         financial.write_text(json.dumps({'auto_top_up_off':False,'automatic_reload_off':False,'purchased_credit_balance_ui':None,'verified_at':None},indent=2)+'\n');financial.chmod(0o600)
     requirements=[]
     if 'openai' in result['enabled_providers']: requirements.append('OpenAI OAuth/account and financial verification')
-    if 'anthropic' in result['enabled_providers']: requirements.append('reviewed Claude OAuth adapter and disabled usage credits')
+    if 'anthropic' in result['enabled_providers']: requirements.append('reviewed Claude OAuth adapter and disabled usage credits or explicit local app-managed-credit policy')
     print(f'Prepared {target}; no service started. Required before inference: '+ '; '.join(requirements)+'.')
 
 if __name__=='__main__':main()

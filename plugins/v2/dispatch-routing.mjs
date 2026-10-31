@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { managedConfigRoot } from './paths.mjs';
 import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
+import { readAnthropicFinancialPolicy } from './anthropic-financial-policy.mjs';
 import { readSelectedClaudeUsage } from './anthropic-subscription.mjs';
 import { canonicalHarnessRole, harnessRoleIDs } from './agent-mode.mjs';
 
@@ -92,14 +93,24 @@ export function readRoutingPolicy({ readFile = readFileSync, policyPath = path.j
   }
 }
 
-export async function readRoutingQuota(ctx, { readPolicy=readRoutingPolicy, readQuota=readProviderQuotas } = {}) {
+export async function readRoutingQuota(ctx, { readPolicy=readRoutingPolicy, readQuota=readProviderQuotas,
+  readAnthropicPolicy=readAnthropicFinancialPolicy } = {}) {
   const policy=readPolicy();
   let catalog;
   try { catalog = ctx ? (await ctx.model.list()).data : undefined; } catch {}
+  // A local Anthropic opt-in file cannot make an OpenAI-only dispatcher fail.
+  // For a dual catalog an invalid file is safe routing evidence: it withholds
+  // the credit exception while preserving a healthy OpenAI candidate. The
+  // Anthropic request guard still reads it directly and fails closed.
+  let anthropicFinancialPolicy={mode:'subscription_only'};
+  if (Array.isArray(catalog) && catalog.some(model=>model?.providerID==='anthropic')) {
+    try { anthropicFinancialPolicy=readAnthropicPolicy(); }
+    catch { anthropicFinancialPolicy={mode:'invalid'}; }
+  }
   let quota;
   try { quota = await readQuota({ providers: catalogProviders(catalog), readClaude: () => readSelectedClaudeUsage(ctx) }); }
   catch { quota={version:1,checked_at:new Date().toISOString(),pools:{}}; }
-  return { ...quota, routingPolicy: policy, catalog };
+  return { ...quota, routingPolicy: policy, anthropicFinancialPolicy, catalog };
 }
 export function modelReference(ref) {
   if (typeof ref === 'string') return /^[\w.-]+\/[\w./-]+(?:#[\w.-]+)?$/.test(ref) ? ref : undefined;
@@ -246,21 +257,28 @@ function weeklyPacingWindows(windows, now) {
 }
 function candidateState(candidate, quota, reserve) {
   const provider = candidate.ref.split('/')[0], pool = quota?.pools?.[provider];
+  if (provider === 'anthropic' && quota?.anthropicFinancialPolicy?.mode === 'invalid') return;
   const now=Date.now(), checked = Date.parse(pool?.checked_at);
-  if (!pool || pool.availability !== 'available' || !Number.isFinite(checked) || now-checked > 120000 || checked>now+5000) return;
-  if (provider === 'anthropic' && pool.financial?.extra_usage_enabled !== false) return;
+  const creditMode=provider === 'anthropic'
+    && quota?.anthropicFinancialPolicy?.mode === 'app_managed_credits'
+    && pool?.financial?.extra_usage_enabled === true;
+  if (!pool || (!creditMode && pool.availability !== 'available') || !Number.isFinite(checked) || now-checked > 120000 || checked>now+5000) return;
+  if (provider === 'anthropic' && !creditMode && pool.financial?.extra_usage_enabled !== false) return;
   if (provider === 'openai' && pool.credit_risk !== 'none') return;
   const relations=(pool.windows ?? []).map(window=>({window,relation:scopeRelation(window,candidate.ref,quota.catalog)}));
   if (relations.some(entry=>entry.relation==='ambiguous')) return;
   const windows=relations.filter(entry=>entry.relation==='applicable').map(entry=>entry.window);
-  if (!windows.length || windows.some(w => !Number.isFinite(w.used_percent) || w.used_percent >= 100-reserve || w.locked_reason
+  if (!windows.length || windows.some(w => !Number.isFinite(w.used_percent) || w.locked_reason
     || timestamp(w.resets_at) === null || timestamp(w.resets_at) <= now)) return;
+  const paid=creditMode && windows.some(w=>w.used_percent>=100-reserve);
+  if (!paid && (pool.availability !== 'available' || windows.some(w=>w.used_percent>=100-reserve))) return;
   if (candidate.requiresScopedQuota && !windows.some(w => w.scope !== 'account')) return;
   if (Array.isArray(quota.catalog)) {
     const [key,variant] = candidate.ref.split('#'), slash=key.indexOf('/');
     const model = quota.catalog.find(m=>m.providerID===key.slice(0,slash) && m.id===key.slice(slash+1));
     if (!model || (variant && !(model.variants??[]).some(v=>(typeof v==='string'?v:v.id)===variant))) return;
   } else return; // Newly selected routes must exist in the settled runtime catalog.
+  if (paid) return {score:undefined,pressure:false,pace:'unknown',paid:true,pacing:undefined};
   const deltas=windows.map(w=>w.pace_delta).filter(Number.isFinite);
   // A high weekly percentage alone is expected near a reset. Pressure comes
   // from being ahead of an applicable pace, or a genuinely short-window cap.
@@ -279,7 +297,7 @@ function candidateState(candidate, quota, reserve) {
   // allowing reset proximity to outweigh the underlying deficit by more than 2x.
   const score=limiting ? -delta + Math.min(deficit,deficit*(1-remaining)) : undefined;
   const pacing=limiting ? {provider,limitingWeeklyPaceDelta:delta,limitingWeeklyResetsAt:limiting.resets_at} : undefined;
-  return {score,pressure,pace:pressure?'ahead':limiting ? (deltas.length&&deltas.every(v=>v < -10)?'behind':'normal') : 'unknown',pacing};
+  return {score,pressure,pace:pressure?'ahead':limiting ? (deltas.length&&deltas.every(v=>v < -10)?'behind':'normal') : 'unknown',pacing,paid:false};
 }
 export function chooseCandidate({input,quota}) {
   const policy=quota?.routingPolicy;
@@ -306,14 +324,21 @@ export function chooseCandidate({input,quota}) {
   // For requested independent review, prefer a capable different family when
   // its pool is healthy; a depleted pool never wins solely for diversity.
   const routine=input.routing?.complexity==='routine' && input.routing?.risk==='normal';
-  eligible.sort((a,b)=>(Number(a.pressure)-Number(b.pressure))
+  const compare=(a,b)=>(Number(a.pressure)-Number(b.pressure))
     || (routine ? 0 : (a.fit.band===b.fit.band ? 0 : a.fit.band==='preferred' ? -1 : 1))
     // Unknown weekly pace remains eligible (including a one-pool profile), but
     // cannot be treated as a neutral measured allowance when a peer is known.
     || (Number(a.pace==='unknown')-Number(b.pace==='unknown'))
     || ((b.independent&&b.pace!=='ahead'&&b.pace!=='unknown'?40:0)+(b.score ?? 0))-((a.independent&&a.pace!=='ahead'&&a.pace!=='unknown'?40:0)+(a.score ?? 0))
-    || a.index-b.index);
-  const chosen=eligible[0];
+    || a.index-b.index;
+  eligible.sort(compare);
+  // Paid capacity has no synthetic pace, reserve, balance, or prepaid-score.
+  // If normal ranking reaches it, a healthy included peer with the same fit
+  // wins without making mixed-fit/pressure ordering non-transitive.
+  const paidChoice=eligible[0];
+  const chosen=paidChoice?.paid
+    ? eligible.filter(choice=>!choice.paid && choice.fit.band===paidChoice.fit.band).sort(compare)[0] ?? paidChoice
+    : paidChoice;
   const pressureTradeoff=!routine && chosen.fit.band==='acceptable' && choices.some(c=>c.fit.band==='preferred' && c.pressure) && !chosen.pressure;
   const explanation=fitContext.strict ? 'protected_task_fit_floor'
     : pressureTradeoff ? 'healthy_acceptable_over_pressured_preferred'

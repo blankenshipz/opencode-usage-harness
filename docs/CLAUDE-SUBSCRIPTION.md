@@ -24,8 +24,8 @@ provider packages, custom endpoints, and Anthropic credential environment overri
 are rejected. The service must run with its clean managed environment.
 
 Before inference the guard queries Anthropic's native OAuth usage endpoint using
-the same selected access token. It requires `extra_usage.is_enabled` to be exactly
-false. Missing data, an enabled value, failed authentication, timeout or network
+the same selected access token. By default it requires `extra_usage.is_enabled`
+to be exactly false. Missing data, an enabled value, failed authentication, timeout or network
 failure blocks inference. Successful proof is cached briefly in memory. This is
 an internal account endpoint, not a guaranteed public API; a schema change fails
 closed and may require an adapter update. The provider's included-usage limits
@@ -39,6 +39,36 @@ an API credit balance nor permission to consume it is implied by this connection
 Only the subscription OAuth path is admitted. OpenAI keeps its own existing
 account-matching, financial-verification and Codex quota checks; exhausted Codex
 allowance does not block a separately admitted Claude request.
+
+### Optional app-managed usage credits
+
+The public default remains subscription-only. An operator who has deliberately
+configured Anthropic's own application limits may opt in to Claude OAuth usage
+credits by copying `config/anthropic-financial-policy.example.json` to
+`$HARNESS_STATE_DIR/config/anthropic-financial-policy.json` (or
+`~/.local/state/opencode-usage-harness/config/anthropic-financial-policy.json`):
+
+```json
+{
+  "version": 1,
+  "mode": "app_managed_credits",
+  "acknowledgement": "I authorize Anthropic app-managed usage credits"
+}
+```
+
+The file is ignored by Git. An absent file remains subscription-only; a malformed
+or incomplete file blocks admission. In this mode OAuth authentication, approved provider package
+and endpoint checks remain unchanged, while the Anthropic app and server enforce
+the configured cap and final account limit. Usage telemetry is advisory routing
+evidence and does not gate an authorized request, so a timeout, stale value, or
+unknown `extra_usage` setting cannot reintroduce a request stall. An actual
+inference exhaustion/error is returned without retry, model fallback, API-key
+fallback, purchase, or reload operation. The harness keeps no atomic dollar
+accounting and does not infer a credit balance or units.
+
+Generated profiles deny edits to this policy file through their native permission
+rules. That is an application permission control, not an operating-system sandbox:
+shell access remains subject to native command approval and local host controls.
 
 ## Managed plugin artifact
 
@@ -118,6 +148,8 @@ stored in cache records. Credential rotation starts a new verification boundary.
 A timeout, network failure, HTTP 429 or server failure is not quota exhaustion.
 After a transient failure the last verified snapshot may support inference only
 while its original disabled-usage-credits evidence is less than 24 hours old.
+Explicit app-managed-credit admission does not use this telemetry recovery path;
+the provider application owns its cap and telemetry remains advisory routing data.
 Cache reads and failed lookups never extend that deadline. Routing preserves the
 original timestamp and exposes stale/cooldown metadata. Recovery snapshots are
 unknown for quota pacing, even within the ordinary advisory freshness limit.
@@ -133,8 +165,10 @@ inference call.
 
 Authentication failures, invalid financial responses, enabled usage credits,
 confirmed applicable exhaustion, and expired financial verification remain
-blocking. A new unsafe response invalidates prior safe evidence. Switching model
-families must not treat a reported account-wide limit as a separate quota pool.
+blocking in the default subscription-only mode. App-managed-credit mode keeps
+OAuth/provider validation and lets the provider app decide its configured limit.
+A new unsafe response invalidates prior safe subscription-only evidence. Switching
+model families must not treat a reported account-wide limit as a separate quota pool.
 No API-key fallback, account substitution, credit purchase or inference retry is
 introduced. The selected OAuth connection and endpoint checks still run for each
 request.

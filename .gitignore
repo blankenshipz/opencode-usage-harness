@@ -12,5 +12,6 @@ runtime/
 backups/
 auth.json
 financial-verification.json
+anthropic-financial-policy.json
 dist/
 .DS_Store

@@ -20,13 +20,15 @@ function event(providerID = 'anthropic', modelID = 'claude-opus') {
 
 async function setup({ env = {}, connection = anthropicConnection, credential = anthropicCredential,
   provider = anthropicProvider, models = [{ providerID: 'anthropic', id: 'claude-opus' }], quota = () => 'ok',
-  usage = async () => ({ extra_usage: { is_enabled: false } }), openaiConnection, openaiCredential, clock = { now: Date.parse('2026-10-26T00:00:00.000Z') } } = {}) {
+  usage = async () => ({ extra_usage: { is_enabled: false } }), openaiConnection, openaiCredential,
+  financialPolicy = () => ({ mode: 'subscription_only' }), clock = { now: Date.parse('2026-10-26T00:00:00.000Z') } } = {}) {
   const hooks = new Map(), quotaCalls = [], reads = [], usageCalls = [];
   const cacheDirectory = await mkdtemp(join(tmpdir(), 'anthropic-guard-cache-'));
   const plugin = createV2Guard({ now: () => new Date(clock.now).toISOString(), env, append: () => {}, recordCompletion: () => {},
     readJSON: file => { reads.push(file); return file.includes('.codex/auth.json') ? codex : openaiFinancial; },
     runQuota: args => { quotaCalls.push(args); return quota(args); },
     readAnthropicUsage: async access => { usageCalls.push(access); return usage(access); },
+    readAnthropicPolicy: financialPolicy,
     anthropicQuotaCache: createQuotaCache({ directory: cacheDirectory, now: () => clock.now }) });
   const providers = { anthropic: provider, openai: { package: '@opencode/ai/providers/openai', settings: { baseURL: 'https://chatgpt.com/backend-api/codex' } } };
   const ctx = {
@@ -203,6 +205,22 @@ test('Anthropic hook admits stale disabled financial evidence through the 24-hou
   await assert.rejects(displayFamily.hooks.get('model.request')(event('anthropic', 'claude-fable-5-1')), /exhausted/); displayFamily.cleanup();
   const otherVersion = await setup({ usage: async () => ({ extra_usage: { is_enabled: false }, limits: [{ kind: 'weekly_scoped', model: 'claude-fable-4', used_percent: 100 }] }) });
   await otherVersion.hooks.get('model.request')(event('anthropic', 'claude-fable-5-1')); otherVersion.cleanup();
+});
+
+test('explicit app-managed Claude credits rely on the provider app cap without a telemetry read', async () => {
+  const credits = () => ({ mode: 'app_managed_credits' });
+  const h = await setup({ financialPolicy: credits, usage: async () => { throw new Error('telemetry must not gate credits'); } });
+  await h.hooks.get('model.request')(event());
+  assert.equal(h.quotaCalls.length, 0);
+  assert.deepEqual(h.usageCalls, []);
+  await h.cleanup();
+});
+
+test('app-managed credit mode preserves OAuth and provider validation', async () => {
+  const h = await setup({ financialPolicy: () => ({ mode: 'app_managed_credits' }),
+    credential: { ...anthropicCredential, metadata: {} } });
+  await assert.rejects(h.hooks.get('model.request')(event()), /Claude Code OAuth is required/);
+  await h.cleanup();
 });
 
 test('Anthropic guard rejects a slow transient refresh that crosses the exact 24-hour verification boundary', async () => {

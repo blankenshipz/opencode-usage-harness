@@ -31,7 +31,7 @@ Publishing or installing the toolkit does not make native runtime patches live.
 | Keep large files from crowding the main agent's context | A 350-line broad-read threshold, focused worker summaries, targeted reads, and reasoned one-use exceptions. |
 | Keep delegated work connected to the task | Shared task intent, scoped worker ownership, resumption, and recorded acceptance evidence. |
 | Understand what your agents accomplished | Workload metrics for usage, observed execution time, retries and reported acceptance, with overlap and unknowns called out. |
-| Keep subscription-only inference explicit | Provider-specific subscription OAuth and financial admission: Codex account/credit checks, Claude usage-credits-disabled verification, and no automatic API-key/provider fallback. |
+| Keep subscription-only inference explicit | Provider-specific subscription OAuth and financial admission: Codex account/credit checks, Claude usage-credits-disabled verification by default, and no automatic API-key/provider fallback. An operator may explicitly select the documented Anthropic app-managed-credit mode. |
 | Adopt changes incrementally | An isolated toolkit installer, versioned updates, integrity checks, and code rollback. |
 
 A typical workflow is: **check quota → inspect only the relevant code → route to
@@ -236,7 +236,7 @@ A missing, stale or failed read is **unknown**, not zero usage or extra capacity
 | Evidence source | Authenticated Codex CLI app-server, `account/rateLimits/read`; admission verifies the OpenCode and CLI account match. | Usage endpoint for the **selected Claude Code OAuth connection** inside OpenCode; no API key or other account is substituted. |
 | Windows | Uses the durations and resets actually returned; does not assume a five-hour or weekly window exists. | Reads session, account-wide weekly and model-scoped limits when present. Reported durations take precedence; recognized five-hour/seven-day windows without durations are marked `duration_source: inferred`. |
 | Scoped capacity | Preserves reported Codex buckets in the CLI output; the shared pool view currently treats normalized Codex windows as account scope. | Preserves model/family scope, locks and weekly-share metadata when provided. A model-scoped allowance is a constraint within the subscription, not a second pool to add to the total. |
-| Financial evidence | Credit-risk metadata plus separate account/financial verification. | Usage credits (`extra_usage.is_enabled`) must be explicitly disabled; monthly API credits are not used. |
+| Financial evidence | Credit-risk metadata plus separate account/financial verification. | Usage credits (`extra_usage.is_enabled`) must be explicitly disabled, unless an operator installs the exact local app-managed-credit acknowledgement described in [Claude connection setup](docs/CLAUDE-SUBSCRIPTION.md#optional-app-managed-usage-credits). |
 | Access outside OpenCode | `codex-quota` provides human-readable or JSON output, refresh and admission checks. | The standalone `subscription-quota.mjs` has no selected OpenCode OAuth context, so it reports Claude as `unknown [adapter_unavailable]`; use the in-session tool for Claude. |
 
 The explicit `codex_quota` tool remains Codex-only. The shared tool and automatic
@@ -253,6 +253,10 @@ lookup failure, admission may use an existing verification of disabled usage cre
 for less than 24 hours from its original successful read. Quota telemetry is still
 fresh for only 60 seconds and stale telemetry remains unsuitable for routing. Expired financial evidence,
 authentication failures, and enabled or unknown usage credits still block admission.
+The only exception is an explicit private `app_managed_credits` policy for an
+operator-managed Anthropic app cap; it keeps OAuth/provider validation but lets
+the provider app enforce spending, without local balance accounting or a fallback
+after a provider limit.
 The provider remains the final included-quota hard stop; no Codex-style subprocess
 is required for Claude.
 Neither path admits API-key billing or automatically retries with another provider.

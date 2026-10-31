@@ -53,6 +53,18 @@ test('comparable review prefers other family only with eligible healthy pool',()
  q.pools.anthropic.financial.extra_usage_enabled=true;
  assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'openai/sol#high');
 });
+test('authorized app-managed credits remain eligible after included exhaustion but lose to healthy same-fit included capacity',()=>{
+ const q=multi();q.anthropicFinancialPolicy={mode:'app_managed_credits'};
+ q.pools.anthropic.financial.extra_usage_enabled=true;q.pools.anthropic.availability='unavailable';
+ q.pools.anthropic.windows[0].used_percent=100;q.pools.anthropic.windows[0].remaining_percent=0;q.pools.anthropic.windows[0].pace_delta=-90;
+ const input={agent:'builder',routing:{complexity:'standard',risk:'normal'}};
+ assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'openai/sol#medium');
+ q.pools.openai.availability='unavailable';
+ const paid=selectDispatchModel({...base,input,quota:q});
+ assert.equal(paid.selected,'anthropic/sonnet#high');
+ assert.equal(paid.poolPacing,undefined);
+ assert.equal(paid.pace,'unknown');
+});
 test('explicit model beats balancing; stale pools and unadvertised models cannot be automatically selected',()=>{
  const q=multi(),input={agent:'builder',model:'openai/sol#medium',routing:{complexity:'standard',risk:'normal'}};
  assert.equal(selectDispatchModel({...base,input,quota:q}).selected,input.model);
@@ -295,6 +307,32 @@ test('policy is retained when catalog or telemetry reads fail',async()=>{
  assert.equal(catalogFailure.routingPolicy,policy);assert.deepEqual(catalogFailure.pools,{});
  const telemetryFailure=await readRoutingQuota({model:{list:async()=>({data:catalog})}},{readPolicy:()=>policy,readQuota:async()=>{throw new Error('offline');}});
  assert.equal(telemetryFailure.routingPolicy,policy);assert.deepEqual(telemetryFailure.pools,{});
+});
+test('routing quota carries the explicit Anthropic financial mode without changing provider telemetry',async()=>{
+ const result=await readRoutingQuota({model:{list:async()=>({data:catalog})}}, {
+  readPolicy:()=>policy, readAnthropicPolicy:()=>({mode:'app_managed_credits'}),
+  readQuota:async()=>({version:1,checked_at:new Date().toISOString(),pools:{}}),
+ });
+ assert.deepEqual(result.anthropicFinancialPolicy,{mode:'app_managed_credits'});
+});
+test('OpenAI-only routing never reads an Anthropic policy file',async()=>{
+ let reads=0;
+ const result=await readRoutingQuota({model:{list:async()=>({data:[catalog[0]]})}}, {
+  readPolicy:()=>policy, readAnthropicPolicy:()=>{reads++;throw new Error('malformed');},
+  readQuota:async()=>({version:1,checked_at:new Date().toISOString(),pools:{}}),
+ });
+ assert.equal(reads,0);assert.deepEqual(result.anthropicFinancialPolicy,{mode:'subscription_only'});
+});
+test('invalid Anthropic routing policy withholds credit routing but preserves OpenAI candidates',async()=>{
+ const result=await readRoutingQuota({model:{list:async()=>({data:catalog})}}, {
+  readPolicy:()=>policy, readAnthropicPolicy:()=>{throw new Error('malformed');},
+  readQuota:async()=>({version:1,checked_at:new Date().toISOString(),pools:{
+   openai:pool('openai',0),anthropic:{...pool('anthropic',-40),financial:{extra_usage_enabled:true}},
+  }}),
+ });
+ assert.deepEqual(result.anthropicFinancialPolicy,{mode:'invalid'});
+ result.pools.anthropic.financial.extra_usage_enabled=false; // Invalid policy blocks even healthy included Anthropic routes.
+ assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'standard',risk:'normal'}},quota:result}).selected,'openai/sol#medium');
 });
 
 test('policy reader rejects unsupported or malformed provider references',()=>{

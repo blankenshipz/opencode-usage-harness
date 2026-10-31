@@ -1,6 +1,7 @@
 import unittest
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,8 +14,11 @@ class ConfigureTests(unittest.TestCase):
         p=profile({k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
         self.assertEqual(p['enabled_providers'],['openai'])
         self.assertEqual(p['permissions'][0]['effect'],'ask')
+        protected = {'action':'edit','resource':'*anthropic-financial-policy.json','effect':'deny'}
+        self.assertIn(protected, p['permissions'])
         for role in ('scout','builder','quick-builder','reviewer'):
             self.assertIn({'action':'large_file_summary','resource':'*','effect':'deny'},p['agents'][role]['permissions'])
+            self.assertIn(protected,p['agents'][role]['permissions'])
         self.assertEqual(len(p['plugins']),4)
         for name in ('build','plan','general','explore'):
             self.assertFalse(p['agents'][name]['disabled'])
@@ -157,5 +161,19 @@ class ConfigureTests(unittest.TestCase):
             state=root/'state'
             subprocess.run([sys.executable, 'configure.py', '--models', str(models), '--state-dir', str(state)], check=True)
             self.assertFalse((state/'config'/'financial-verification.json').exists())
+
+    def test_generated_policy_protects_financial_opt_in_in_default_and_explicit_state_directories(self):
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); models=root/'models.json';models.write_text(json.dumps({k:'anthropic/fixture#medium' for k in tiers}))
+            default_state=root/'default-state'; alternate_state=root/'alternate-state'
+            env={**os.environ,'HARNESS_STATE_DIR':str(default_state)}
+            subprocess.run([sys.executable,'configure.py','--models',str(models)],check=True,env=env,capture_output=True)
+            subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(alternate_state)],check=True,capture_output=True)
+            protected={'action':'edit','resource':'*anthropic-financial-policy.json','effect':'deny'}
+            for state in (default_state,alternate_state):
+                generated=json.loads((state/'config'/'opencode.json').read_text())
+                self.assertIn(protected,generated['permissions'])
+                self.assertIn(protected,generated['agents']['harness-builder']['permissions'])
 
 if __name__=='__main__':unittest.main()

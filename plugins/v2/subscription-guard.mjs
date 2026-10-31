@@ -9,6 +9,7 @@ import { anthropicPackage, assertAnthropicOverrides, assertAnthropicBaseURL, ass
   assertAnthropicCredential, fetchAnthropicUsage, normalizeAnthropicUsageFailure, readSelectedClaudeUsage, anthropicUsageExhausted, sanitizeAnthropicUsage } from './anthropic-subscription.mjs';
 import { CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS, createQuotaCache } from './quota-cache.mjs';
 import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
+import { readAnthropicFinancialPolicy } from './anthropic-financial-policy.mjs';
 import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
 import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
 import { createRegistry } from './dispatch-registry.mjs';
@@ -94,7 +95,8 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     appendFileSync(path.join(telemetry, `${file}.jsonl`), JSON.stringify(value) + '\n', { mode: 0o600 });
   }, env = process.env, now = () => new Date().toISOString(), recordCompletion = value => persistCompletion({
     database: statePath('telemetry', 'completions.sqlite3'), value, python: env.HARNESS_PYTHON || 'python3', env,
-  }), registry = createRegistry(), readAnthropicUsage = fetchAnthropicUsage, anthropicQuotaCache } = {}) {
+  }), registry = createRegistry(), readAnthropicUsage = fetchAnthropicUsage, anthropicQuotaCache,
+  readAnthropicPolicy = readAnthropicFinancialPolicy } = {}) {
   const quotaCache = anthropicQuotaCache ?? createQuotaCache({ now: () => Date.parse(now()), hardTtlMs: CLAUDE_DISABLED_OVERAGE_VERIFICATION_MS });
   // The default reader already owns the process-shared cache used by routing.
   // Injected readers are raw test/integration adapters and need that wrapper.
@@ -171,6 +173,12 @@ export function createV2Guard({ readJSON = file => JSON.parse(readFileSync(file,
     const access = credential.access;
     if (typeof access !== 'string' || access.length === 0)
       throw new Error('Subscription guard: Anthropic Claude Code OAuth access is unavailable.');
+    const financialPolicy = readAnthropicPolicy();
+    // This operator-selected mode delegates the spending cap and final stop to
+    // the Anthropic app/provider. Usage telemetry is advisory routing evidence;
+    // a transient or stale read must not stall an otherwise authorized OAuth
+    // request, and no local balance is inferred.
+    if (financialPolicy.mode === 'app_managed_credits') return;
     let usage;
     try { usage = await cachedAnthropicUsage(access); }
     catch (error) { throw normalizeAnthropicUsageFailure(error); }
