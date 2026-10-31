@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { installTaskDispatch, hasCapability } from '../plugins/v2/task-dispatch.mjs';
+import { installTaskDispatch, hasCapability, resolvePublicationScope } from '../plugins/v2/task-dispatch.mjs';
 import { createV2TaskOutcomes } from '../plugins/v2/task-outcomes.mjs';
 import { setIntent } from '../plugins/v2/task-intent.mjs';
 import { createRegistry } from '../plugins/v2/dispatch-registry.mjs';
@@ -64,7 +64,7 @@ async function harness(t, custom, nativeInput, dispatchOptions={}) {
  const ctx={location:{directory:'/project'},agent:{list:async()=>({data:Object.entries(agents).map(([id,a])=>({id,...a}))})},tool:{transform:async fn=>{assert.notEqual(fn.constructor.name,'AsyncFunction','native editor transformations must be synchronous');return fn({get:n=>tools.get(n),update:(n,fn)=>fn(tools.get(n)),add:tool=>tools.set(tool.name,tool)});}}};
  const registry=createRegistry(dir);await registry('/project',async(state,save)=>{setIntent(state,{rootID:'root',taskId:'release',intent,expectedRevision:0,actorSessionID:'root'});await save();});
  const hooks=new Map();ctx.session={hook:async(name,fn)=>{const previous=hooks.get(name);hooks.set(name,async event=>{if(previous)await previous(event);return fn(event);});}};
- const runtime=await installTaskDispatch(ctx,{registry,globalRegistry:createRegistry(path.join(dir,'global-writers')),loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction'],loadRoutingPolicy:()=>undefined,...dispatchOptions});
+ const runtime=await installTaskDispatch(ctx,{registry,globalRegistry:createRegistry(path.join(dir,'global-writers')),loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction'],loadRoutingPolicy:()=>undefined,resolvePublicationScope:async()=>({checkout:'.worktrees/pub',commonGit:'.git'}),...dispatchOptions});
  const call=(input,tool='task_dispatch',sessionID='root')=>tools.get(tool).execute(input,{sessionID,agent:'router',progress:async()=>{}});
  return {call,sessions,calls,tools,ctx,dir,registry,rawNative,hooks,runtime};
 }
@@ -247,6 +247,52 @@ test('writers have disjoint ownership; deployment waits for existing writers',as
  h.sessions.filter(s=>s.id!=='root').forEach(s=>s.active=false);
  await h.call({...base,workKey:'deploy',operation:'deploy',requiredCapabilities:['shell'],background:true});
  await assert.rejects(h.call({...base,workKey:'another-deploy',operation:'deploy',requiredCapabilities:['shell']}),/overlapping/);
+});
+test('publish coordinates explicit narrow frozen scopes without becoming deploy',async t=>{
+ const revision='a'.repeat(40);
+ const h=await harness(t);await h.call({...base,background:true});
+ const publish={...base,workKey:'publish-release',operation:'publish',requiredCapabilities:['shell'],writePaths:['artifacts/release.json'],publication:{revision,checkout:'.worktrees/pub'}};
+ const {background,...defaulted}=publish;
+ const result=await h.call(defaulted);
+ assert.equal(result.content,'OK');assert.equal(h.calls.at(-1).background,true);
+ assert.match(h.calls.at(-1).prompt,new RegExp(`frozen commit ${revision}`));assert.match(h.calls.at(-1).prompt,/never HEAD/);assert.match(h.calls.at(-1).prompt,/non-force push/);
+ await h.registry('/project',async state=>{
+  const record=state.records.find(item=>item.workKey==='publish-release');
+  assert.deepEqual(record.writePaths,['artifacts/release.json','.worktrees/pub','.git']);assert.deepEqual(record.publication,{revision,checkout:'.worktrees/pub'});
+ });
+ const summary=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);
+ assert.deepEqual(summary.owners.find(owner=>owner.workKey==='publish-release').publication,{revision,checkout:'.worktrees/pub'});
+ const identity=result.metadata.sessionID;
+ await h.call({...publish,sessionID:identity,publication:{revision:'b'.repeat(64),checkout:'.worktrees/pub'},background:true});
+ assert.equal(h.calls.at(-1).sessionID,identity);
+ await h.registry('/project',async state=>{
+  const record=state.records.find(item=>item.workKey==='publish-release');
+  assert.equal(record.childID,identity);assert.equal(record.admissionGeneration,2);assert.deepEqual(record.publication,{revision:'b'.repeat(64),checkout:'.worktrees/pub'});
+ });
+ await h.call({...base,workKey:'publish-release',sessionID:identity,operation:'verify',requiredCapabilities:['shell'],writePaths:['artifacts/release.json'],background:true});
+ await h.registry('/project',async state=>assert.equal(state.records.find(item=>item.workKey==='publish-release').publication,undefined));
+ for (const [index,candidate] of [undefined,[],['artifacts/*'],[''],[' \t'],['artifact\nname']].entries()) await assert.rejects(h.call({...publish,workKey:`bad-${index}`,writePaths:candidate}),/publish requires explicit non-empty writePaths|literal paths/);
+ for (const [index,publication] of [undefined,{revision:'abc',checkout:'.worktrees/pub'},{revision:42,checkout:'.worktrees/pub'},{revision,checkout:'.worktrees/pub',extra:true},{revision}].entries()) await assert.rejects(h.call({...publish,workKey:`revision-${index}`,publication}),/publication\.revision|full frozen commit OID|publication\.checkout/);
+ await assert.rejects(h.call({...base,workKey:'nonpublish-publication',publication:{revision}}),/only valid for publish/);
+});
+test('publish blocks only overlapping Git metadata and target scopes',async t=>{
+ const h=await harness(t);await h.call({...base,workKey:'git-metadata',writePaths:['.git'],background:true});
+ await assert.rejects(h.call({...base,workKey:'publish-git',operation:'publish',requiredCapabilities:['shell'],writePaths:['.git/refs/heads/main','artifacts/release.json'],publication:{revision:'c'.repeat(40),checkout:'.worktrees/pub'}}),/overlapping/);
+});
+test('publish fails closed when Git scope discovery is unavailable or escapes the workspace',async t=>{
+ const publication={revision:'d'.repeat(40),checkout:'.worktrees/pub'};
+ for (const resolvePublicationScope of [async()=>{throw new Error('private git failure');},async()=>({checkout:'.worktrees/pub',commonGit:'../outside'})]) {
+  const h=await harness(t,undefined,undefined,{resolvePublicationScope});
+  await assert.rejects(h.call({...base,workKey:`scope-${Math.random()}`,operation:'publish',requiredCapabilities:['shell'],writePaths:['artifacts/release.json'],publication}),/publish Git scope discovery is unavailable or outside the workspace/);
+ }
+});
+test('real publication scope discovery finds a linked worktree common Git directory',async t=>{
+ const directory=await fsp.mkdtemp(path.join(os.tmpdir(),'publish-scope-'));t.after(()=>fsp.rm(directory,{recursive:true,force:true}));
+ const run=promisify(execFile);
+ await run('git',['init',directory]);await run('git',['-C',directory,'config','user.email','test@example.invalid']);await run('git',['-C',directory,'config','user.name','Test']);
+ await fsp.writeFile(path.join(directory,'seed.txt'),'seed\n');await run('git',['-C',directory,'add','seed.txt']);await run('git',['-C',directory,'commit','-m','seed']);
+ const checkout=path.join(directory,'publish');await run('git',['-C',directory,'worktree','add','-b','publish-scope-branch',checkout]);
+ assert.deepEqual(await resolvePublicationScope({workspace:directory,checkout:'publish'}),{checkout:'publish',commonGit:'.git'});
 });
 test('continuation path retention keeps admitted scope across operations without widening read-only or deploy ownership',async t=>{
  const h=await harness(t);const inspect=(await h.call({...base,background:true})).metadata.sessionID;

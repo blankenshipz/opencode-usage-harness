@@ -50,6 +50,7 @@ function ownerSummary(owner) {
   for (const key of ['taskId', 'workKey', 'childID', 'parentID', 'agent', 'operation', 'intentRevision', 'checkIds', 'admissionGeneration', 'compactionID', 'compactionOutcome', 'recordedState', 'effectiveState', 'nativeExecution', 'collection', 'writePaths', 'rebind', 'needsRebind', 'denial', 'continuationOwner', 'activeDescendants', 'inFlight']) {
     if (owner?.[key] !== undefined) summary[key] = owner[key];
   }
+  if (typeof owner?.publication?.revision === 'string') summary.publication = { revision: owner.publication.revision, ...own(owner.publication, 'checkout') };
   if (owner?.routing !== undefined) summary.routing = routingSummary(owner.routing);
   if (owner?.workCheckpoint !== undefined) summary.workCheckpoint = checkpointSummary(owner.workCheckpoint);
   if (owner?.verificationAttempt !== undefined) summary.verificationAttempt = verificationSummary(owner.verificationAttempt);

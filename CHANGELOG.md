@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — scoped Git publication
+
+- Separate frozen-commit publication from checkout-exclusive deployment.
+- Require explicit publication scopes and commit identity; retain overlapping leases, hooks and native approvals.
+
+
 ## Unreleased — scoped verifier capabilities
 
 - Recognize scoped edit capability, including verifier artifacts, without changing native path permissions.

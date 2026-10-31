@@ -53,7 +53,7 @@ Git hold after its owner is idle merely because feature work remains. Inspect cu
 ownership; an unknown or in-flight lease still requires reconciliation, not deletion.
 Publication success needs a verified remote branch/commit or PR, not a local plan.
 
-An admitted writer retains its `writePaths` through non-`deploy` operation
+Except for explicit `publish` scopes, an admitted writer retains its `writePaths` through non-`deploy` operation
 changes and implicit continuation of the same work key. A read-only continuation
 becoming a writer must name paths explicitly; `[]` is rejected instead of falling
 back to a workspace root, and conflicts identify the exact overlapping paths.
@@ -181,3 +181,26 @@ The dispatcher must recognize that scoped capability; the native executor still
 checks each actual path and secret restriction. A missing capability on an existing
 assignment must identify that capability, not falsely report a changed child identity.
 Preserve the existing child, role and real denial history during correction.
+
+### Publication is distinct from deployment
+
+Use `publish` only for authorized publication of an already-frozen Git commit.
+Every admission requires `publication: {revision: "<full commit OID>", checkout: "<workspace-relative checkout>"}` and
+explicit nonempty `writePaths`, even for the same child. Admission discovers the
+actual checkout root and shared Git metadata with read-only Git queries and always
+reserves both. Include every additional hook/output path involved in `writePaths`.
+Missing/invalid Git discovery or external metadata fails closed.
+Push the exact OID to the approved ref, non-force, preserving native command
+approvals, hooks and required gates. Do not silently skip hooks or relabel a real
+permission denial. The binding records intent; it does not parse or sandbox shell
+commands or prove the remote accepted the commit. Confirm the remote afterward.
+
+Disjoint worktrees need not wait for a whole-checkout deployment lease. Shared Git
+metadata and overlapping checkout/output paths still serialize. Unknown hook
+effects require broad scope and waiting for its owners. `deploy` retains exclusive
+workspace ownership; source changes/builds are separate implementation or verification
+work. Never clear another active worker's lease to publish. A dispatcher rooted in
+a linked worktree cannot silently omit an external common Git directory: the
+minimal publication path does not add new external-write grants. Use an already
+authorized workspace containing the Git metadata or stop for an operator-supported
+solution; changing workspace must preserve ownership through normal reconciliation.

@@ -64,7 +64,7 @@ test('checkpoint targets are bounded and sustained dispatch uses native backgrou
   for (const value of [{}, { objective: 'x', expectedEvidence: '' }, { objective: 'x', expectedEvidence: 'x', extra: 1 }]) {
     assert.throws(() => normalizeCheckpoint(value), /invalid checkpoint/);
   }
-  for (const operation of ['coordinate', 'implement', 'deploy']) assert.equal(backgroundDispatch({ operation }), true);
+  for (const operation of ['coordinate', 'implement', 'deploy', 'publish']) assert.equal(backgroundDispatch({ operation }), true);
   assert.equal(backgroundDispatch({ operation: 'inspect' }), false);
   assert.equal(backgroundDispatch({ operation: 'implement', background: false }), false);
   assert.equal(backgroundDispatch({ operation: 'inspect', background: true }), true);

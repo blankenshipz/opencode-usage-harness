@@ -4,6 +4,8 @@ import { checkpointSchema, normalizeCheckpoint, beginCheckpoint, acknowledgeTask
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
 import path from 'node:path';
 import { realpath } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import crypto from 'node:crypto';
 import { createRegistry, runtimeSessions, runtimeIntentSources, runtimeCompletionReceipt, lineage, descendant, overlaps } from './dispatch-registry.mjs';
 import { authorizeExternalWrites } from './external-write-grant.mjs';
@@ -50,8 +52,42 @@ export function hasCapability(agent, capability) {
   return eligibility.unrestricted || eligibility.scoped;
 }
 const hasUnrestrictedCapability = (agent, capability) => capabilityEligibility(agent, capability).unrestricted;
+const execFileAsync = promisify(execFile);
 const string = (value, name) => { if (typeof value !== 'string' || !value.trim() || value.length > 160 || /[\r\n\0]/.test(value)) throw new Error(`task-dispatch: valid ${name} is required`); return value; };
-const operations = ['inspect', 'verify', 'implement', 'deploy', 'coordinate'];
+const contained = (root, candidate) => candidate === root || candidate.startsWith(root + path.sep);
+const relativeLiteralDirectory = (workspace, value) => {
+  if (typeof value !== 'string' || !value.trim() || /[*?\r\n\0]/.test(value) || path.isAbsolute(value)) throw new Error('task-dispatch: publish requires publication.checkout as a literal workspace-relative directory');
+  const absolute=path.resolve(workspace,value), relative=path.relative(workspace,absolute);
+  if (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) throw new Error('task-dispatch: publish requires publication.checkout as a literal workspace-relative directory');
+  return { absolute, relative: relative || '.' };
+};
+const gitEnvironment = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+async function gitPath(cwd, argument) {
+  try {
+    const { stdout } = await execFileAsync('git',['rev-parse',argument],{cwd,env:gitEnvironment(),timeout:2000,maxBuffer:8192,windowsHide:true});
+    const value=stdout.trim();
+    if (!value || /[\r\n\0]/.test(value)) throw new Error('invalid');
+    return value;
+  } catch { throw new Error('task-dispatch: publish Git scope discovery is unavailable'); }
+}
+export async function resolvePublicationScope({ workspace, checkout }) {
+  const requested=relativeLiteralDirectory(workspace,checkout);
+  let realWorkspace, realCheckout;
+  try {
+    [realWorkspace,realCheckout]=await Promise.all([realpath(workspace),realpath(requested.absolute)]);
+    if (!contained(realWorkspace,realCheckout)) throw new Error('outside');
+  } catch { throw new Error('task-dispatch: publish Git scope is unavailable or outside the workspace'); }
+  const [root, commonOutput]=await Promise.all([gitPath(requested.absolute,'--show-toplevel'),gitPath(requested.absolute,'--git-common-dir')]);
+  try {
+    const [realRoot,realCommon]=await Promise.all([
+      realpath(root), realpath(path.isAbsolute(commonOutput) ? commonOutput : path.resolve(requested.absolute,commonOutput)),
+    ]);
+    if (!contained(realWorkspace,realCheckout) || !contained(realWorkspace,realRoot) || !contained(realWorkspace,realCommon) || realRoot !== realCheckout)
+      throw new Error('outside');
+    return { checkout:path.relative(realWorkspace,realCheckout) || '.', commonGit:path.relative(realWorkspace,realCommon) || '.' };
+  } catch { throw new Error('task-dispatch: publish Git scope is unavailable or outside the workspace'); }
+}
+const operations = ['inspect', 'verify', 'implement', 'deploy', 'publish', 'coordinate'];
 const routingKeys = new Set(['complexity','risk','taskType','reviewOf','reviewOfChildID','reviewIndependence']);
 const capabilityMismatch = (agent, missing) => Object.assign(
   new Error(`task-dispatch: TASK_DISPATCH_CAPABILITY_MISMATCH: ${agent} cannot perform ${missing.join(', ')}; assignment validation failure; not native permission denial. No child was launched and no native execution, permission, or provider admission was attempted for this dispatch. Correct a new, unadmitted assignment by selecting an eligible role within the authorized scope; preserve any explicitly requested model. This does not clear previous denials; do not drop required capabilities, loosen permissions, or replace/resume an existing child under another role.`),
@@ -74,6 +110,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   agent: { type: 'string', minLength: 1 }, description: { type: 'string', minLength: 1 }, prompt: { type: 'string', minLength: 1 },
   requiredCapabilities: { type: 'array', uniqueItems: true, items: { type: 'string', enum: ['shell','edit','delegate'] } },
   writePaths: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1 } },
+  publication: { type: 'object', additionalProperties: false, properties: { revision: { type: 'string', minLength: 40, maxLength: 64 }, checkout: { type: 'string', minLength: 1, maxLength: 500 } }, required: ['revision','checkout'] },
   sessionID: { type: 'string', minLength: 1 }, model: { type: 'string' }, background: { type: 'boolean' }, refreshIntent: { type: 'boolean' }, externalWriteGrantID: { type: 'string', minLength: 1, maxLength: 160 },
   checkpoint: checkpointSchema,
   compact: {type:'boolean'}, resetModel: {type:'boolean'}, continuationEffort:{type:'string',enum:['reassess']},
@@ -93,7 +130,7 @@ const nativeSubagentSchema = { type:'object', additionalProperties:false, proper
   agent:{type:'string',minLength:1}, description:{type:'string',minLength:1}, prompt:{type:'string',minLength:1},
   model:{type:'string',minLength:1,description:'Set only when the user explicitly requests a model or variant. Discover its exact provider/model#variant ID.'}, sessionID:{type:'string',minLength:1}, background:{type:'boolean'},
 }, required:['agent','description','prompt'] };
-const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. A new implement assignment with omitted writePaths owns the workspace; an explicit same-child continuation with omitted writePaths retains its admitted paths. Deploy requires exclusive workspace ownership.';
+const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status after a failure. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. A new implement assignment with omitted writePaths owns the workspace; an explicit same-child continuation with omitted writePaths retains its admitted paths. Deploy requires exclusive workspace ownership. Publish requires explicit scoped paths and an exact frozen revision.';
 const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
 // A corrected outcome may need a new assignment, but it may never silently
 // widen or replace an already admitted child's ownership.  This is deliberately
@@ -218,7 +255,7 @@ export function taskWorkStatus(state,rootID,taskId) {
   const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
-export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, grantPath, configRoot } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -242,6 +279,19 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
   };
   const paths = (input, agent) => {
     if (input.operation === 'deploy') return { local:['.'], external:[] };
+    if (input.operation === 'publish') {
+      const local=[];
+      for (const p of input.writePaths) {
+        if (typeof p !== 'string' || !p.trim() || /[*?\r\n\0]/.test(p)) throw new Error('task-dispatch: writePaths must be non-empty literal paths or directories');
+        const resolved = path.resolve(workspace, p);
+        const relative = path.relative(workspace, resolved);
+        if (path.isAbsolute(p) && (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)))
+          throw new Error('task-dispatch: publish writePaths must be workspace-relative; no external grant is available');
+        if (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) throw new Error('task-dispatch: writePaths must be workspace-relative or explicitly granted absolute paths');
+        local.push(relative || '.');
+      }
+      return { local, external:[] };
+    }
     // Executable checks may mutate via shell even when the edit tool is denied.
     if (input.operation === 'verify' && !input.writePaths?.length) return { local:['.'], external:[] };
     if (input.operation !== 'implement' && input.operation !== 'verify' && !input.requiredCapabilities.includes('edit') && !hasUnrestrictedCapability(agent, 'edit')) return { local:[], external:[] };
@@ -310,6 +360,11 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
+      if (input.operation === 'publish') {
+        if (!Array.isArray(input.writePaths) || input.writePaths.length === 0) throw new Error('task-dispatch: publish requires explicit non-empty writePaths for every admission');
+        if (!input.publication || typeof input.publication !== 'object' || Array.isArray(input.publication) || Object.keys(input.publication).length !== 2 || typeof input.publication.revision !== 'string' || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(input.publication.revision)) throw new Error('task-dispatch: publish requires publication.revision as a full frozen commit OID');
+        relativeLiteralDirectory(workspace,input.publication.checkout);
+      } else if (input.publication !== undefined) throw new Error('task-dispatch: publication is only valid for publish');
       if (input.model !== undefined && !modelReference(input.model)) throw new Error('task-dispatch: invalid explicit model reference');
       if (input.resetModel !== undefined && typeof input.resetModel !== 'boolean') throw new Error('task-dispatch: invalid resetModel');
       if (input.continuationEffort !== undefined && input.continuationEffort !== 'reassess') throw new Error('task-dispatch: invalid continuationEffort');
@@ -318,7 +373,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       if (!agent || agent.disabled) throw new Error(`task-dispatch: role ${input.agent} is unavailable`);
       const required = new Set(input.requiredCapabilities);
       if (input.operation === 'implement') required.add('edit');
-      if (['deploy','verify'].includes(input.operation)) required.add('shell');
+      if (['deploy','verify','publish'].includes(input.operation)) required.add('shell');
       if (input.operation === 'coordinate') required.add('delegate');
       // Known executable requests cannot masquerade as file-only scouting.
       if (input.operation !== 'coordinate' && /\b(?:git history|commit history|git\s+(?:log|show|status|diff|rev-parse))\b/i.test(input.prompt)) required.add('shell');
@@ -352,8 +407,20 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         if (existing) throw new Error(existing.message);
         throw capabilityMismatch(input.agent, missing);
       }
+      const requestedCheckout = input.operation === 'publish' ? relativeLiteralDirectory(workspace,input.publication.checkout) : undefined;
+      let publicationScope;
+      if (input.operation === 'publish') {
+        try { publicationScope = await discoverPublicationScope({workspace,checkout:input.publication.checkout}); }
+        catch { throw new Error('task-dispatch: publish Git scope discovery is unavailable or outside the workspace'); }
+      }
+      if (publicationScope) {
+        try {
+          if (!publicationScope.checkout || !publicationScope.commonGit || relativeLiteralDirectory(workspace,publicationScope.checkout).relative !== requestedCheckout.relative) throw new Error('invalid');
+          relativeLiteralDirectory(workspace,publicationScope.commonGit);
+        } catch { throw new Error('task-dispatch: publish Git scope discovery is unavailable or outside the workspace'); }
+      } else if (input.operation === 'publish') throw new Error('task-dispatch: publish Git scope discovery is unavailable or outside the workspace');
       const requestedPaths = paths(input, agent);
-      let writes = requestedPaths.local;
+      let writes = publicationScope ? [...new Set([...requestedPaths.local,publicationScope.checkout,publicationScope.commonGit])] : requestedPaths.local;
       let externalWrites = requestedPaths.external;
       if (externalWrites.length && input.operation !== 'implement') throw new Error('task-dispatch: external write grants only permit implement assignments');
       if (externalWrites.length && !input.externalWriteGrantID) throw new Error('task-dispatch: external absolute writePaths require an operator external write grant before native dispatch');
@@ -421,7 +488,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           const owner = state.records.find(r => r.childID === requested);
           if (owner && owner.key !== key) throw new Error(`task-dispatch: child belongs to taskId ${owner.taskId}, workKey ${owner.workKey}; retain that ownership identity`);
           if (record?.childID && record.childID !== requested) throw new Error('task-dispatch: workKey already owns another child; resume that child');
-          if (!record && input.operation !== 'deploy' && writes.length && (input.writePaths === undefined || (Array.isArray(input.writePaths) && input.writePaths.length === 0)))
+          if (!record && !['deploy','publish'].includes(input.operation) && writes.length && (input.writePaths === undefined || (Array.isArray(input.writePaths) && input.writePaths.length === 0)))
             throw new Error('task-dispatch: a legacy continuation without a recorded write scope requires explicit non-empty writePaths before it can perform a write-capable operation');
           if (reconcileCompaction(record, child, now)) await save();
           // An owned continuation keeps its admitted local scope when it omits
@@ -436,7 +503,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           // effective edit capability, so an edit-capable inspect request is
           // treated as a writer when it would otherwise receive `.`.
           const requestedLocalWriter = writes.length > 0;
-          if (record && input.writePaths === undefined && input.operation !== 'deploy') {
+          if (record && input.writePaths === undefined && !['deploy','publish'].includes(input.operation)) {
             if (priorLocalWrites.length) writes = priorLocalWrites;
             // An external-only owner has no local scope to retain, but its
             // separately recorded grant is revalidated below for this exact
@@ -541,7 +608,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         // Assignment binding starts at admission so an accepted child can record checkpoints while
         // its native call is still running. Delivery acknowledgement is tracked separately below.
         const generation=(record.admissionGeneration ?? 0)+1;
-        Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now(),admissionGeneration:generation,
+        Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now(),admissionGeneration:generation,publication:input.operation === 'publish' ? { revision: input.publication.revision, checkout: publicationScope.checkout } : undefined,
           ...(externalGrant ? { externalWrites, externalGrant:{grantID:externalGrant.grantID,externalRoot:externalGrant.externalRoot} } : { externalWrites:[], externalGrant:undefined }) });
         beginCheckpoint(record, checkpoint, now());
         const canonicalWorkspace=await canonicalWriterPath(workspace);
@@ -595,7 +662,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           ? `${renderIntent(admission.intent,input.checkIds)}\n\nWorker assignment:\n${input.prompt}`
           : `${renderIntentReference(admission.intent,input.checkIds)}\n\nNext action:\n${input.prompt}`;
         const marker=`task-dispatch-generation-${crypto.randomUUID()}`;
-        const baseHandoff = `${handoff}\n\n${checkpointHandoff(checkpoint)}${admission.contextAdvice ? "\nHigh context: at the next completed boundary retain a concise checkpoint and ask the parent for same-session compact:true before further work." : ""}`;
+        const publicationHandoff = input.operation === 'publish' ? `\n\nPublication binding: publish only frozen commit ${input.publication.revision} from checkout ${publicationScope.checkout}, never HEAD. Use a non-force push, let repository hooks run, and preserve native permission prompts, denials, and history. This scope coordination does not authorize a command or any new workspace access.` : '';
+        const baseHandoff = `${handoff}${publicationHandoff}\n\n${checkpointHandoff(checkpoint)}${admission.contextAdvice ? "\nHigh context: at the next completed boundary retain a concise checkpoint and ask the parent for same-session compact:true before further work." : ""}`;
         const markedHandoff = `${baseHandoff}\n\nDispatch completion marker: ${marker}`;
         const boundedHandoff = admission.convergence ? `${markedHandoff}\n\nConvergence advisory: ${admission.convergence.advisory}` : markedHandoff;
         const promptHash=crypto.createHash('sha256').update(boundedHandoff).digest('hex');

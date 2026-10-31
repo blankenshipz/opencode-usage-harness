@@ -109,5 +109,5 @@ export function checkpointHandoff(checkpoint) {
 }
 export function backgroundDispatch(input) {
   // Inspect/summary calls remain short foreground work. Explicit overrides always win.
-  return input.background ?? ['coordinate', 'implement', 'deploy'].includes(input.operation);
+  return input.background ?? ['coordinate', 'implement', 'deploy', 'publish'].includes(input.operation);
 }

@@ -55,11 +55,11 @@ class InstructionBudgetTest(unittest.TestCase):
         routing = self.load()["routing"].lower()
         for phrase in (
             "executable acceptance command", "input/output contract",
-            "delivery/publication have separate owners/checks", "stale parked delivery",
-            "explicit current gate", "content-rights/review gates",
+            "separate feature and publication gates", "revive parked delivery",
+            "current intent and gate", "content-rights/review gates",
             "exact actor, action and resource", "never retry the denied action",
             "retain admitted writepaths", "nondeploy operation changes",
-            "implicit same-key continuations", "readonly-to-writer",
+            "implicit same-key continuations", "publication:{revision:<full oid>,checkout:<path>}", "publish requires explicit paths", "readonly-to-writer",
             "reject empty[]", "exact overlapping paths",
         ):
             self.assertIn(phrase, routing)
