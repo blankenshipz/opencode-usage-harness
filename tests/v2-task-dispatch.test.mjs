@@ -880,3 +880,21 @@ test('compaction cannot treat a stale assignment as delivery of current intent',
  await assert.rejects(h.call({...base,sessionID:child.id,intentRevision:2,compact:true,checkpoint:{objective:'Retain result',expectedEvidence:'receipt'}}),/deliver the current intent.*before compaction/);
  assert.equal(compactions,0);assert.equal(h.calls.length,1);
 });
+
+test('generation timing persists collection and continuation without status-side execution',async t=>{
+ let clock=100;
+ const h=await harness(t,undefined,undefined,{now:()=>clock,loadCompletionReceipt:async()=>({promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3,completedAt:200})});
+ const start=await h.call({...base,background:true});const id=start.metadata.sessionID;
+ h.sessions.find(s=>s.id===id).active=false;clock=250;
+ const collect={taskId:'release',workKey:'backend',sessionID:id,generation:1};
+ await h.call(collect,'task_dispatch_collect');
+ clock=350;await h.call(collect,'task_dispatch_collect');
+ let owner=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content).owners[0];
+ assert.equal(owner.timing.generations[0].completedAt,200);assert.equal(owner.timing.generations[0].collectedAt,250);assert.equal(owner.timing.generations[0].completionToCollectionMs,50);
+ let before;await h.registry('/project',async state=>{before=JSON.stringify(state);});
+ await h.call({taskId:'release',summary:true},'task_dispatch_status');
+ await h.registry('/project',async state=>assert.equal(JSON.stringify(state),before));assert.equal(h.calls.length,1);
+ clock=400;await h.call({...base,sessionID:id,background:true});
+ owner=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content).owners[0];
+ assert.equal(owner.timing.generations[0].continuationGeneration,2);assert.equal(owner.timing.generations[0].collectionToContinuationMs,150);
+});

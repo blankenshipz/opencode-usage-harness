@@ -54,11 +54,18 @@ function contextSummary(value) {
   return summary;
 }
 
+function timingSummary(value) {
+  if (!value || !Array.isArray(value.generations)) return undefined;
+  const fields = ['generation','childID','admittedAt','acceptedAt','completedAt','collectedAt','continuationAcceptedAt','continuationGeneration','completionToCollectionMs','collectionToContinuationMs','completionToContinuationMs'];
+  return {basis:value.basis, generations:value.generations.slice(-16).map(row => Object.fromEntries(fields.filter(key => row[key] !== undefined).map(key => [key,row[key]])))};
+}
+
 function ownerSummary(owner) {
   const summary = {};
   for (const key of ['taskId', 'workKey', 'childID', 'parentID', 'agent', 'operation', 'intentRevision', 'checkIds', 'admissionGeneration', 'compactionID', 'compactionOutcome', 'recordedState', 'effectiveState', 'nativeExecution', 'collection', 'writePaths', 'rebind', 'needsRebind', 'denial', 'continuationOwner', 'activeDescendants', 'inFlight']) {
     if (owner?.[key] !== undefined) summary[key] = owner[key];
   }
+  if (owner?.timing !== undefined) summary.timing = timingSummary(owner.timing);
   if (owner?.context !== undefined) summary.context = contextSummary(owner.context);
   if (typeof owner?.publication?.revision === 'string') summary.publication = { revision: owner.publication.revision, ...own(owner.publication, 'checkout') };
   if (owner?.routing !== undefined) summary.routing = routingSummary(owner.routing);

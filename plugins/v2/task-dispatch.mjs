@@ -16,6 +16,7 @@ import { createWorkerProgress } from './worker-progress.mjs';
 import { admissionDenial, denialAdvice, receipt, suppression } from './denial-recovery.mjs';
 import { quotaRecoveryReceipt, enqueueQuotaRecovery, deliverQuotaRecovery, pendingQuotaRecovery, quotaRecoverySyntheticInput } from './quota-recovery.mjs';
 import { guardNativeDispatch, isHarnessDispatchInput, isNativeAgent, canonicalHarnessRole } from './agent-mode.mjs';
+import { beginHandoffTiming, acceptHandoffTiming, collectHandoffTiming, handoffTimingStatus } from './handoff-timing.mjs';
 import { summarizeTaskDispatchStatus } from './task-dispatch-status-summary.mjs';
 // Ordinary workspace aliases remain supported; containment is checked after
 // resolving the nearest existing ancestor. External grants use stricter checks.
@@ -634,6 +635,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         const generation=(record.admissionGeneration ?? 0)+1;
         Object.assign(record,{ agent:input.agent,operation:input.operation,intentRevision:intent?.revision,checkIds:intent?input.checkIds:undefined,writePaths:writes,childID:requested,inFlight:token,ownerPid:process.pid,description:input.description,startedAt:Date.now(),state:'starting',updatedAt:Date.now(),admissionGeneration:generation,publication:input.operation === 'publish' ? { revision: input.publication.revision, checkout: publicationScope.checkout } : undefined,compactionSourceEvidence:input.compact?retainedCompactionEvidence:undefined,
           ...(externalGrant ? { externalWrites, externalGrant:{grantID:externalGrant.grantID,externalRoot:externalGrant.externalRoot} } : { externalWrites:[], externalGrant:undefined }) });
+        if (!input.compact) beginHandoffTiming(record,generation,now());
         beginCheckpoint(record, checkpoint, now());
         const canonicalWorkspace=await canonicalWriterPath(workspace);
         const localAbsolute=await Promise.all(writes.map(relative=>canonicalWriterPath(path.resolve(workspace,relative))));
@@ -653,7 +655,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
        }
       });
       if (admission.existing) return { content:`Existing child ${admission.existing} is still running or awaiting its admitted compaction outcome. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
-      const update = async patch => globalRegistry('all-writers',async(globalState,saveGlobal)=>registry(workspace,async(state,save)=> {
+      const update = async (patch, accepted = false) => globalRegistry('all-writers',async(globalState,saveGlobal)=>registry(workspace,async(state,save)=> {
         const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly');
         if(admission.writerLease) {
           const lease=globalState.leases?.find(item=>item.token===token);
@@ -669,7 +671,9 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           }
           await saveGlobal();
         }
-        Object.assign(r,patch,{updatedAt:Date.now()});await save();
+        Object.assign(r,patch,{updatedAt:Date.now()});
+        if (accepted) acceptHandoffTiming(r,admission.generation,r.childID,now());
+        await save();
       }));
       let observed = admission.childID;
       let compactionID;
@@ -708,7 +712,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           await update({childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null,...(admission.restoreBinding ?? {})});
           return {...result,content:`task-dispatch: native ${denied} recorded. ${denialAdvice(denied)}`,metadata:{...(result?.metadata??{}),denial:{category:denied}}};
         }
-        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null});
+        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null},true);
         return {...result, metadata:{...(result.metadata ?? {}),routing:admission.routing,...(admission.contextAdvice?{contextAdvice:admission.contextAdvice}:{}),...(admission.convergence?{convergence:admission.convergence}:{})}};
       } catch(error) {
         const denied = admissionDenial(error);
@@ -743,7 +747,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       if (!collectionEligibility({record,child,sessions,rootID,current,callerID:context.sessionID}).eligible) throw new Error('task-dispatch: generation is not at a collectable terminal boundary');
       const receipt=await loadCompletionReceipt({sessionID:input.sessionID,marker:binding.marker,promptHash:`${binding.promptHash},${binding.prefixedPromptHash}`});
       if (!receipt) throw new Error('task-dispatch: no exact terminal receipt exists for this background generation; idle alone is not completion');
-      record.state='completed';record.completionReceipt={generation:input.generation,marker:binding.marker,promptHash:binding.promptHash,...receipt};record.updatedAt=Date.now();await save();
+      record.state='completed';record.completionReceipt={generation:input.generation,marker:binding.marker,promptHash:binding.promptHash,...receipt};record.updatedAt=Date.now();collectHandoffTiming(record,record.completionReceipt,now());await save();
       return {content:JSON.stringify({sessionID:input.sessionID,generation:input.generation,status:'completed',receipt:record.completionReceipt})};
     })});
     editor.add({name:'task_intent',description:'Read or revise the shared user outcome for this root task. Get returns valid root user-message IDs. Only the root goal owner may set; use expectedRevision to avoid overwriting corrections. Never store secret values.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1,maxLength:128},action:{type:'string',enum:['get','set']},expectedRevision:{type:'integer',minimum:0},intent:intentSchema},required:['taskId','action']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
@@ -774,7 +778,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         }
         if (delivered) await save();
       } catch { /* status remains read-safe; the durable receipt stays pending for a later explicit retry */ }
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,key:undefined,recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,key:undefined,handoffTimings:undefined,timing:handoffTimingStatus(r),recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }

@@ -291,8 +291,10 @@ or assume smaller context always means lower subscription usage.
 Outcome measurements distinguish missing values from observed zero. Old records
 are not rewritten. Checkpoint and full-task completion remain separate, and all
 agent-submitted outcomes remain self-reported. Optional result `freshness` (`fresh`, `reused`, `unrun`, or legacy `unknown`) marks
-new evidence versus reused or unrun checks; reused evidence retains its source
-`sourceReceipt` reference and still has to satisfy current artifact identity and acceptance rules.
+new evidence versus reused or unrun checks. `sourceReceipt` is required exactly
+when `freshness` is `reused`; fresh, unrun, and unknown results must omit it.
+Reused evidence retains its source reference and still has to satisfy current
+artifact identity and acceptance rules.
 Unknown metrics must not become zero in downstream reports or success rates.
 
 
@@ -396,3 +398,31 @@ This design draws on Headroom's conservative deduplication and recoverable-origi
 approach; pinned source references and attribution are in [NOTICE](../NOTICE).
 We deliberately use exact repeats and existing durable files rather than its
 heuristic sampling, model proxy, automatic effort changes or expiring cache.
+
+
+## Passive handoff timing
+
+Full and summary `task_dispatch_status` expose each owner's `timing.generations`,
+bounded to the latest 16 execution admissions. Records survive restart in the
+existing private ownership registry and contain IDs and timestamps, not prompts
+or tool output. No automatic continuation, timer, notification or new gate is
+introduced. Compaction-only admissions do not count as execution continuations.
+
+- `admittedAt`: the harness accepted the validated execution assignment.
+- `acceptedAt`: native dispatch returned without an admission denial. This can
+  acknowledge queued work; it does not prove inference started. For synchronous
+  dispatch it is observed only on return, not at the actual execution start.
+- `completedAt`: the successful idle timestamp from the exact generation-bound
+  background receipt, populated when the parent explicitly collects it.
+- `collectedAt`: the first successful explicit collection; repeated collection
+  does not move this clock.
+- `continuationAcceptedAt` / `continuationGeneration`: the next accepted
+  execution generation on the same child; compaction alone does not set them.
+
+`completionToCollectionMs`, `collectionToContinuationMs` and
+`completionToContinuationMs` separate observed handoff intervals. Missing native
+clocks, legacy records and backwards clocks produce `null`, never an invented
+zero. The intervals include legitimate waiting for dependencies or decisions;
+they are not proof of a stall or an automatic retry instruction. Status only
+projects existing timing; it does not collect results or write timing records.
+Existing background receipts remain valid without the optional timestamp.

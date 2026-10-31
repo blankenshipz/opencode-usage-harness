@@ -134,6 +134,11 @@ class DispatchRuntimeTest(unittest.TestCase):
             c.execute("insert into session_v2 values ('child','succeeded')")
             c.executemany("insert into session_message values (?,?,?,?,?)", [("prompt","child","user",1,json.dumps({"text":text})), ("answer","child","assistant",2,json.dumps({"finish":"stop","time":{"completed":2},"content":[{"type":"text","text":"done"}]})), ("idle","child","idle",3,json.dumps({"outcome":"succeeded"}))])
         self.assertEqual(completion_receipt("child",marker,digest,db_path=db), {"promptID":"prompt","assistantID":"answer","assistantSeq":2,"idleID":"idle","idleSeq":3})
+        for clock in (True, -1, float('inf'), "300", None):
+            with sqlite3.connect(db) as c: c.execute("update session_message set data=? where id='idle'", (json.dumps({"outcome":"succeeded", "time":{"created":clock}}),))
+            self.assertNotIn("completedAt", completion_receipt("child",marker,digest,db_path=db))
+        with sqlite3.connect(db) as c: c.execute("update session_message set data=? where id='idle'", (json.dumps({"outcome":"succeeded", "time":{"created":300}}),))
+        self.assertEqual(completion_receipt("child",marker,digest,db_path=db)["completedAt"], 300)
         with sqlite3.connect(db) as c: c.execute("insert into session_message values (?,?,?,?,?)", ("later","child","user",4,json.dumps({"text":"later"})))
         self.assertIsNone(completion_receipt("child",marker,digest,db_path=db))
 

@@ -202,10 +202,16 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
                 elif finish not in ("tool-calls", "tool_calls", None):
                     return None
             elif kind == "idle" and assistant is not None:
-                try: outcome = json.loads(data).get("outcome")
+                try:
+                    idle = json.loads(data)
+                    outcome = idle.get("outcome")
                 except (TypeError, json.JSONDecodeError): return None
                 if outcome != "succeeded": return None
                 receipt = {"promptID": prompt_id, "assistantID": assistant[0], "assistantSeq": assistant[1], "idleID": str(ident), "idleSeq": int(seq)}
+                timing = idle.get("time")
+                completed_at = timing.get("created") if isinstance(timing, dict) else None
+                if isinstance(completed_at, int) and not isinstance(completed_at, bool) and 0 < completed_at <= 9007199254740991:
+                    receipt["completedAt"] = completed_at
         return receipt
 
 

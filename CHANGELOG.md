@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased — receipt guidance and handoff timing
+
+- Explain both receipt/freshness mismatch directions with indexed corrective diagnostics and tool field guidance; acceptance rules are unchanged.
+- Record bounded, generation-bound completion, collection and continuation timings without automatic execution or new approval gates; unavailable history stays unknown.
+
 ## Unreleased — measured context and bounded search
 
 - Preserve completed context usage across streaming messages and invalidate pre-compaction observations; unknown is no longer zero.
