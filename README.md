@@ -72,7 +72,7 @@ The generated profile in [configure.py](configure.py) maps roles as follows:
 | `harness-deep-debugger` | STRONG | Ambiguous failures and difficult debugging. |
 | `harness-architect` | STRONG | Design and consequential analysis; no shell or edits. |
 | `harness-reviewer` | STRONG | Correctness, regression and risk review; no shell or edits. |
-| `harness-verifier` | STRONG | Execute assigned checks and report results; no direct edit tool or delegation. Shell can write, so ownership and command approvals still apply. |
+| `harness-verifier` | STRONG | Execute assigned checks and report results; direct edits are limited to `.artifacts/*` and nested artifact directories, with secret exclusions. No delegation. Native path permissions, write ownership and command approvals still apply. |
 | `harness-maximum` | MAXIMUM | Exceptional problems where the expected quality improvement justifies the capacity. |
 
 Only the router and coordinator delegate; other roles are terminal workers.

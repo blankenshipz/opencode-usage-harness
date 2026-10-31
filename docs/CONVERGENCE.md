@@ -174,3 +174,10 @@ The parent must observe the matching compaction ID and continue the same child w
 authorized. Status inspection never starts work. A future notification outbox would
 need exact parent/generation binding, restart-safe deduplication and explicit
 non-resuming delivery; automatic worker wake-ups are not implemented.
+
+Capability discovery is distinct from permission admission. A verifier can have
+artifact-only edit capability while retaining a blanket production-file deny.
+The dispatcher must recognize that scoped capability; the native executor still
+checks each actual path and secret restriction. A missing capability on an existing
+assignment must identify that capability, not falsely report a changed child identity.
+Preserve the existing child, role and real denial history during correction.

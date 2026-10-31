@@ -686,6 +686,32 @@ test('verify requires shell, preserves explicit model and reserves writes despit
  assert.equal(result.content,'OK');assert.equal(h.calls[0].model,'anthropic/fixture-opus#high');
  await h.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['.']));
 });
+test('scoped edit eligibility supports verifier artifact continuations without granting workspace access',async t=>{
+ const scopedPermissions=[{action:'shell',resource:'*',effect:'allow'},{action:'edit',resource:'*',effect:'deny'},{action:'edit',resource:'artifacts/*',effect:'allow'},{action:'subagent',resource:'*',effect:'deny'}];
+ assert.equal(hasCapability({permissions:scopedPermissions},'edit'),true);
+ assert.equal(scopedPermissions.some(rule=>rule.action==='edit'&&rule.resource==='*'&&rule.effect==='allow'),false);
+ const h=await harness(t);const list=h.ctx.agent.list;
+ h.ctx.agent.list=async()=>({data:[...(await list()).data,{id:'harness-verifier',model:'openai/fixture-strong#high',permissions:scopedPermissions},{id:'harness-scoped-inspector',permissions:scopedPermissions},{id:'harness-readonly',permissions:[{action:'shell',resource:'*',effect:'allow'},{action:'edit',resource:'*',effect:'deny'}]}]});
+ const verifier={...base,agent:'harness-verifier',operation:'verify',requiredCapabilities:['shell','edit'],prompt:'Verify artifact',writePaths:['artifacts/report.json'],background:true};
+ const first=await h.call(verifier);const sessionID=first.metadata.sessionID;
+ await h.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['artifacts/report.json']));
+ await h.call({action:'set',taskId:'release',expectedRevision:1,intent:{...intent,target:'Rebound artifact',sourceMessageIDs:['msg_correction']}},'task_intent');
+ h.sessions.find(session=>session.id===sessionID).active=false;
+ await h.call({...verifier,intentRevision:2,sessionID,writePaths:undefined});
+ await h.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['artifacts/report.json']));
+ await h.call({...verifier,intentRevision:2,workKey:'artifact-next',writePaths:['artifacts/next.json']});
+ await h.call({...base,intentRevision:2,workKey:'scoped-inspect',operation:'inspect',agent:'harness-scoped-inspector',requiredCapabilities:[],description:'Inspect artifact',prompt:'Inspect artifact',writePaths:undefined});
+ await h.registry('/project',async state=>assert.deepEqual(state.records.find(record=>record.workKey==='scoped-inspect').writePaths,[]));
+ const currentList=h.ctx.agent.list;
+ h.ctx.agent.list=async()=>({data:(await currentList()).data.map(agent=>agent.id==='harness-verifier'?{...agent,permissions:[{action:'shell',resource:'*',effect:'allow'},{action:'edit',resource:'*',effect:'deny'}]}:agent)});
+ await assert.rejects(h.call({...verifier,intentRevision:2,sessionID,writePaths:undefined}),error=>{
+  assert.match(error.message,/existing same-identity assignment/);assert.match(error.message,/missing required capability: edit/);return true;
+ });
+ await assert.rejects(h.call({...base,workKey:'readonly-artifact',agent:'harness-readonly',operation:'verify',requiredCapabilities:['shell','edit'],prompt:'Verify without edit access',writePaths:['artifacts/readonly.json']}),error=>{
+  assert.equal(error.code,'TASK_DISPATCH_CAPABILITY_MISMATCH');assert.match(error.message,/cannot perform edit/);return true;
+ });
+ assert.equal(h.calls.some(call=>call.agent==='harness-readonly'),false);
+});
 test('enabled routing policy requires assessment for new work but preserves admitted continuation',async t=>{
  const policy={version:1,enabled:true,roles:{}};
  const h=await harness(t,undefined,undefined,{loadRoutingPolicy:()=>policy,loadQuota:async()=>({})});

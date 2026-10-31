@@ -24,8 +24,7 @@ async function canonicalWriterPath(value) {
     catch(error){if(error.code!=='ENOENT')throw error;const parent=path.dirname(current);if(parent===current)throw error;missing.unshift(path.basename(current));current=parent;}
   }
 }
-// Eligibility is not a permission grant: the native executor still owns authorization and depth.
-export function hasCapability(agent, capability) {
+function capabilityEligibility(agent, capability) {
   const rules = agent.permissions ?? [], action = capability === 'delegate' ? 'subagent' : capability;
   const match = (pattern, value) => new RegExp(`^${pattern.split('*').map(p => p.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`).test(value);
   const effect = resource => {
@@ -33,8 +32,24 @@ export function hasCapability(agent, capability) {
     for (const rule of rules) if (match(rule.action, action) && match(rule.resource, resource)) result = rule.effect;
     return result;
   };
-  return capability === 'delegate' ? rules.some(r => r.action === action && r.resource !== '*' && effect(r.resource) !== 'deny') || effect('*') !== 'deny' : effect('*') !== 'deny';
+  return {
+    unrestricted: effect('*') !== 'deny',
+    scoped: rules.some(rule => match(rule.action, action) && rule.resource !== '*' && effect(rule.resource) !== 'deny'),
+  };
 }
+// Eligibility is not a permission grant: it only establishes that a role has
+// some non-denied capability. Scoped rules are useful for continuing work that
+// already owns that scope, but the native executor still authorizes each exact
+// resource (and this check never turns a scoped rule into workspace access).
+export function hasCapability(agent, capability) {
+  const eligibility = capabilityEligibility(agent, capability);
+  // This mirrors the existing delegate eligibility rule for every capability:
+  // an explicitly scoped, non-denied rule is potential capability even when a
+  // catch-all deny prevents unrestricted access. Exact native authorization is
+  // intentionally left to the executor rather than reimplemented here.
+  return eligibility.unrestricted || eligibility.scoped;
+}
+const hasUnrestrictedCapability = (agent, capability) => capabilityEligibility(agent, capability).unrestricted;
 const string = (value, name) => { if (typeof value !== 'string' || !value.trim() || value.length > 160 || /[\r\n\0]/.test(value)) throw new Error(`task-dispatch: valid ${name} is required`); return value; };
 const operations = ['inspect', 'verify', 'implement', 'deploy', 'coordinate'];
 const routingKeys = new Set(['complexity','risk','taskType','reviewOf','reviewOfChildID','reviewIndependence']);
@@ -229,7 +244,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     if (input.operation === 'deploy') return { local:['.'], external:[] };
     // Executable checks may mutate via shell even when the edit tool is denied.
     if (input.operation === 'verify' && !input.writePaths?.length) return { local:['.'], external:[] };
-    if (input.operation !== 'implement' && input.operation !== 'verify' && !input.requiredCapabilities.includes('edit') && !hasCapability(agent, 'edit')) return { local:[], external:[] };
+    if (input.operation !== 'implement' && input.operation !== 'verify' && !input.requiredCapabilities.includes('edit') && !hasUnrestrictedCapability(agent, 'edit')) return { local:[], external:[] };
     const local=[], external=[];
     for (const p of (input.writePaths?.length ? input.writePaths : ['.'])) {
       if (typeof p !== 'string' || /[*?\0]/.test(p)) throw new Error('task-dispatch: writePaths must be literal paths or directories');
@@ -332,7 +347,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           if (record?.denial)
             return { message:`task-dispatch: admission remains denied (${record.denial.category}). ${denialAdvice(record.denial.category)} Inspect task_dispatch_status for the receipt.` };
           if (record || owner || child)
-            return { message:`task-dispatch: existing assignment ${input.taskId}/${input.workKey} already has recorded ownership; preserve its child and role identity.` };
+            return { message:`task-dispatch: existing same-identity assignment ${input.taskId}/${input.workKey} is missing required capability: ${missing.join(', ')}; preserve its child and role identity. This eligibility check does not change native permission authorization.` };
         });
         if (existing) throw new Error(existing.message);
         throw capabilityMismatch(input.agent, missing);

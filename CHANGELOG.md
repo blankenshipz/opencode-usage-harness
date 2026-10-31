@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — scoped verifier capabilities
+
+- Recognize scoped edit capability, including verifier artifacts, without changing native path permissions.
+- Report missing capabilities accurately for existing assignments instead of a misleading worker-identity error.
+
+
 ## Unreleased — truthful handoff and publication guidance
 
 - Remove an accidental blanket “never push” instruction: authorized publication proceeds after required gates.
