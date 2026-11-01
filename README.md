@@ -46,7 +46,10 @@ every task. The full workflow requires the compatible agent integration; install
 the standalone tools does not activate it automatically.
 
 Passive worker status exposes bounded native tool names, timings and exit/timeout
-metadata, plus visible-text age. It distinguishes active execution, current
+metadata, plus visible-text age when observed. Activity reuses the existing lazy
+scan through the latest valid context observation; it does not eagerly load old
+payloads across every archived chat. Older activity outside that window is unknown.
+It distinguishes active execution, current
 self-reported dependencies, an idle worker awaiting result inspection, and a
 collected result awaiting its parent's decision. Dependency reports expire on intent/admission changes, but their source execution
 generation is unproven and delayed reports may arrive. They never determine the

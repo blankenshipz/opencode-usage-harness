@@ -283,14 +283,13 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
                 query += " AND seq>?"
                 params.append(boundary[0])
             query += " ORDER BY seq DESC LIMIT 64"
-            assistant_rows = list(connection.execute(query, params))
-            activity, last_response, last_visible = _native_activity(assistant_rows)
-            if last_response is not None:
-                activity["lastModelResponseAt"] = last_response
-            item["activity"] = activity
-            if last_visible is not None:
-                item["lastVisibleTextAt"] = last_visible
-            for assistant_id, assistant_data in assistant_rows:
+            # Keep the existing lazy context scan: fetching/decoding 64 full
+            # message payloads for every historical session exceeds the runtime
+            # reader deadline on large installations. Activity uses only rows
+            # already needed to reach the latest valid context observation.
+            assistant_rows = []
+            for assistant_id, assistant_data in connection.execute(query, params):
+                assistant_rows.append((assistant_id, assistant_data))
                 observation = _completed_context_observation(assistant_data, assistant_id)
                 if observation is not None:
                     completed, context_tokens, context_model = observation
@@ -300,6 +299,13 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
                     if context_model is not None:
                         item["contextModel"] = context_model
                     break
+            activity, last_response, last_visible = _native_activity(assistant_rows)
+            activity["scope"] = "latest_assistant_through_latest_valid_context"
+            if last_response is not None:
+                activity["lastModelResponseAt"] = last_response
+            item["activity"] = activity
+            if last_visible is not None:
+                item["lastVisibleTextAt"] = last_visible
             rows.append(item)
         return rows
 

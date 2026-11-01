@@ -27,6 +27,24 @@ class DispatchRuntimeTest(unittest.TestCase):
             )
         return db
 
+    def test_activity_does_not_eagerly_decode_historical_payloads_after_context(self):
+        db = self.fixture()
+        latest = {"time": {"created": 90, "completed": 100}, "tokens": {"input": 20, "output": 5}, "content": [{"type": "text", "text": "latest"}]}
+        with sqlite3.connect(db) as connection:
+            connection.execute("insert into session_message values ('msg_old', 'root', 'assistant', 3, ?)", (json.dumps({"content": [{"type": "text", "text": "old" * 100000}]}),))
+            connection.execute("insert into session_message values ('msg_latest', 'root', 'assistant', 4, ?)", (json.dumps(latest),))
+        from src import dispatch_runtime
+        visited = []
+        original = dispatch_runtime._native_activity
+        def observe(rows):
+            visited.extend(message_id for message_id, _ in rows)
+            return original(rows)
+        with patch.object(dispatch_runtime, "_native_activity", side_effect=observe):
+            result = sessions(db_path=db)[0]
+        self.assertEqual(visited, ["msg_latest"])
+        self.assertEqual(result["activity"]["scope"], "latest_assistant_through_latest_valid_context")
+        self.assertEqual(result["lastVisibleTextAt"], 100)
+
     def test_explicit_database_and_source_ids_only(self):
         db = self.fixture()
         self.assertEqual(intent_sources("root", db_path=db), ["source"])
