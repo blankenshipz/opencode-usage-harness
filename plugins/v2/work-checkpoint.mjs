@@ -23,6 +23,41 @@ export const TASK_REVIEW_CONTINUATIONS = 6;
 export const HIGH_CONTEXT_RATIO = 0.8;
 export const HIGH_CONTEXT_TOKENS = 120000;
 
+const positiveLimit = value => Number.isSafeInteger(value) && value > 0;
+const modelIdentity = value => value && ['providerID','id'].every(key=>typeof value[key]==='string' && /^[\w.-]{1,160}$/.test(value[key]))
+  && (value.variant===undefined || typeof value.variant==='string' && /^[\w.-]{1,80}$/.test(value.variant))
+  ? {providerID:value.providerID,id:value.id,...(value.variant && value.variant!=='default'?{variant:value.variant}:{})} : undefined;
+
+// Input usage belongs to a completed message, not the mutable UI selection.
+// Never infer a capacity from a model name, another provider or a stale route.
+function observedCapacity(native, catalog) {
+  const model=modelIdentity(native?.contextModel), current=modelIdentity(native?.model);
+  const fallback=reason=>({capacityBasis:'legacy_token_fallback',capacityUnknownReason:reason});
+  if (!model) return fallback('observed_model_unknown');
+  if (!current || JSON.stringify(current)!==JSON.stringify(model)) return fallback('selected_model_changed_or_unknown');
+  if (!Array.isArray(catalog)) return fallback('catalog_unavailable');
+  const matches=catalog.filter(item=>item?.providerID===model.providerID && item?.id===model.id);
+  if (matches.length!==1) return fallback('model_missing_or_ambiguous');
+  const entry=matches[0];let limits=entry.limit;
+  if (model.variant) {
+    const variants=Array.isArray(entry.variants)?entry.variants.filter(item=>item?.id===model.variant):[];
+    if (variants.length!==1) return fallback('variant_missing_or_ambiguous');
+    if (variants[0].limit!==undefined) {
+      if (!variants[0].limit || typeof variants[0].limit!=='object' || Array.isArray(variants[0].limit)) return fallback('limits_unavailable');
+      limits={...limits,...variants[0].limit};
+    }
+  }
+  if (!limits || typeof limits!=='object' || Array.isArray(limits)
+    || ['context','input','output'].some(key=>limits[key]!==undefined && !positiveLimit(limits[key]))) return fallback('limits_unavailable');
+  if (positiveLimit(limits.context) && positiveLimit(limits.output) && limits.context<=limits.output) return fallback('limits_unavailable');
+  const budgets=[];
+  if (positiveLimit(limits.input)) budgets.push(limits.input);
+  if (positiveLimit(limits.context) && positiveLimit(limits.output) && limits.context>limits.output) budgets.push(limits.context-limits.output);
+  else if (positiveLimit(limits.context) && positiveLimit(limits.input)) budgets.push(limits.context);
+  if (!budgets.length) return fallback('limits_unavailable');
+  return {limit:Math.min(...budgets),capacityBasis:'catalog_input_budget',model};
+}
+
 const boundedCount = value => Number.isFinite(value) ? Math.min(Math.max(0, Math.floor(value)), 1000000) : 0;
 const sameReviewBaseline = accounting => ({ preparedSteps: accounting.preparedSteps, continuations: accounting.continuations });
 
@@ -59,18 +94,21 @@ function contextAdvisory(knownContext) {
 
 // An observation describes a completed model input, not an in-flight placeholder.
 // Unknown usage stays unknown; metadata is allowlisted so status never exports prompts.
-export function observedContext(native) {
+export function observedContext(native, catalog) {
   const tokens = native?.contextTokens;
   if (!Number.isFinite(tokens) || tokens < 0) return { status: 'unknown' };
-  const observation = { status: 'known', tokens, basis: 'last_completed_model_input', pressure: contextAdvisory({ tokens }) ? 'high' : 'normal' };
+  const capacity=observedCapacity(native,catalog);
+  const observation = { status: 'known', tokens, basis: 'last_completed_model_input', ...capacity,
+    ...(capacity.limit ? {ratio:tokens/capacity.limit} : {}),
+    pressure: contextAdvisory({ tokens,limit:capacity.limit }) ? 'high' : 'normal' };
   if (Number.isFinite(native.contextObservedAt) && native.contextObservedAt > 0) observation.observedAt = native.contextObservedAt;
   if (typeof native.contextMessageID === 'string' && native.contextMessageID.length <= 160) observation.messageID = native.contextMessageID;
   return observation;
 }
 
 // Advice only. A status read never compacts, resumes, collects or releases a lease.
-export function contextMaintenance(record, native, { callerID, activeDescendants = [], compactionAvailable = false, needsRebind = false } = {}) {
-  const observation = observedContext(native);
+export function contextMaintenance(record, native, { callerID, activeDescendants = [], compactionAvailable = false, needsRebind = false, catalog } = {}) {
+  const observation = observedContext(native,catalog);
   const pressure = contextAdvisory(observation);
   if (!pressure) return { ...observation, pressure: observation.status === 'known' ? 'normal' : 'unknown' };
   let blockedReason;

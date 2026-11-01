@@ -41,8 +41,23 @@ def intent_sources(session_id: str, *, db_path: str | Path | None = None) -> lis
         return sources
 
 
-def _completed_context_observation(raw: str, message_id: object) -> tuple[object, object] | None:
-    """Return (completed time, context token count) for a usable assistant."""
+def _context_model(item: dict[str, object]) -> dict[str, str] | None:
+    """Return the allowlisted model identity for a completed assistant."""
+    model = item.get("model")
+    if not isinstance(model, dict):
+        return None
+    if any(not isinstance(model.get(key), str) or not model[key] for key in ("providerID", "id")):
+        return None
+    if "variant" in model and (not isinstance(model["variant"], str) or not model["variant"]):
+        return None
+    result = {key: model[key] for key in ("providerID", "id")}
+    if isinstance(model.get("variant"), str) and model["variant"]:
+        result["variant"] = model["variant"]
+    return result
+
+
+def _completed_context_observation(raw: str, message_id: object) -> tuple[object, object, dict[str, str] | None] | None:
+    """Return (completed time, context token count, model) for a usable assistant."""
     try:
         item = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
@@ -98,7 +113,7 @@ def _completed_context_observation(raw: str, message_id: object) -> tuple[object
                     break
     if not present:
         return None
-    return completed, sum(values)
+    return completed, sum(values), _context_model(item)
 
 
 def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
@@ -161,10 +176,12 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
             for assistant_id, assistant_data in connection.execute(query, params):
                 observation = _completed_context_observation(assistant_data, assistant_id)
                 if observation is not None:
-                    completed, context_tokens = observation
+                    completed, context_tokens, context_model = observation
                     item["contextTokens"] = context_tokens
                     item["contextObservedAt"] = completed
                     item["contextMessageID"] = assistant_id
+                    if context_model is not None:
+                        item["contextModel"] = context_model
                     break
             rows.append(item)
         return rows

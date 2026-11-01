@@ -1037,3 +1037,16 @@ test('a later admitted generation cannot be settled by an older compaction wait'
  const result=await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'Continue integration',expectedEvidence:'retained-check'}});
  assert.equal(result.metadata.status,'compacting');await h.registry('/project',async state=>{assert.equal(state.records[0].state,'starting');assert.equal(state.records[0].compactionOutcome,undefined);});assert.equal(h.calls.length,1);
 });
+
+test('model-aware status and dispatch handoff share the exact catalog budget without triggering compaction',async t=>{
+ const h=await harness(t);await h.call({...base,background:false});const child=h.sessions.find(s=>s.parentID==='root');
+ const model={providerID:'anthropic',id:'fixture-roomy',variant:'medium'};Object.assign(child,{model,contextModel:model,contextTokens:142000,lastAssistantID:'last-model-input'});
+ h.ctx.model={list:async()=>({data:[{providerID:model.providerID,id:model.id,limit:{context:1000000,output:128000},variants:[{id:'medium'}]}]})};
+ let before;await h.registry('/project',async state=>before=JSON.stringify(state));
+ const status=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].context.pressure,'normal');assert.equal(status.owners[0].context.limit,872000);assert.equal(status.owners[0].context.capacityBasis,'catalog_input_budget');assert.equal(status.owners[0].context.recommended,undefined);assert.equal(h.calls.length,1);
+ await h.registry('/project',async state=>assert.equal(JSON.stringify(state),before));
+ const next=await h.call({...base,sessionID:child.id,background:false});assert.equal(next.metadata.contextAdvice,undefined);assert.doesNotMatch(h.calls.at(-1).prompt,/High context:/);
+ child.contextTokens=750000;
+ const high=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);assert.equal(high.owners[0].context.pressure,'high');assert.equal(high.owners[0].context.eligibleForCompaction,false);assert.equal(high.owners[0].context.blockedReason,'native_compaction_unavailable');assert.equal(h.calls.length,2);
+});

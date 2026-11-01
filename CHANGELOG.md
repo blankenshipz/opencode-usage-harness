@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — model-aware compaction advice
+
+- Derive advisory context pressure from the actual model/variant input budget, reserving maximum output space, instead of treating every model as high pressure at 120,000 tokens.
+- Bind usage to the exact completed assistant's model and retain conservative fallback advice when model selection, catalog or limits cannot be verified. Expose budget, ratio and evidence in status and use the same calculation for worker handoffs.
+- Preserve native automatic compaction, checkpoint ownership, permission and financial safeguards. No inference experiments or assumed quota savings.
+
 ## Unreleased — compaction handoff wait
 
 - Keep the requesting parent's dispatch call open through a bounded native idle wait after same-child compaction. Return the exact generation/compaction outcome so normal continuation can proceed without a separate idle handoff.

@@ -48,7 +48,7 @@ function routingSummary(value) {
 function contextSummary(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const summary = {};
-  for (const key of ['status', 'tokens', 'basis', 'observedAt', 'messageID', 'pressure', 'recommended', 'when', 'action', 'eligibleForCompaction', 'blockedReason', 'parentID', 'childID', 'advice']) {
+  for (const key of ['status', 'tokens', 'basis', 'observedAt', 'messageID', 'pressure', 'limit', 'ratio', 'model', 'capacityBasis', 'capacityUnknownReason', 'recommended', 'when', 'action', 'eligibleForCompaction', 'blockedReason', 'parentID', 'childID', 'advice']) {
     if (value[key] !== undefined) summary[key] = value[key];
   }
   return summary;

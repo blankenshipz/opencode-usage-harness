@@ -68,6 +68,41 @@ class DispatchRuntimeTest(unittest.TestCase):
         self.assertEqual(result["contextObservedAt"], 30)
         self.assertEqual(result["contextMessageID"], "completed")
 
+    def test_context_model_comes_from_the_completed_observation(self):
+        db = self.fixture()
+        with sqlite3.connect(db) as connection:
+            connection.execute("alter table session_v2 add column model text")
+            connection.execute("update session_v2 set model=?", (json.dumps({"providerID": "demo", "id": "current"}),))
+            connection.executemany(
+                "insert into session_message values (?, 'root', 'assistant', ?, ?)",
+                [
+                    ("old", 3, json.dumps({"time": {"completed": 30}, "tokens": {"input": 4}, "model": {"providerID": "demo", "id": "observed", "variant": "medium", "secret": "drop"}})),
+                    ("new", 4, json.dumps({"tokens": {"input": 99}, "model": {"providerID": "demo", "id": "inflight"}})),
+                ],
+            )
+        result = sessions(db_path=db)[0]
+        self.assertEqual(result["contextTokens"], 4)
+        self.assertEqual(result["contextMessageID"], "old")
+        self.assertEqual(result["contextModel"], {"providerID": "demo", "id": "observed", "variant": "medium"})
+
+    def test_context_model_malformed_does_not_change_context_observation(self):
+        db = self.fixture()
+        with sqlite3.connect(db) as connection:
+            connection.executemany(
+                "insert into session_message values (?, 'root', 'assistant', ?, ?)",
+                [
+                    ("bad-model", 3, json.dumps({"time": {"completed": 30}, "tokens": {"input": 4}, "model": {"providerID": "demo", "id": 42}})),
+                ],
+            )
+        result = sessions(db_path=db)[0]
+        self.assertEqual(result["contextTokens"], 4)
+        self.assertEqual(result["contextMessageID"], "bad-model")
+        self.assertNotIn("contextModel", result)
+        for variant in (42, None, ""):
+            with self.subTest(variant=variant), sqlite3.connect(db) as connection:
+                connection.execute("update session_message set data=? where id='bad-model'", (json.dumps({"time": {"completed": 30}, "tokens": {"input": 4}, "model": {"providerID": "demo", "id": "observed", "variant": variant}}),))
+            self.assertNotIn("contextModel", sessions(db_path=db)[0])
+
     def test_context_usage_omits_unknown_invalid_and_precompaction_observations(self):
         db = self.fixture()
         with sqlite3.connect(db) as connection:

@@ -1,5 +1,6 @@
 import { readRoutingQuota, readRoutingPolicy, selectDispatchModel, modelReference, TASK_TYPES } from './dispatch-routing.mjs';
 import { waitForCompactionIdle } from './compaction-wait.mjs';
+
 import { observeAdmission, convergenceAdvice, userActions, recordProgress, normalizeProgressEvidence } from './convergence.mjs';
 import { checkpointSchema, normalizeCheckpoint, observedContext, contextMaintenance, beginCheckpoint, acknowledgeTaskReview, normalizeReviewAcknowledgement, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
@@ -22,6 +23,10 @@ import { summarizeTaskDispatchStatus } from './task-dispatch-status-summary.mjs'
 import { integrationAssignmentTemplate } from './integration-assignment.mjs';
 import { rootProgressStatus, rootProgressReminder } from './root-progress.mjs';
 import { createTerminalSettler, terminalSettlementEligibility } from './terminal-settlement.mjs';
+
+const readContextCatalog = async ctx => {
+  try { return (await ctx.model?.list())?.data; } catch { return undefined; }
+};
 // Ordinary workspace aliases remain supported; containment is checked after
 // resolving the nearest existing ancestor. External grants use stricter checks.
 async function canonicalWriterPath(value) {
@@ -482,6 +487,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         // Unknown telemetry never erases the local task-fit policy.
       } }
       quota = { ...(quota ?? {}), routingPolicy: routingPolicy ?? quota?.routingPolicy };
+      const contextCatalog=quota.catalog ?? await readContextCatalog(ctx);
       const token = crypto.randomUUID();
       const admission = await globalRegistry('all-writers', async (globalState, saveGlobal) => {
        try { return await registry(workspace, async (state, save) => {
@@ -640,7 +646,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
             retainedCompactionEvidence=compactionSourceEvidence(record,requested);
           }
         }
-        const contextAdvice=checkpointStatus(record,now(),{knownContext:{tokens:child?.contextTokens}})?.highContext;
+        const contextAdvice=checkpointStatus(record,now(),{knownContext:observedContext(child,contextCatalog)})?.highContext;
         // Native delivery has not yet acknowledged the corrected assignment.
         // Preserve the old gate so a failed or denied delivery cannot let the
         // existing child infer against a revision it never received.
@@ -812,6 +818,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     })});
     editor.add({name:'task_dispatch_status',description:'Read durable ownership, collection and nextDispatch.workReview requirements without launching or resuming work. Check summary:true at continuation boundaries; include any due workReview in the next idle dispatch.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string'},summary:{type:'boolean'}}},execute:async(input,context)=>registry(workspace,async(state,save)=>{
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID);
+      const contextCatalog=await readContextCatalog(ctx);
       let reconciled = false;
       for (const record of state.records.filter(record=>record.rootID===rootID)) if (reconcileCompaction(record,sessions.find(s=>s.id===record.childID),now)) reconciled = true;
       if (reconciled) await save();
@@ -823,13 +830,13 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         }
         if (delivered) await save();
       } catch { /* status remains read-safe; the durable receipt stays pending for a later explicit retry */ }
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),terminalBlocked=terminalSettlementEligibility(r,native,sessions,context.sessionID),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,key:undefined,handoffTimings:undefined,timing:handoffTimingStatus(r),nextDispatch:{workReview:dispatchReviewRequirement(r,taskWorkStatus(state,rootID,r.taskId),now())},recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,terminalReconciliation:r.completionBinding?.background?{action:'task_dispatch_reconcile_terminal',eligibleForInspection:!terminalBlocked,blockedReason:terminalBlocked,responsibleParentID:r.parentID,generation:r.admissionGeneration,...(r.terminalSettlement?.generation===r.admissionGeneration?{outcome:r.terminalSettlement.receipt.outcome,acceptedForCurrentIntent:false}: {})}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),terminalBlocked=terminalSettlementEligibility(r,native,sessions,context.sessionID),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,key:undefined,handoffTimings:undefined,timing:handoffTimingStatus(r),nextDispatch:{workReview:dispatchReviewRequirement(r,taskWorkStatus(state,rootID,r.taskId),now())},recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,terminalReconciliation:r.completionBinding?.background?{action:'task_dispatch_reconcile_terminal',eligibleForInspection:!terminalBlocked,blockedReason:terminalBlocked,responsibleParentID:r.parentID,generation:r.admissionGeneration,...(r.terminalSettlement?.generation===r.admissionGeneration?{outcome:r.terminalSettlement.receipt.outcome,acceptedForCurrentIntent:false}: {})}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind,catalog:contextCatalog}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native,contextCatalog)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }
       const currentRecovery = entry => state.records.some(r => r.rootID===rootID && r.parentID===entry.target.parentID && r.childID===entry.target.childID && r.admissionGeneration===entry.target.generation);
       const self=sessions.find(s=>s.id===context.sessionID);
-      const status={owners,rootProgress:rootProgressStatus(self,now()),selfContext:observedContext(self),quotaRecoveryPending:pendingQuotaRecovery(state).filter(currentRecovery),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))};
+      const status={owners,rootProgress:rootProgressStatus(self,now()),selfContext:observedContext(self,contextCatalog),quotaRecoveryPending:pendingQuotaRecovery(state).filter(currentRecovery),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))};
       return {content:JSON.stringify(input.summary===true?summarizeTaskDispatchStatus(status):status)};
     })});
   });

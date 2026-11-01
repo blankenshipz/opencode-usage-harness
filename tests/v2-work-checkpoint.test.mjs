@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { acknowledgeTaskReview, backgroundDispatch, beginCheckpoint, CHECKPOINT_MS, checkpointStatus, HIGH_CONTEXT_TOKENS, normalizeCheckpoint, normalizeReviewAcknowledgement, prepareCheckpoint, TASK_REVIEW_CONTINUATIONS, TASK_REVIEW_STEPS } from '../plugins/v2/work-checkpoint.mjs';
+import { acknowledgeTaskReview, backgroundDispatch, beginCheckpoint, CHECKPOINT_MS, checkpointStatus, contextMaintenance, observedContext, HIGH_CONTEXT_TOKENS, normalizeCheckpoint, normalizeReviewAcknowledgement, prepareCheckpoint, TASK_REVIEW_CONTINUATIONS, TASK_REVIEW_STEPS } from '../plugins/v2/work-checkpoint.mjs';
 
 test('cooperative slice survives serialization and becomes due on the existing boundary', () => {
   let owner = {};
@@ -102,4 +102,40 @@ test('context maintenance is generation-bound advice at a safe same-owner checkp
   assert.equal(observedContext({contextTokens:0}).tokens,0);
   assert.equal(observedContext({contextTokens:Infinity}).status,'unknown');
   assert.equal(contextMaintenance(record,{...native,contextTokens:10},options).recommended,undefined);
+});
+
+const roomyModel={providerID:'anthropic',id:'fixture-roomy',variant:'medium'};
+const roomyCatalog=[{providerID:'anthropic',id:'fixture-roomy',limit:{context:1000000,output:128000},variants:[{id:'medium'}]}];
+const roomyNative={model:roomyModel,contextModel:roomyModel,contextTokens:142000};
+test('model-aware pressure preserves roomy context below eighty percent of usable input',()=>{
+ const observation=observedContext(roomyNative,roomyCatalog);
+ assert.equal(observation.pressure,'normal');assert.equal(observation.limit,872000);assert.equal(observation.capacityBasis,'catalog_input_budget');
+ assert.equal(observedContext({...roomyNative,contextTokens:697599},roomyCatalog).pressure,'normal');
+ assert.equal(observedContext({...roomyNative,contextTokens:697600},roomyCatalog).pressure,'high');
+});
+test('model-aware budget respects smaller input limits, output reserve and variant overrides',()=>{
+ const model={providerID:'demo',id:'small',variant:'medium'};const native={model,contextModel:model,contextTokens:45000};
+ const catalog=[{...model,limit:{context:64000,input:60000,output:8000},variants:[{id:'medium'}]}];
+ assert.equal(observedContext(native,catalog).limit,56000);assert.equal(observedContext(native,catalog).pressure,'high');
+ catalog[0].limit.input=40000;assert.equal(observedContext(native,catalog).limit,40000);
+ catalog[0].variants[0].limit={input:30000};assert.equal(observedContext(native,catalog).limit,30000);
+});
+test('model-aware pressure never borrows another model or trusts malformed catalog limits',()=>{
+ for(const [native,catalog] of [
+  [{...roomyNative,contextModel:undefined},roomyCatalog],
+  [{...roomyNative,model:{...roomyModel,id:'other'}},roomyCatalog],
+  [roomyNative,undefined],[roomyNative,[]],[roomyNative,[...roomyCatalog,...roomyCatalog]],
+  [roomyNative,[{...roomyCatalog[0],providerID:'other'}]],
+  [roomyNative,[{...roomyCatalog[0],variants:[]}]],
+  ...[{context:0,output:128000},{context:1000000,output:1000000},{context:1000000,output:Infinity},{context:1000000},null].map(limit=>[roomyNative,[{...roomyCatalog[0],limit}]]),
+ ]) {
+  const result=observedContext(native,catalog);assert.equal(result.capacityBasis,'legacy_token_fallback');assert.equal(result.limit,undefined);assert.equal(result.pressure,'high');assert.ok(result.capacityUnknownReason);
+ }
+});
+test('model-aware advice still needs a safe exact-parent checkpoint and never treats a large window as a usage target',()=>{
+ const native={...roomyNative,id:'child',active:false,lastAssistantID:'new'};const record={parentID:'parent',childID:'child',state:'completed'};const options={callerID:'parent',compactionAvailable:true,catalog:roomyCatalog};
+ assert.equal(contextMaintenance(record,native,options).recommended,undefined);
+ const high={...native,contextTokens:750000};assert.equal(contextMaintenance(record,high,options).eligibleForCompaction,true);
+ assert.equal(contextMaintenance(record,{...high,active:true},options).blockedReason,'wait_for_current_work');
+ assert.equal(contextMaintenance(record,high,{...options,callerID:'other'}).blockedReason,'recorded_parent_required');
 });
