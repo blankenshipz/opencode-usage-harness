@@ -1064,3 +1064,33 @@ test('validated dependency reports persist advisory context and expire on contin
  await h.call({...base,sessionID:'ses_1'});
  assert.equal((await read()).owners[0].handoff.reportedProgress,undefined);
 });
+
+test('review after successful compaction binds the retained implementation generation only',async t=>{
+ let available=true;
+ const receipt={promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3};
+ const h=await harness(t,undefined,undefined,{loadCompletionReceipt:async()=>available?receipt:null});
+ const started=await h.call({...base,background:true,model:'openai/author#medium'});
+ const id=started.metadata.sessionID,child=h.sessions.find(s=>s.id===id);
+ Object.assign(child,{active:false,lastAssistantID:'answer'});
+ await h.call({taskId:'release',workKey:'backend',sessionID:id,generation:1},'task_dispatch_collect');
+ h.ctx.session.compact=async input=>{child.lastCompaction={id:input.id,status:'completed'};};
+ await h.call({...base,sessionID:id,compact:true,checkpoint:{objective:'Retain implementation',expectedEvidence:'exact-receipt'}});
+ await h.call({taskId:'release'},'task_dispatch_status');
+ const review={...base,workKey:'review',operation:'inspect',writePaths:[],routing:{complexity:'standard',risk:'normal',reviewOfChildID:id}};
+ const accepted=await h.call(review);
+ await h.registry('/project',async state=>{
+  const author=state.records.find(r=>r.childID===id),reviewer=state.records.find(r=>r.childID===accepted.metadata.sessionID);
+  assert.equal(author.state,'awaiting_continuation');assert.equal(author.admissionGeneration,2);
+  assert.equal(reviewer.routing.reviewProvenance.generation,1);
+ });
+ available=false;await assert.rejects(h.call({...review,workKey:'missing-receipt'}),/no longer matches the native terminal chain/);available=true;
+ child.active=true;await assert.rejects(h.call({...review,workKey:'active-author'}),/still active|overlapping writes/);child.active=false;
+ const native={...child.lastCompaction};child.lastCompaction.id='different';
+ await assert.rejects(h.call({...review,workKey:'other-compaction'}),/no completed admitted implementation generation/);child.lastCompaction=native;
+ await h.registry('/project',async(state,save)=>{const r=state.records.find(r=>r.childID===id);r.compactionSourceEvidence.childID='forged';await save();});
+ await assert.rejects(h.call({...review,workKey:'forged-source'}),/no completed admitted implementation generation/);
+ await h.registry('/project',async(state,save)=>{const r=state.records.find(r=>r.childID===id);r.compactionSourceEvidence.childID=id;r.compactionOutcome.status='failed';r.state='awaiting_recovery';await save();});
+ child.lastCompaction.status='failed';
+ await assert.rejects(h.call({...review,workKey:'failed-compaction'}),/no completed admitted implementation generation/);
+ assert.equal(h.calls.length,2);
+});

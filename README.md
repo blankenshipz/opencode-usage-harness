@@ -231,6 +231,11 @@ evidence; reconcile actionable findings and perform targeted repairs. Additional
 review needs a concrete unresolved risk. Spare quota alone is not a review trigger.
 Managed reviews identify the implementation worker with `routing.reviewOfChildID`;
 the dispatcher resolves its model rather than trusting a model-name claim.
+A successful same-worker compaction does not erase a collected implementation
+result: review can use its retained, natively revalidated source-generation receipt
+while the idle author awaits continuation. Compaction itself is never task
+completion. Active authors, failed or mismatched compactions, missing receipts,
+and later implementation generations still require their own completion evidence.
 Use `reviewIndependence: "preferred"` normally and `"required"` for an explicit
 user requirement. Legacy `reviewOf` strings remain unverified hints.
 Same-family review remains valid when a suitable independent pool is unavailable;

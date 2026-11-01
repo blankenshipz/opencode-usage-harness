@@ -232,16 +232,31 @@ async function resolveReviewProvenance({ input, state, sessions, rootID, record,
     throw new Error('task-dispatch: review author admission is still in flight; wait for its admitted generation to finish before dispatching review');
   if (child.active)
     throw new Error('task-dispatch: review author is still active; wait for the worker to become idle and for its admitted dispatch to record completion before dispatching review');
-  if (owner.state!=='completed')
+  // Compaction is maintenance, not a new implementation result. Only the
+  // exact retained, natively revalidated source receipt may supply provenance.
+  let sourceOwner=owner;
+  if (owner.state==='awaiting_continuation') {
+    const saved=owner.compactionSourceEvidence;
+    const expected=compactionSourceEvidence(owner,owner.childID);
+    const {compactionID,...identity}=saved ?? {};
+    if (saved && expected && compactionID===owner.compactionID &&
+        owner.compactionOutcome?.id===compactionID && owner.compactionOutcome.status==='completed' &&
+        child.lastCompaction?.id===compactionID && child.lastCompaction.status==='completed' &&
+        Number.isInteger(saved.sourceGeneration) && saved.sourceGeneration>0 && saved.sourceGeneration<owner.admissionGeneration &&
+        saved.sourceGeneration===owner.completionBinding?.generation &&
+        JSON.stringify(identity)===JSON.stringify(expected))
+      sourceOwner={...owner,admissionGeneration:saved.sourceGeneration,state:'completed'};
+  }
+  if (sourceOwner.state!=='completed')
     throw new Error(`task-dispatch: review author has no completed admitted implementation generation (recorded state: ${owner.state ?? 'unknown'}); explicit generation-bound completion evidence is required before dispatching review`);
-  await validateBackgroundReceipt(owner,child,loadCompletionReceipt);
+  await validateBackgroundReceipt(sourceOwner,child,loadCompletionReceipt);
   const selected=modelReference(owner.routing?.selected), observed=modelReference(child.model);
   if (!selected || (observed && observed!==selected))
     throw new Error('task-dispatch: review author model evidence is missing or disagrees with its admitted route');
   if (routing.reviewOf !== undefined && modelReference(routing.reviewOf)!==selected)
     throw new Error('task-dispatch: reviewOf does not match the admitted implementation worker model');
   const provenance={childID:owner.childID,model:selected,source:'admitted_route'};
-  if (Number.isInteger(owner.admissionGeneration) && owner.admissionGeneration>0) provenance.generation=owner.admissionGeneration;
+  if (Number.isInteger(sourceOwner.admissionGeneration) && sourceOwner.admissionGeneration>0) provenance.generation=sourceOwner.admissionGeneration;
   return {...input,routing:{...routing,reviewOf:selected,reviewProvenance:provenance}};
 }
 // Native runtime data only exposes the latest compaction.  Keep each observed
