@@ -1050,3 +1050,17 @@ test('model-aware status and dispatch handoff share the exact catalog budget wit
  child.contextTokens=750000;
  const high=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);assert.equal(high.owners[0].context.pressure,'high');assert.equal(high.owners[0].context.eligibleForCompaction,false);assert.equal(high.owners[0].context.blockedReason,'native_compaction_unavailable');assert.equal(h.calls.length,2);
 });
+
+
+test('validated dependency reports persist advisory context and expire on continuation without work',async t=>{
+ const h=await harness(t);await h.call(base);
+ const args={taskId:'release',intentRevision:1,scope:'checkpoint',status:'in_progress',progressState:'waiting_dependency',dependencySessionIDs:['ses_dependency']};
+ await h.runtime.outcome(args,{sessionID:'ses_1'},async()=> 'recorded');
+ const calls=h.calls.length;
+ const read=async()=>JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);
+ const first=await read();assert.equal(first.owners[0].handoff.phase,'awaiting_parent_decision');assert.equal(first.owners[0].handoff.reportedProgress.progressState,'waiting_dependency');assert.equal(first.owners[0].handoff.dependencies[0].observation,'unobserved');assert.equal(h.calls.length,calls);
+ await assert.rejects(h.runtime.outcome({...args,progressState:'working'},{sessionID:'ses_1'},async()=>{throw new Error('invalid fixture outcome');}),/invalid fixture/);
+ assert.equal((await read()).owners[0].handoff.reportedProgress.progressState,'waiting_dependency');
+ await h.call({...base,sessionID:'ses_1'});
+ assert.equal((await read()).owners[0].handoff.reportedProgress,undefined);
+});

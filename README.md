@@ -45,6 +45,24 @@ A separate scout is useful when discovery is needed, not a required extra agent 
 every task. The full workflow requires the compatible agent integration; installing
 the standalone tools does not activate it automatically.
 
+Passive worker status exposes bounded native tool names, timings and exit/timeout
+metadata, plus visible-text age. It distinguishes active execution, current
+self-reported dependencies, an idle worker awaiting result inspection, and a
+collected result awaiting its parent's decision. Dependency reports expire on intent/admission changes, but their source execution
+generation is unproven and delayed reports may arrive. They never determine the
+handoff phase or delay collection; cross-root readiness is not inferred.
+Silence is not a stall, and a completed tool is not accepted task completion.
+This activity projection adds no worker wakes or paid status-only turns; existing
+recovery notifications retain their no-resume behavior. Workrelay's separate
+read surface can expose the same kind of safe tool metadata from its requested
+message page; inspect the existing child rather than judging only its idle parent.
+
+The integration assignment template includes runtime/browser prerequisites,
+stage-specific failure diagnostics, and a publication checkpoint: name a frozen
+verified increment and its existing owner, or the concrete remaining blocker.
+Unrelated unfinished features should not delay an independently publishable change;
+all existing review, hooks, authorization and spending safeguards still apply.
+
 Recovery status distinguishes a running compaction, successful compaction awaiting
 same-child continuation, and failed compaction awaiting recovery. When the runtime
 supports native idle waits, a requested compaction keeps the existing parent

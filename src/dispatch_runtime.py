@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -116,6 +117,132 @@ def _completed_context_observation(raw: str, message_id: object) -> tuple[object
     return completed, sum(values), _context_model(item)
 
 
+_NATIVE_TOOL_NAMES = {
+    "read", "write", "edit", "patch", "apply_patch", "shell", "bash",
+    "glob", "grep", "list", "question", "plan_enter", "plan_exit",
+    "task_dispatch", "task_dispatch_collect", "task_dispatch_status",
+    "task_intent", "task_outcome", "task_artifact", "webfetch",
+}
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
+
+
+def _safe_activity_id(value: object) -> str | None:
+    return value if isinstance(value, str) and _SAFE_ID.fullmatch(value) else None
+
+
+def _activity_timestamp(value: object) -> int | None:
+    return value if _native_timestamp(value) else None
+
+
+def _tool_timestamp(state: dict[str, object], keys: tuple[str, ...]) -> int | None:
+    timing = state.get("time")
+    if not isinstance(timing, dict):
+        return None
+    for key in keys:
+        value = _activity_timestamp(timing.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _tool_status(value: object) -> str:
+    if value in ("streaming", "running"):
+        return "streaming"
+    if value == "completed":
+        return "completed"
+    if value in ("error", "failed"):
+        return "error"
+    if value in ("cancelled", "aborted"):
+        return "cancelled"
+    return "other"
+
+
+def _tool_name(value: object) -> str:
+    return value if isinstance(value, str) and value in _NATIVE_TOOL_NAMES else "other"
+
+
+def _tool_observation(part: dict[str, object], message_id: object, assistant_time: dict[str, object] | None) -> dict[str, object] | None:
+    if part.get("type") != "tool":
+        return None
+    state = part.get("state")
+    if not isinstance(state, dict):
+        return None
+    status = _tool_status(state.get("status"))
+    observation: dict[str, object] = {"name": _tool_name(part.get("name")), "status": status}
+    safe_message = _safe_activity_id(message_id)
+    if safe_message is not None:
+        observation["messageID"] = safe_message
+    safe_tool = _safe_activity_id(part.get("id"))
+    if safe_tool is not None:
+        observation["toolID"] = safe_tool
+    started = _tool_timestamp(state, ("started", "start", "ran", "created"))
+    completed = _tool_timestamp(state, ("completed", "end", "ended"))
+    if started is None and status == "streaming" and isinstance(assistant_time, dict):
+        started = _activity_timestamp(assistant_time.get("created"))
+    if started is not None:
+        observation["startedAt"] = started
+    if completed is not None:
+        observation["completedAt"] = completed
+    metadata = state.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    exit_code = metadata.get("exit")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        observation["exitCode"] = exit_code
+    if metadata.get("timeout") is True:
+        observation["timedOut"] = True
+    return observation
+
+
+def _native_activity(assistant_rows: list[tuple[object, str]]) -> tuple[dict[str, object], int | None, int | None]:
+    """Project bounded assistant activity without retaining native payloads."""
+    activity: dict[str, object] = {"runningTools": []}
+    latest_response: int | None = None
+    latest_visible: int | None = None
+    latest_completed: dict[str, object] | None = None
+    newest_running: list[dict[str, object]] = []
+    newest_assistant_seen = False
+    for assistant_id, raw in assistant_rows:
+        try:
+            assistant = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(assistant, dict):
+            continue
+        is_newest_assistant = not newest_assistant_seen
+        newest_assistant_seen = True
+        timing = assistant.get("time")
+        timing = timing if isinstance(timing, dict) else None
+        completed = _activity_timestamp(timing.get("completed")) if timing else None
+        if completed is not None and latest_response is None and assistant.get("finish") not in ("error", "cancelled", "aborted") and not assistant.get("error"):
+            latest_response = completed
+        content = assistant.get("content")
+        if not isinstance(content, list):
+            continue
+        if completed is not None and latest_visible is None and any(
+            isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str) and part["text"].strip()
+            for part in content
+        ):
+            latest_visible = completed
+        running: list[dict[str, object]] = []
+        for part in content:
+            observation = _tool_observation(part, assistant_id, timing) if isinstance(part, dict) else None
+            if observation is None:
+                continue
+            if observation["status"] == "streaming":
+                running.append(observation)
+            elif observation["status"] != "other":
+                previous_completed = latest_completed.get("completedAt") if latest_completed else None
+                current_completed = observation.get("completedAt")
+                if latest_completed is None or (isinstance(current_completed, int) and (not isinstance(previous_completed, int) or current_completed > previous_completed)):
+                    latest_completed = observation
+        if is_newest_assistant:
+            newest_running = running
+    if latest_completed is not None:
+        activity["lastCompletedTool"] = latest_completed
+    activity["runningTools"] = sorted(newest_running, key=lambda tool: (str(tool.get("toolID", "")), str(tool.get("name", ""))))[:3]
+    return activity, latest_response, latest_visible
+
+
 def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
     # Pinned V2 contract: claim() sets this historically named column; release()
     # clears it. Non-null means claimed execution, not proof of useful progress.
@@ -144,23 +271,6 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
             if row[1] is None:
                 if _native_timestamp(row[4]):
                     item["executionStartedAt"] = row[4]
-                visible = connection.execute(
-                    "SELECT data FROM session_message WHERE session_id=? AND type='assistant' ORDER BY seq DESC LIMIT 128",
-                    (row[0],),
-                )
-                for assistant_data, in visible:
-                    try:
-                        assistant = json.loads(assistant_data)
-                    except (TypeError, json.JSONDecodeError):
-                        continue
-                    timing = assistant.get("time") if isinstance(assistant, dict) else None
-                    completed = timing.get("completed") if isinstance(timing, dict) else None
-                    content = assistant.get("content") if isinstance(assistant, dict) else None
-                    if not _native_timestamp(completed) or not isinstance(content, list):
-                        continue
-                    if any(isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str) and part["text"].strip() for part in content):
-                        item["lastVisibleTextAt"] = completed
-                        break
             compact = connection.execute("SELECT id,json_extract(data,'$.status') FROM session_message WHERE session_id=? AND type='compaction' AND json_extract(data,'$.reason')='manual' ORDER BY seq DESC LIMIT 1", (row[0],)).fetchone()
             if compact and compact[1] in ('running', 'completed', 'failed'):
                 item['lastCompaction'] = {'id': compact[0], 'status': compact[1]}
@@ -173,7 +283,14 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
                 query += " AND seq>?"
                 params.append(boundary[0])
             query += " ORDER BY seq DESC LIMIT 64"
-            for assistant_id, assistant_data in connection.execute(query, params):
+            assistant_rows = list(connection.execute(query, params))
+            activity, last_response, last_visible = _native_activity(assistant_rows)
+            if last_response is not None:
+                activity["lastModelResponseAt"] = last_response
+            item["activity"] = activity
+            if last_visible is not None:
+                item["lastVisibleTextAt"] = last_visible
+            for assistant_id, assistant_data in assistant_rows:
                 observation = _completed_context_observation(assistant_data, assistant_id)
                 if observation is not None:
                     completed, context_tokens, context_model = observation

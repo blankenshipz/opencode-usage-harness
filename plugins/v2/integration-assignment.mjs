@@ -6,8 +6,10 @@ export function integrationAssignmentTemplate() {
     promptTemplate:[
       'Contract: <producer -> consumer; agreed representation and schema/version; exact input artifact/revision pins or explicitly unresolved contract decision>.',
       'Implement: <one end-to-end slice; producer/consumer changes plus necessary serializers, schemas and tests>.',
-      'Verify: <one executable integration command; expected observable assertions; existing live/local/synthetic verification mode and receipt location>.',
+      'Verify: <one executable integration command; expected observable assertions; existing live/local/synthetic verification mode, known runtime/browser prerequisites and receipt location>.',
+      'Publish checkpoint: <frozen verified increment and existing publication owner, or exact remaining publication blocker; do not wait for unrelated features or waive hooks, review or authorization>.',
       'Handoff: <next existing owner and its parent/session IDs; exact output artifact/revision and receipt; remaining dependency, or none>.',
+      'On a failed verification stage, retain the exact inner diagnostic and repair that stage before another full rerun. Inspect passive child activity before calling silence a stall; do not create status-only inference loops.',
       'Continue through meaningful integration and targeted verification. Freeze at an integration/acceptance boundary; reuse unchanged pins and passing evidence rather than freezing and handing off each small edit.',
     ].join('\n'),
     fields:{

@@ -62,7 +62,7 @@ function timingSummary(value) {
 
 function ownerSummary(owner) {
   const summary = {};
-  for (const key of ['taskId', 'workKey', 'childID', 'parentID', 'agent', 'operation', 'intentRevision', 'checkIds', 'admissionGeneration', 'compactionID', 'compactionOutcome', 'recordedState', 'effectiveState', 'nativeExecution', 'collection', 'writePaths', 'rebind', 'needsRebind', 'denial', 'continuationOwner', 'activeDescendants', 'inFlight']) {
+  for (const key of ['taskId', 'workKey', 'childID', 'parentID', 'agent', 'operation', 'intentRevision', 'checkIds', 'admissionGeneration', 'compactionID', 'compactionOutcome', 'recordedState', 'effectiveState', 'nativeExecution', 'collection', 'writePaths', 'rebind', 'needsRebind', 'denial', 'continuationOwner', 'activeDescendants', 'inFlight', 'workerActivity', 'handoff']) {
     if (owner?.[key] !== undefined) summary[key] = owner[key];
   }
   if (owner?.nextDispatch?.workReview) {

@@ -98,6 +98,45 @@ class DispatchRuntimeTest(unittest.TestCase):
         self.assertEqual(result["contextTokens"], 4)
         self.assertEqual(result["contextMessageID"], "bad-model")
         self.assertNotIn("contextModel", result)
+
+    def test_native_activity_is_bounded_closed_set_and_applies_to_children(self):
+        db = self.fixture()
+        with sqlite3.connect(db) as connection:
+            connection.execute("insert into session_v2 values ('child', 'root', 'builder', 'workspace', null, 2, 'private child')")
+            completed = {
+                "time": {"completed": 20},
+                "finish": "stop",
+                "content": [
+                    {"type": "text", "text": "SECRET response"},
+                    {"type": "tool", "id": "shell-1", "name": "shell", "state": {"status": "completed", "time": {"created": 10, "completed": 15}, "exitCode": 0}},
+                    {"type": "tool", "id": "opaque-1", "name": "execute", "state": {"status": "completed", "time": {"created": 16, "completed": 19}, "metadata": {"timeout": True}, "input": {"command": "SECRET"}}},
+                ],
+            }
+            active = {
+                "time": {"created": 30},
+                "content": [
+                    {"type": "tool", "id": "z", "name": "read", "state": {"status": "streaming", "time": {"created": 31}, "input": {"path": "/SECRET"}}},
+                    {"type": "tool", "id": "a", "name": "grep", "state": {"status": "streaming", "time": {"created": 32}}},
+                    {"type": "tool", "id": "b", "name": "custom-secret", "state": {"status": "streaming", "time": {"created": 33}}},
+                    {"type": "tool", "id": "c", "name": "shell", "state": {"status": "streaming", "time": {"created": 34}}},
+                ],
+            }
+            child_stale = {"time": {"created": 40}, "content": [{"type": "tool", "id": "stale", "name": "shell", "state": {"status": "streaming", "time": {"created": 41}}}]}
+            child_answer = {"time": {"completed": 50}, "finish": "stop", "content": [{"type": "text", "text": "child SECRET"}]}
+            connection.executemany(
+                "insert into session_message values (?, ?, 'assistant', ?, ?)",
+                [("root-done", "root", 3, json.dumps(completed)), ("root-active", "root", 4, json.dumps(active)), ("child-stale", "child", 2, json.dumps(child_stale)), ("child-done", "child", 3, json.dumps(child_answer))],
+            )
+        result = {row["id"]: row for row in sessions(db_path=db)}
+        root = result["root"]
+        self.assertEqual(root["activity"]["lastModelResponseAt"], 20)
+        self.assertEqual(root["lastVisibleTextAt"], 20)
+        self.assertEqual([tool["toolID"] for tool in root["activity"]["runningTools"]], ["a", "b", "c"])
+        self.assertEqual(root["activity"]["runningTools"][1]["name"], "other")
+        self.assertEqual(root["activity"]["lastCompletedTool"], {"name": "other", "status": "completed", "messageID": "root-done", "toolID": "opaque-1", "startedAt": 16, "completedAt": 19, "timedOut": True})
+        self.assertNotIn("SECRET", json.dumps(root))
+        self.assertEqual(result["child"]["lastVisibleTextAt"], 50)
+        self.assertEqual(result["child"]["activity"]["runningTools"], [])
         for variant in (42, None, ""):
             with self.subTest(variant=variant), sqlite3.connect(db) as connection:
                 connection.execute("update session_message set data=? where id='bad-model'", (json.dumps({"time": {"completed": 30}, "tokens": {"input": 4}, "model": {"providerID": "demo", "id": "observed", "variant": variant}}),))
