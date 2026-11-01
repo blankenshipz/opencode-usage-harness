@@ -74,6 +74,10 @@ function ownerSummary(owner) {
   if (owner?.context !== undefined) summary.context = contextSummary(owner.context);
   if (typeof owner?.publication?.revision === 'string') summary.publication = { revision: owner.publication.revision, ...own(owner.publication, 'checkout') };
   if (owner?.routing !== undefined) summary.routing = routingSummary(owner.routing);
+  if (owner?.terminalReconciliation) {
+    const value = owner.terminalReconciliation;
+    summary.terminalReconciliation = Object.fromEntries(['action','eligibleForInspection','blockedReason','responsibleParentID','generation','outcome','acceptedForCurrentIntent'].filter(k => value[k] !== undefined).map(k => [k,value[k]]));
+  }
   if (owner?.workCheckpoint !== undefined) summary.workCheckpoint = checkpointSummary(owner.workCheckpoint);
   if (owner?.verificationAttempt !== undefined) summary.verificationAttempt = verificationSummary(owner.verificationAttempt);
   if (owner?.externalWrites !== undefined) summary.externalWrites = owner.externalWrites;
@@ -90,6 +94,7 @@ export function summarizeTaskDispatchStatus(status) {
   return {
     owners: Array.isArray(status.owners) ? status.owners.map(ownerSummary) : [],
     ...(status.selfContext === undefined ? {} : { selfContext: contextSummary(status.selfContext) }),
+    ...own(status, 'rootProgress'),
     ...own(status, 'quotaRecoveryPending'),
     ...(status.taskWork === undefined ? {} : { taskWork: taskWorkSummary(status.taskWork) }),
     ...own(status, 'userActions'),

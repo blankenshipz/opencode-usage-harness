@@ -11,6 +11,8 @@ import { createV2TaskOutcomes } from '../plugins/v2/task-outcomes.mjs';
 import { setIntent } from '../plugins/v2/task-intent.mjs';
 import { createRegistry } from '../plugins/v2/dispatch-registry.mjs';
 import { createWorkerProgress } from '../plugins/v2/worker-progress.mjs';
+import { rootProgressReminder, ROOT_PROGRESS_MS } from '../plugins/v2/root-progress.mjs';
+import { terminalSettlementEligibility } from '../plugins/v2/terminal-settlement.mjs';
 import { summarizeTaskDispatchStatus } from '../plugins/v2/task-dispatch-status-summary.mjs';
 const agents = JSON.parse(fs.readFileSync(new URL('./fixtures/agents.json', import.meta.url)));
 const intent = {outcome:'Working release',target:'Local backend',nonGoals:[],authorizedEffects:['Local changes'],assumptions:[],checks:[{id:'backend',description:'Actual backend check',mode:'local'}],sourceMessageIDs:['msg_user']};
@@ -685,6 +687,87 @@ test('background collection requires an exact generation receipt and is idempote
  const second=JSON.parse((await h.call(collect,'task_dispatch_collect')).content);assert.equal(second.status,'completed');assert.equal(reads,1);
  await h.registry('/project',async(state,save)=>{state.records[0].completionReceipt.generation=0;await save();});status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners[0];assert.equal(status.collection.terminalEvidenceVerified,false);
  await assert.rejects(h.call({...collect,generation:2},'task_dispatch_collect'),/parent, task, work key, child, and generation exactly/);
+});
+
+const terminalFixture = outcome => ({outcome,promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3,completedAt:300});
+test('terminal reconciliation excludes historical roots behind nested native parents',()=>{
+ const root={id:'root'},parent={id:'parent',parentID:'root'},child={id:'child',parentID:'parent',active:false,agent:'builder',model:'openai/model#medium'};
+ const record={rootID:'root',parentID:'parent',agent:'builder',state:'running',admissionGeneration:1,completionBinding:{background:true,generation:1},routing:{selected:'openai/model#medium'}};
+ assert.equal(terminalSettlementEligibility(record,child,[root,parent,child],'parent'),undefined);
+ root.canonicalSessionID='canonical';
+ assert.match(terminalSettlementEligibility(record,child,[root,parent,child],'parent'),/historical/);
+});
+async function stoppedGeneration(t, outcome='failed', options={}) {
+ const h=await harness(t,undefined,undefined,{loadTerminalReceipt:async()=>terminalFixture(outcome),...options});
+ const started=await h.call({...base,background:true,model:'openai/model#medium'});
+ const child=h.sessions.find(s=>s.id===started.metadata.sessionID);child.active=false;child.model=h.calls[0].model;
+ await h.registry('/project',async(state,save)=>{setIntent(state,{rootID:'root',taskId:'release',intent:{...intent,outcome:'Wind down',sourceMessageIDs:['msg_correction']},expectedRevision:1,actorSessionID:'root'});await save();});
+ return {...h,child,args:{taskId:'release',workKey:'backend',sessionID:child.id,generation:1}};
+}
+test('stale terminal generations settle without accepting current intent, inference, or quota reads',async t=>{
+ let quota=0;const h=await stoppedGeneration(t,'failed',{loadQuota:async()=>{quota++;return {};}});
+ const calls=h.calls.length,quotaBefore=quota;
+ await assert.rejects(h.call(h.args,'task_dispatch_collect'),/collectable terminal boundary/);
+ const status=JSON.parse((await h.call({summary:true},'task_dispatch_status')).content);
+ assert.equal(status.owners[0].terminalReconciliation.eligibleForInspection,true);
+ const result=JSON.parse((await h.call(h.args,'task_dispatch_reconcile_terminal')).content);
+ assert.equal(result.status,'settled');assert.equal(result.receipt.outcome,'failed');assert.equal(result.acceptedForCurrentIntent,false);
+ assert.equal(result.ownershipReleased,true);assert.equal(result.inferenceStarted,false);
+ assert.deepEqual(JSON.parse((await h.call(h.args,'task_dispatch_reconcile_terminal')).content),result);
+ await h.registry('/project',async state=>{assert.equal(state.records[0].state,'settled');assert.equal(state.records[0].completionReceipt,undefined);assert.equal(state.records[0].terminalHistory.length,1);assert.equal(state.records[0].intentRevision,1);assert.equal(state.intentEvidence,undefined);});
+ await createRegistry(path.join(h.dir,'global-writers'))('all-writers',async state=>assert.deepEqual(state.leases,[]));
+ await assert.rejects(h.hooks.get('model.request')({sessionID:h.child.id,agent:'builder'}),/assignment superseded/);
+ assert.equal(h.calls.length,calls);assert.equal(quota,quotaBefore);
+});
+test('stale successes and cancellations archive exact outcomes, never current-task completion',async t=>{
+ for(const outcome of ['succeeded','interrupted']) {
+  const h=await stoppedGeneration(t,outcome);
+  const result=JSON.parse((await h.call(h.args,'task_dispatch_reconcile_terminal')).content);
+  assert.equal(result.receipt.outcome,outcome);assert.equal(result.status,'settled');assert.equal(result.acceptedForCurrentIntent,false);
+  await h.registry('/project',async state=>assert.equal(state.records[0].completionReceipt,undefined));
+ }
+});
+test('terminal reconciliation preserves exact parent, generation, model and inactivity checks',async t=>{
+ let reads=0;const h=await stoppedGeneration(t,'failed',{loadTerminalReceipt:async()=>{reads++;return terminalFixture('failed');}});
+ await assert.rejects(h.call(h.args,'task_dispatch_reconcile_terminal',h.child.id),/recorded parent/);
+ await assert.rejects(h.call({...h.args,generation:2},'task_dispatch_reconcile_terminal'),/generation exactly/);
+ h.child.active=true;await assert.rejects(h.call(h.args,'task_dispatch_reconcile_terminal'),/inactivity/);h.child.active=false;
+ h.sessions.push({id:'active-grandchild',parentID:h.child.id,agent:'builder',active:true});await assert.rejects(h.call(h.args,'task_dispatch_reconcile_terminal'),/active descendant/);h.sessions.pop();
+ const model=h.child.model;h.child.model='openai/other#medium';await assert.rejects(h.call(h.args,'task_dispatch_reconcile_terminal'),/role or model/);h.child.model=model;
+ assert.equal(reads,0);
+ await h.registry('/project',async(state,save)=>{state.records[0].denial={category:'native_permission'};await save();});
+ await h.call(h.args,'task_dispatch_reconcile_terminal');
+ await h.registry('/project',async state=>assert.equal(state.records[0].denial.category,'native_permission'));
+});
+test('unverified or racing terminal evidence cannot settle or release a lease',async t=>{
+ for(const mode of ['missing','changed','active']) {
+  let reads=0;let child;
+  const h=await stoppedGeneration(t,'failed',{loadTerminalReceipt:async()=>{
+   reads++;if(mode==='missing')return null;
+   if(mode==='active'&&child)child.active=true;
+   return {...terminalFixture('failed'),idleID:mode==='changed'&&reads>1?'other-idle':'idle'};
+  }});child=h.child;
+  await assert.rejects(h.call(h.args,'task_dispatch_reconcile_terminal'),/no exact native|boundary changed/);
+  await h.registry('/project',async state=>{assert.equal(state.records[0].state,'running');assert.equal(state.records[0].terminalSettlement,undefined);});
+  await createRegistry(path.join(h.dir,'global-writers'))('all-writers',async state=>assert.equal(state.leases.length,1));
+ }
+});
+test('successful current-intent results still require normal collection',async t=>{
+ const h=await harness(t,undefined,undefined,{loadTerminalReceipt:async()=>terminalFixture('succeeded')});
+ const started=await h.call({...base,background:true,model:'openai/model#medium'}),child=h.sessions.find(s=>s.id===started.metadata.sessionID);child.active=false;child.model=h.calls[0].model;
+ await assert.rejects(h.call({taskId:'release',workKey:'backend',sessionID:child.id,generation:1},'task_dispatch_reconcile_terminal'),/use task_dispatch_collect/);
+});
+test('root progress advice uses native visible text and never changes execution or registry state',async t=>{
+ const at=2*ROOT_PROGRESS_MS;const h=await harness(t,undefined,undefined,{now:()=>at});
+ Object.assign(h.sessions[0],{executionStartedAt:1,lastVisibleTextAt:1});
+ let before;await h.registry('/project',async state=>{before=JSON.stringify(state);});
+ const event={sessionID:'root',agent:'router',system:[],tools:{}};
+ await h.hooks.get('context')(event);assert.equal(event.system.filter(p=>p.text===rootProgressReminder).length,1);
+ await h.hooks.get('context')(event);assert.equal(event.system.length,1);
+ h.sessions[0].lastVisibleTextAt=at-100;
+ const recent={sessionID:'root',agent:'router',system:[],tools:{}};await h.hooks.get('context')(recent);assert.deepEqual(recent.system,[]);
+ const native={sessionID:'root',agent:'build',system:[],tools:{}};await h.hooks.get('context')(native);assert.deepEqual(native.system,[]);
+ await h.registry('/project',async state=>assert.equal(JSON.stringify(state),before));assert.equal(h.calls.length,0);
 });
 test('background collection rejects foreign parent, active descendants, and legacy bindings',async t=>{
  const receipt=async()=>({promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3});

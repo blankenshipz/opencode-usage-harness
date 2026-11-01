@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — stopped generations and root updates
+
+- Add explicit parent-only terminal reconciliation across intent revisions, preserving exact native generation evidence without treating failure, cancellation or superseded success as current-task completion.
+- Release only the matching inactive write reservation; retain denials and bounded settlement history.
+- Extend cooperative progress reminders to managed root routers using native execution and visible-text timestamps, without extra requests or forced handoffs.
+
 ## Unreleased — complete bounded JSON review
 
 - Add shell-free, hash-bound character paging for JSON that native line reads truncate.

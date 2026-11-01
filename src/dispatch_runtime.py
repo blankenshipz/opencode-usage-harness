@@ -126,6 +126,26 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
                 # This binding is independent of usage validity: an in-flight
                 # newest assistant still identifies the native compaction point.
                 item["lastAssistantID"] = latest[0]
+            if row[1] is None:
+                if _native_timestamp(row[4]):
+                    item["executionStartedAt"] = row[4]
+                visible = connection.execute(
+                    "SELECT data FROM session_message WHERE session_id=? AND type='assistant' ORDER BY seq DESC LIMIT 128",
+                    (row[0],),
+                )
+                for assistant_data, in visible:
+                    try:
+                        assistant = json.loads(assistant_data)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    timing = assistant.get("time") if isinstance(assistant, dict) else None
+                    completed = timing.get("completed") if isinstance(timing, dict) else None
+                    content = assistant.get("content") if isinstance(assistant, dict) else None
+                    if not _native_timestamp(completed) or not isinstance(content, list):
+                        continue
+                    if any(isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str) and part["text"].strip() for part in content):
+                        item["lastVisibleTextAt"] = completed
+                        break
             compact = connection.execute("SELECT id,json_extract(data,'$.status') FROM session_message WHERE session_id=? AND type='compaction' AND json_extract(data,'$.reason')='manual' ORDER BY seq DESC LIMIT 1", (row[0],)).fetchone()
             if compact and compact[1] in ('running', 'completed', 'failed'):
                 item['lastCompaction'] = {'id': compact[0], 'status': compact[1]}
@@ -275,6 +295,175 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
         return None if pending_recovery is not None else receipt
 
 
+def _terminal_prompt(connection, session_id: str, marker: str, prompt_hash: str):
+    accepted = {value for value in prompt_hash.split(",") if value}
+    if not accepted:
+        return None
+    candidates = []
+    try:
+        inbox_rows = connection.execute("SELECT id,payload FROM session_inbox WHERE session_id=?", (session_id,))
+        for ident, payload in inbox_rows:
+            try:
+                item = json.loads(payload)
+                text = item.get("text") if isinstance(item, dict) else None
+            except (TypeError, json.JSONDecodeError):
+                text = None
+            if isinstance(text, str) and marker in text and hashlib.sha256(text.encode()).hexdigest() in accepted:
+                candidates.append((str(ident), None))
+    except sqlite3.OperationalError:
+        return None
+    for ident, seq, data in connection.execute(
+        "SELECT id,seq,data FROM session_message WHERE session_id=? AND type='user' ORDER BY seq", (session_id,)
+    ):
+        try:
+            item = json.loads(data)
+            text = item.get("text") if isinstance(item, dict) else None
+        except (TypeError, json.JSONDecodeError):
+            text = None
+        if isinstance(text, str) and marker in text and hashlib.sha256(text.encode()).hexdigest() in accepted:
+            candidates.append((str(ident), int(seq)))
+    ids = {ident for ident, _ in candidates}
+    bound = [candidate for candidate in candidates if candidate[1] is not None]
+    if len(ids) != 1 or len(bound) != 1:
+        return None
+    return bound[0]
+
+
+def terminal_receipt(session_id: str, marker: str, prompt_hash: str, *, db_path: str | Path | None = None) -> dict[str, object] | None:
+    """Return a sanitized native terminal outcome for one exact prompt generation."""
+    with _connect(db_path) as connection:
+        connection.execute("BEGIN")
+        columns = {row[1] for row in connection.execute("pragma table_info(session_v2)")}
+        if "idle_outcome" not in columns or "time_suspended" not in columns:
+            return None
+        session_columns = ["time_suspended"]
+        if "time_compacting" in columns:
+            session_columns.append("time_compacting")
+        row = connection.execute(
+            "SELECT idle_outcome," + ",".join(session_columns) + " FROM session_v2 WHERE id=?", (session_id,)
+        ).fetchone()
+        if row is None or row[0] not in ("succeeded", "failed", "interrupted") or row[1] is not None or (len(row) > 2 and row[2] is not None):
+            return None
+        try:
+            pending = connection.execute(
+                "SELECT 1 FROM session_inbox WHERE session_id=? AND delivery!='delivered' LIMIT 1", (session_id,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if pending:
+            return None
+        prompt = _terminal_prompt(connection, session_id, marker, prompt_hash)
+        if prompt is None:
+            return None
+        prompt_id, prompt_seq = prompt
+        rows = connection.execute(
+            "SELECT id,seq,type,data FROM session_message WHERE session_id=? AND seq>? ORDER BY seq",
+            (session_id, prompt_seq),
+        )
+        assistant = None
+        assistant_outcome = None
+        terminal_assistant = False
+        pending_recovery = None
+        recoveries = 0
+        recovered_identity = None
+        terminal_idle = None
+        terminal_idle_data = None
+        for ident, seq, kind, data in rows:
+            if terminal_idle is not None:
+                return None
+            if kind in ("user", "compaction", "model-switched", "agent-switched", "location-switched"):
+                return None
+            try:
+                item = json.loads(data)
+            except (TypeError, json.JSONDecodeError):
+                return None
+            if not isinstance(item, dict):
+                return None
+            if terminal_assistant and kind != "idle":
+                return None
+            if pending_recovery is not None:
+                if kind != "synthetic":
+                    return None
+                if item.get("text") != _NATIVE_RECOVERY_TEXT:
+                    return None
+                pending_recovery = None
+                continue
+            if kind == "assistant":
+                if assistant is not None:
+                    return None
+                if recovered_identity is not None and _assistant_identity(item) != recovered_identity:
+                    return None
+                finish = item.get("finish")
+                timing = item.get("time")
+                completed = timing.get("completed") if isinstance(timing, dict) else None
+                if "error" in item and item["error"] is not None and not isinstance(item["error"], dict):
+                    return None
+                if item.get("error") or finish in ("error", "cancelled", "aborted"):
+                    if not _native_timestamp(completed):
+                        return None
+                    if item.get("error") or finish == "error":
+                        recovery = _native_recovery(item, ident)
+                        if recovery is not None:
+                            if recoveries >= 8:
+                                return None
+                            pending_recovery = recovery
+                            recoveries += 1
+                            recovered_identity = _assistant_identity(item)
+                            assistant = None
+                            assistant_outcome = None
+                            continue
+                        if "retry" in item:
+                            return None
+                    assistant = (str(ident), int(seq), completed)
+                    assistant_outcome = "failed" if item.get("error") or finish == "error" else "interrupted"
+                    terminal_assistant = True
+                elif finish == "stop":
+                    if not _native_timestamp(completed):
+                        return None
+                    content = item.get("content")
+                    text = "".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text") if isinstance(content, list) else ""
+                    if not text.strip():
+                        return None
+                    assistant = (str(ident), int(seq), completed)
+                    assistant_outcome = "succeeded"
+                    terminal_assistant = True
+                elif finish in ("tool-calls", "tool_calls", None):
+                    continue
+                else:
+                    return None
+            elif kind == "idle":
+                outcome = item.get("outcome")
+                if outcome not in ("succeeded", "failed", "interrupted"):
+                    return None
+                if outcome != row[0]:
+                    return None
+                if terminal_idle is not None:
+                    return None
+                if outcome == "succeeded" and (assistant is None or assistant_outcome != "succeeded"):
+                    return None
+                if assistant_outcome == "failed" and outcome != "failed":
+                    return None
+                if assistant_outcome == "interrupted" and outcome not in ("interrupted", "failed"):
+                    return None
+                terminal_idle = (str(ident), int(seq), outcome)
+                terminal_idle_data = item
+            else:
+                # Other rows are only acceptable before the terminal idle and
+                # carry no completion evidence themselves.
+                continue
+        if terminal_idle is None:
+            return None
+        outcome = terminal_idle[2]
+        receipt = {"promptID": prompt_id, "idleID": terminal_idle[0], "idleSeq": terminal_idle[1], "outcome": outcome}
+        if assistant is not None:
+            receipt.update({"assistantID": assistant[0], "assistantSeq": assistant[1]})
+        timing = terminal_idle_data.get("time") if isinstance(terminal_idle_data, dict) else None
+        completed_at = timing.get("created") if isinstance(timing, dict) else None
+        if _native_timestamp(completed_at):
+            receipt["completedAt"] = completed_at
+        return receipt
+
+
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
@@ -283,6 +472,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if len(args) == 4 and args[0] == "--completion-receipt":
         print(json.dumps(completion_receipt(args[1], args[2], args[3])))
+        return 0
+    if len(args) == 4 and args[0] == "--terminal-receipt":
+        print(json.dumps(terminal_receipt(args[1], args[2], args[3])))
         return 0
     print(json.dumps(sessions()))
     return 0
