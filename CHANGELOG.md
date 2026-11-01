@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — hands-on integration lead guidance
+
+- Clarify that an existing capable builder can lead an admitted end-to-end slice through its existing paths and gates, while the root retains intent, completion and separate review dispatch.
+- Require acceptance, input/output and check-prerequisite preflight before evaluation; keep router supervision light and evidence-led, without automatic idle wakes, retries or closure from test counts.
+- Document authorized incremental publication and an operator-configurable Opus medium lead/Sol high milestone-reviewer trial for dual pools; it is not a default or a superiority claim, and one-pool users retain the same pattern with available models.
+
 ## Unreleased — idle Claude windows and installed telemetry
 
 - Treat only fresh, zero-use, unlocked Claude account session windows without a reset as unstarted; preserve unknown pacing and all scoped, exhaustion and financial guards.

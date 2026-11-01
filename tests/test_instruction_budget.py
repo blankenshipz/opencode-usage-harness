@@ -64,6 +64,17 @@ class InstructionBudgetTest(unittest.TestCase):
         ):
             self.assertIn(phrase, routing)
 
+    def test_hands_on_lead_preserves_root_and_completion_authority(self):
+        routing = self.load()["routing"].lower()
+        for phrase in (
+            "existing capable builder", "admitted child and precise paths",
+            "root keeps intent/closure", "dispatches separate review",
+            "check prerequisites", "authorized incremental work",
+            "no repeat status-only turns", "automatic idle wakes/retries",
+            "idle and test counts do not close the task",
+        ):
+            self.assertIn(phrase, routing)
+
 
 if __name__ == "__main__":
     unittest.main()

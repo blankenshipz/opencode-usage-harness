@@ -29,17 +29,21 @@ Publishing or installing the toolkit does not make native runtime patches live.
 | See whether capacity is running out or going unused | Independent OpenAI/Codex and Claude quota views, reset times, pacing, and model-scoped limits where exposed; missing data stays unknown. |
 | Combine model strengths with quota pacing | Task-specific, evidence-backed preferences among approved model/effort peers; independent quota balancing, sticky continuations and optional cross-family review. |
 | Keep large files from crowding the main agent's context | A 350-line broad-read threshold, focused worker summaries, targeted reads, and reasoned one-use exceptions. |
-| Keep delegated work connected to the task | A stable integration owner agrees one executable acceptance command and producer/evaluator contract, then delivers an end-to-end slice while workers complete meaningful verified chunks. |
+| Keep delegated work connected to the task | A stable integration lead uses an existing capable builder's admitted child and paths to deliver an end-to-end slice through existing gates; the root retains intent, closure and separate-review dispatch. |
 | Understand what your agents accomplished | Workload metrics for usage, observed execution time, retries and reported acceptance, with overlap and unknowns called out. |
 | Keep subscription-only inference explicit | Provider-specific subscription OAuth and financial admission: Codex account/credit checks, Claude usage-credits-disabled verification by default, and no automatic API-key/provider fallback. An operator may explicitly select the documented Anthropic app-managed-credit mode. |
 | Adopt changes incrementally | An isolated toolkit installer, versioned updates, integrity checks, and code rollback. |
 
 A typical workflow is: **check quota → inspect only the relevant code → let one
-integration owner deliver an executable end-to-end slice → route independent,
+admitted capable builder lead an executable end-to-end slice → route independent,
 meaningful implementation and verification chunks → repair or escalate when the
-evidence warrants it**. A separate scout is useful when discovery is needed, not
-a required extra agent for every task. The full workflow requires the compatible
-agent integration; installing the standalone tools does not activate it automatically.
+evidence warrants it**. Before evaluating the slice, establish its acceptance
+command, input/output contract and check prerequisites. The router delegates before
+editing, then uses light evidence-based supervision: it batches bookkeeping at
+transitions and does not create repeated status-only turns, idle wakes or retries.
+A separate scout is useful when discovery is needed, not a required extra agent for
+every task. The full workflow requires the compatible agent integration; installing
+the standalone tools does not activate it automatically.
 
 Recovery status distinguishes a running compaction, successful compaction awaiting
 same-child continuation, and failed compaction awaiting recovery. Recoverable Codex
@@ -168,6 +172,12 @@ admitted model, and an explicit manual model override wins. A depleted or
 unavailable pool is not retried through another provider. `reviewOf` requests a
 meaningful independent peer review only when the policy has a healthy capable
 peer; the harness never creates an automatic review.
+
+An operator may configure a dual-pool trial with an Opus medium capable builder
+as the stable lead and a Sol high reviewer at meaningful milestones. This is a
+manual, evidence-seeking arrangement, not a generated default or a claim that
+either model is superior. A one-pool installation keeps the same lead-and-review
+pattern with its available models.
 
 ### Task fit, model families and independent review
 
