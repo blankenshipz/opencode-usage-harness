@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { shellReads as legacyShellReads } from '../large-file-context/core.mjs';
 import { isNativeAgent, canonicalHarnessRole } from './agent-mode.mjs';
+import { createStructuredJSONRead } from './structured-json-read.mjs';
 
 const LIMIT = 350;
 const SUMMARY_LIMIT = 6000;
@@ -144,7 +145,7 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
         nativeRead = read?.execute;
         nativeSubagent = subagent?.execute;
         if (read) editor.update('read', tool => {
-          tool.description += `\nLarge-file policy: direct text reads are capped at ${LIMIT} lines. Use explicit bounded reads; a router or coordinator can use large_file_summary for broad files.`;
+          tool.description += `\nLarge-file policy: direct text reads are capped at ${LIMIT} lines. Use explicit bounded reads; for long single-line JSON use large_file_json for exact hash-bound character pages without shell access; a router or coordinator can use large_file_summary for broad files.`;
           // The stock ReadTool output uses Schema.Class for pages. A policy denial is
           // a plain JSON result, so use the equivalent structural public contract.
           tool.output = readOutput;
@@ -192,6 +193,7 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
             return shell.execute(input, context);
           };
         });
+        if (nativeRead) editor.add(createStructuredJSONRead({ directory, nativeRead }));
         editor.add({
           name: 'large_file_check',
           description: `Check whether a file exceeds ${LIMIT} text lines without returning its contents. Then use an explicit bounded native read, or have a router or coordinator use large_file_summary for a broad question.`,

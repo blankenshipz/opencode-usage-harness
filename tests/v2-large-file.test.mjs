@@ -25,6 +25,13 @@ test('preflight does not leak bytes and accepts exactly 350 lines', async () => 
   assert.doesNotMatch(check.content, /SECRET/);
 });
 
+test('reviewers discover shell-free JSON paging alongside native read', async () => {
+  const h = await harness({ agent: 'harness-reviewer' });
+  assert.equal(h.tools.get('large_file_json')?.name, 'large_file_json');
+  assert.match(h.tools.get('read').description, /large_file_json/);
+  assert.equal(h.calls.length, 0, 'registering the reader must not access files');
+});
+
 test('351 lines route broad reads but keep bounded ranges usable for scouts', async () => {
   const h = await harness();
   await denied(h.tools.get('read').execute({ path: h.file }, h.context), /Large-file context block/);

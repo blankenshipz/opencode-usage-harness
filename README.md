@@ -563,6 +563,16 @@ Credit to Spotify for the approach of blocking broad reads of files over a 350-l
 Headroom inspired our recoverable tool-result compression: the V2 harness now automatically compacts eligible new JSON, search listings, and repeated test/build output before they enter model context. Conservative [diff previews](docs/DIFF-PREVIEWS.md) retain all changes while shortening unchanged context; [diagnostics](docs/COMPRESSION-DIAGNOSTICS.md) explain skipped results, and [passive cache monitoring](docs/CACHE-DRIFT.md) detects prepared-context changes without rewriting requests. Every JSON row/value remains represented; exact originals are retained privately and can be read in bounded chunks through OpenCode's normal read tool. Nested CodeMode values, source reads, errors, permissions, and existing conversation history stay intact. No extra inference or proxy is required. We independently implemented these ideas after examining Headroom's [log compressor](https://github.com/headroomlabs-ai/headroom/blob/976aa714ef3e19174dc0cb586cee7b20d064e4ef/crates/headroom-core/src/transforms/log_compressor.rs) and [compression store](https://github.com/headroomlabs-ai/headroom/blob/976aa714ef3e19174dc0cb586cee7b20d064e4ef/headroom/cache/compression_store.py). See [automatic compression and retrieval](docs/CONTEXT-COMPRESSION.md), including limits and the local snapshot security boundary. Existing [bounded check-log previews](docs/TELEMETRY.md#bounded-log-previews) remain available.
 
 
+### Complete JSON review without shell access
+
+Harness reviewers and other harness agents can use `large_file_json` when native
+line reads truncate a minified JSON file. It returns exact text in bounded,
+SHA-256-bound character pages, preserving large numbers, duplicate keys and
+escaped strings. Continue with `next` and `expectedSha256` until `complete` is
+true; a partial page is not a complete review. Native read permissions still
+apply. The helper adds no shell capability, model calls or provider-specific
+behavior. See [JSON reading](docs/STRUCTURED-JSON-READ.md) for limits and examples.
+
 ## License
 
 MIT. The OpenCode compatibility patch retains upstream attribution in `NOTICE` and `compat/LICENSE.opencode`.

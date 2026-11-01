@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased — complete bounded JSON review
+
+- Add shell-free, hash-bound character paging for JSON that native line reads truncate.
+- Preserve exact source text and existing read permissions; reject changed files and oversized sources rather than silently omitting evidence.
+
 ## Unreleased — compact integration assignments
 
 - Add an on-demand integration template using existing intent and dispatch fields: agreed producer/consumer contract, supporting paths, one integration check and exact next-owner evidence.
