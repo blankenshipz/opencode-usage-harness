@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { installTaskDispatch, hasCapability, resolvePublicationScope } from '../plugins/v2/task-dispatch.mjs';
+import { installTaskDispatch, hasCapability, resolvePublicationScope, dispatchReviewRequirement } from '../plugins/v2/task-dispatch.mjs';
 import { createV2TaskOutcomes } from '../plugins/v2/task-outcomes.mjs';
 import { setIntent } from '../plugins/v2/task-intent.mjs';
 import { createRegistry } from '../plugins/v2/dispatch-registry.mjs';
@@ -618,9 +618,14 @@ test('historical transcript refuses dispatch and model inference with canonical 
 test('cumulative review persists across continuations and accepts evidence without human approval',async t=>{
  const h=await harness(t);await h.call({...base,background:false});
  await h.registry('/project',async(state,save)=>{state.records[0].workAccounting={preparedSteps:240,continuations:12,reviewBaseline:{preparedSteps:0,continuations:0}};await save();});
+ let before;await h.registry('/project',async state=>{before=JSON.stringify(state);});
+ const status=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);
+ assert.deepEqual(status.owners[0].nextDispatch.workReview,{requiredWhenIdle:true,laneDue:true,taskDue:true,requiredFields:['hypothesis','evidenceReference']});
+ await h.registry('/project',async state=>assert.equal(JSON.stringify(state),before));
  await assert.rejects(h.call({...base,background:false}),/cumulative work review due/);
  await h.call({...base,background:false,workReview:{hypothesis:'Repair measured parse failure',evidenceReference:'receipt-parse-1'}});
  await h.registry('/project',async state=>assert.equal(state.records[0].workAccounting.preparedSteps,240));
+ const after=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content);assert.equal(after.owners[0].nextDispatch.workReview.requiredWhenIdle,false);assert.equal(h.calls.length,2);
 });
 test('native compaction keeps ownership and resets only intent delivery acknowledgement',async t=>{
  const h=await harness(t);await h.call({...base,background:false});const child=h.sessions.find(s=>s.parentID==='root');child.lastAssistantID='last-message';let compacted;
@@ -897,4 +902,14 @@ test('generation timing persists collection and continuation without status-side
  clock=400;await h.call({...base,sessionID:id,background:true});
  owner=JSON.parse((await h.call({taskId:'release',summary:true},'task_dispatch_status')).content).owners[0];
  assert.equal(owner.timing.generations[0].continuationGeneration,2);assert.equal(owner.timing.generations[0].collectionToContinuationMs,150);
+});
+
+
+test('review preflight covers task-wide and lane-only requirements without inventing acknowledgement',()=>{
+ const r={workCheckpoint:{startedAt:1,preparedSteps:0},workAccounting:{preparedSteps:0,continuations:0,reviewBaseline:{preparedSteps:0,continuations:0}}};
+ assert.deepEqual(dispatchReviewRequirement(r,{due:true},2),{requiredWhenIdle:true,laneDue:false,taskDue:true,requiredFields:['hypothesis','evidenceReference']});
+ r.workAccounting.preparedSteps=120;
+ assert.deepEqual(dispatchReviewRequirement(r,{due:false},2),{requiredWhenIdle:true,laneDue:true,taskDue:false,requiredFields:['hypothesis','evidenceReference']});
+ const raw=JSON.stringify(r);dispatchReviewRequirement(r,{due:false},2);assert.equal(JSON.stringify(r),raw);
+ const summary=summarizeTaskDispatchStatus({owners:[{nextDispatch:{workReview:{requiredWhenIdle:true,laneDue:true,taskDue:false,prompt:'SECRET'}}}]});assert.equal(JSON.stringify(summary).includes('SECRET'),false);
 });

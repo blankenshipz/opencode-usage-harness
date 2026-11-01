@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — native recovery and preflight guidance
+
+- Collect narrowly recovered native provider results only with retained matching retry proof, exact recovery boundary and a later successful same-generation terminal result; preserve all earlier errors.
+- Expose lane/root cumulative-review requirements before continuation while preserving admission thresholds and explicit reassessment.
+- Make outcome-validation errors corrective and field-specific without echoing private evidence or weakening acceptance.
+
 ## Unreleased — receipt guidance and handoff timing
 
 - Explain both receipt/freshness mismatch directions with indexed corrective diagnostics and tool field guidance; acceptance rules are unchanged.

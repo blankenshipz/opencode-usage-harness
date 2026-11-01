@@ -142,6 +142,73 @@ class DispatchRuntimeTest(unittest.TestCase):
         with sqlite3.connect(db) as c: c.execute("insert into session_message values (?,?,?,?,?)", ("later","child","user",4,json.dumps({"text":"later"})))
         self.assertIsNone(completion_receipt("child",marker,digest,db_path=db))
 
+    def test_recovered_provider_receipts_require_native_retry_and_exact_boundaries(self):
+        from copy import deepcopy
+        marker = "recovered-generation"; prompt = "work " + marker
+        digest = __import__('hashlib').sha256(prompt.encode()).hexdigest()
+        identity = {"agent":"harness-builder", "model":{"providerID":"openai", "id":"fixture", "variant":"medium"}}
+        error = {"type":"provider.transport", "message":"PRIVATE provider error", "response":{"delivery":"accepted"}}
+        failed = {**deepcopy(identity), "finish":"error", "time":{"completed":2}, "error":error,
+                  "retry":{"attempt":2, "at":3, "error":deepcopy(error)}}
+        synthetic = {"text":"The previous response was interrupted. Continue from where you left off without repeating completed content."}
+        answer = {**deepcopy(identity), "finish":"stop", "time":{"completed":5}, "content":[{"type":"text", "text":"PRIVATE answer"}]}
+        base = [("failed","assistant",failed),("recovery","synthetic",synthetic),("answer","assistant",answer),("idle","idle",{"outcome":"succeeded", "time":{"created":6}})]
+        def read(rows, pending=False):
+            tmp=tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup); db=Path(tmp.name)/"opencode.db"
+            with sqlite3.connect(db) as c:
+                c.executescript("create table session_v2 (id text, idle_outcome text); create table session_message (id text,session_id text,type text,seq integer,data text); create table session_inbox (id text,session_id text,type text,payload text,delivery text,enqueued_seq integer,time_created integer);")
+                c.execute("insert into session_v2 values ('child','succeeded')")
+                c.execute("insert into session_message values ('prompt','child','user',1,?)",(json.dumps({"text":prompt}),))
+                c.executemany("insert into session_message values (?,'child',?,?,?)",[(i,t,n+2,json.dumps(d)) for n,(i,t,d) in enumerate(rows)])
+                if pending: c.execute("insert into session_inbox values ('pending','child','message','{}','queued',1,1)")
+            return completion_receipt("child",marker,digest,db_path=db)
+        receipt=read(base)
+        self.assertEqual(receipt["assistantID"],"answer")
+        self.assertEqual(receipt["recoveredProviderErrors"],[{"errorID":"failed","recoveryID":"recovery","type":"provider.transport","attempt":2}])
+        self.assertNotIn("PRIVATE",json.dumps(receipt))
+        internal=deepcopy(base);internal[0][2]["error"]["type"]="provider.internal";internal[0][2]["retry"]["error"]=deepcopy(internal[0][2]["error"])
+        self.assertIsNotNone(read(internal))
+        shell=deepcopy(base);shell.insert(2,("shell","synthetic",{"text":"retained shell result"}));self.assertIsNotNone(read(shell))
+        tool=deepcopy(base);tool.insert(2,("tool","assistant",{**identity,"finish":"tool-calls","time":{"completed":4},"content":[]}));self.assertIsNotNone(read(tool))
+        rejected=[]
+        for key in ["retry", "model", "agent"]:
+            rows=deepcopy(base);del rows[0][2][key];rejected.append(rows)
+        for field,value in [("attempt",True),("attempt",1),("at",True),("at",1),("error",{"type":"provider.auth"})]:
+            rows=deepcopy(base);rows[0][2]["retry"][field]=value;rejected.append(rows)
+        for status in [400,401,402,403,408,429,True,"503"]:
+            rows=deepcopy(base);rows[0][2]["error"]["status"]=status;rows[0][2]["retry"]["error"]=deepcopy(rows[0][2]["error"]);rejected.append(rows)
+        for kind in ["provider.auth","provider.quota","provider.rate-limit","provider.unknown","permission.denied","subscription.guard"]:
+            rows=deepcopy(base);rows[0][2]["error"]["type"]=kind;rows[0][2]["retry"]["error"]=deepcopy(rows[0][2]["error"]);rejected.append(rows)
+        for finish in ["cancelled","aborted"]:
+            rows=deepcopy(base);rows[0][2]["finish"]=finish;rejected.append(rows)
+        for key in ["agent","providerID","id","variant"]:
+            rows=deepcopy(base)
+            if key=="agent":rows[2][2][key]="other"
+            else:rows[2][2]["model"][key]="other"
+            rejected.append(rows)
+        for kind in ["user","compaction","model-switched","agent-switched","location-switched"]:
+            rows=deepcopy(base);rows.insert(2,("boundary",kind,{}));rejected.append(rows)
+        for outcome in ["failed","interrupted"]:
+            rows=deepcopy(base);rows.insert(2,("earlier-idle","idle",{"outcome":outcome}));rejected.append(rows)
+        rows=deepcopy(base);rows[1][2]["text"]="not a native recovery";rejected.append(rows)
+        rows=deepcopy(base);rows.insert(1,("shell-before-recovery","synthetic",{"text":"unrelated"}));rejected.append(rows)
+        rows=deepcopy(base);rows[2][2]["content"]=[];rejected.append(rows)
+        rows=deepcopy(base);del rows[2][2]["time"];rejected.append(rows)
+        rows=deepcopy(base);rows[2][2]["finish"]="tool-calls";rejected.append(rows)
+        rows=deepcopy(base);rows.append(("later","assistant",answer));rejected.append(rows)
+        rows=deepcopy(base);rows[3][2]["outcome"]="failed";rejected.append(rows)
+        for kind in ["system", "synthetic", "shell", "idle"]:
+            rows=deepcopy(base);rows.insert(3,("after-answer",kind,{"outcome":"succeeded"}));rejected.append(rows)
+            rows=deepcopy(base);rows.append(("after-idle",kind,{"outcome":"succeeded"}));rejected.append(rows)
+        for index,rows in enumerate(rejected):
+            with self.subTest(invalid_chain=index):self.assertIsNone(read(rows))
+        self.assertIsNone(read(base,pending=True))
+        for count in (8,9):
+            repeated=[]
+            for n in range(count):repeated.extend([(f"error-{n}","assistant",deepcopy(failed)),(f"recovery-{n}","synthetic",synthetic)])
+            result=read(repeated+base[2:])
+            self.assertEqual(result is not None,count==8)
+
     def test_completion_receipt_rejects_tool_error_cancel_compaction_pending_and_ambiguous_prompt(self):
         marker="marker-2"; text=f"work\nDispatch completion marker: {marker}"; digest=__import__('hashlib').sha256(text.encode()).hexdigest()
         def make(assistant, extra=None, inbox=None, duplicate=False):

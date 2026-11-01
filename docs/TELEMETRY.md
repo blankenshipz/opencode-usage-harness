@@ -426,3 +426,50 @@ zero. The intervals include legitimate waiting for dependencies or decisions;
 they are not proof of a stall or an automatic retry instruction. Status only
 projects existing timing; it does not collect results or write timing records.
 Existing background receipts remain valid without the optional timestamp.
+
+
+## Recovered native execution receipts
+
+A failed provider call is not automatically a failed final generation. The V2
+reader recognizes only native `provider.internal` and `provider.transport`
+continuations with absent or 5xx status. It requires the completed failed
+assistant's retained `retry` decision (attempt at least 2, valid timestamp and
+exactly matching error), the immediately following native interrupted-response
+synthetic, unchanged agent/provider/model/variant, then a distinct completed
+nonblank `stop` answer immediately followed by one successful idle, with no
+later projected message. The exact prompt/hash/generation and
+pending-input checks remain unchanged. The reader accepts no user, compaction,
+model/agent/location switch or unsuccessful idle boundary. Unknown/malformed
+retry evidence fails closed; a matching synthetic text alone is insufficient.
+
+The receipt retains up to eight `recoveredProviderErrors` entries containing only
+error ID, recovery ID, type and attempt. Raw error messages, responses and prompts
+are not exported. It identifies the final assistant; that row may be a
+continuation fragment, so the receipt proves native completion of the admitted
+generation, not the completeness of that single text or passing application
+checks. Original native failures remain intact. Collection performs no inference,
+retry, provider/model switch, approval bypass or retroactive authorization.
+
+This read-only compatibility path depends on OpenCode retaining `assistant.retry`
+from its native retry scheduling projection. Older or changed runtimes without
+that evidence stay uncollectable; do not infer recovery or invent receipts. The
+standalone reader's existing API remains compatible and recovery metadata is
+optional.
+
+## Review and outcome preflight
+
+At continuation decision boundaries, read summary status. Each owner's
+`nextDispatch.workReview` combines lane and root-task review pressure;
+`requiredWhenIdle` lists `hypothesis` and `evidenceReference` when due. Include the
+evidence-backed `workReview` in the next idle dispatch rather than discovering
+the requirement by rejection. Status never acknowledges a review or launches
+work, and the authoritative admission check handles races. Counters and thresholds
+are unchanged.
+
+Outcome errors identify indexed fields, expected string limits and actual
+length/type without echoing evidence. Dependency waits must supply the real
+`dependencySessionIDs`. A `blocker` belongs only to `status=blocked`; in-progress
+notes use normal progress evidence. Correct the field pairing, not the reported
+outcome merely to pass validation. Missing reused-result references must be
+supplied; no auto-generated receipts, silently truncated evidence or relaxed
+acceptance rules are introduced.

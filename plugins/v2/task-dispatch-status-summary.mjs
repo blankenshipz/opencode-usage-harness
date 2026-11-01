@@ -65,6 +65,11 @@ function ownerSummary(owner) {
   for (const key of ['taskId', 'workKey', 'childID', 'parentID', 'agent', 'operation', 'intentRevision', 'checkIds', 'admissionGeneration', 'compactionID', 'compactionOutcome', 'recordedState', 'effectiveState', 'nativeExecution', 'collection', 'writePaths', 'rebind', 'needsRebind', 'denial', 'continuationOwner', 'activeDescendants', 'inFlight']) {
     if (owner?.[key] !== undefined) summary[key] = owner[key];
   }
+  if (owner?.nextDispatch?.workReview) {
+    const value=owner.nextDispatch.workReview;
+    summary.nextDispatch={workReview:{requiredWhenIdle:value.requiredWhenIdle===true,laneDue:value.laneDue===true,taskDue:value.taskDue===true,
+      ...(value.requiredWhenIdle===true?{requiredFields:['hypothesis','evidenceReference']}:{})}};
+  }
   if (owner?.timing !== undefined) summary.timing = timingSummary(owner.timing);
   if (owner?.context !== undefined) summary.context = contextSummary(owner.context);
   if (typeof owner?.publication?.revision === 'string') summary.publication = { revision: owner.publication.revision, ...own(owner.publication, 'checkout') };

@@ -150,6 +150,43 @@ def sessions(*, db_path: str | Path | None = None) -> list[dict[str, object]]:
         return rows
 
 
+_NATIVE_RECOVERY_TEXT = "The previous response was interrupted. Continue from where you left off without repeating completed content."
+
+
+def _native_timestamp(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 9007199254740991
+
+
+def _assistant_identity(item):
+    model, agent = item.get("model"), item.get("agent")
+    if not isinstance(agent, str) or not agent or not isinstance(model, dict):
+        return None
+    if any(not isinstance(model.get(key), str) or not model[key] for key in ("providerID", "id")):
+        return None
+    if "variant" in model and (not isinstance(model["variant"], str) or not model["variant"]):
+        return None
+    return agent, model["providerID"], model["id"], model.get("variant")
+
+
+def _native_recovery(item, message_id):
+    """Require retained native RetryScheduled evidence, never error text alone."""
+    error, retry = item.get("error"), item.get("retry")
+    completed = (item.get("time") or {}).get("completed")
+    if item.get("finish") != "error" or not isinstance(error, dict) or not isinstance(retry, dict):
+        return None
+    if error.get("type") not in ("provider.internal", "provider.transport") or retry.get("error") != error:
+        return None
+    status = error.get("status")
+    if status is not None and (not isinstance(status, int) or isinstance(status, bool) or not 500 <= status < 600):
+        return None
+    attempt, at = retry.get("attempt"), retry.get("at")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or not 2 <= attempt <= 1000000:
+        return None
+    if not _native_timestamp(completed) or not _native_timestamp(at) or at < completed or not _assistant_identity(item):
+        return None
+    return {"errorID":str(message_id), "type":error["type"], "attempt":attempt}
+
+
 def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_path: str | Path | None = None) -> dict[str, object] | None:
     """Return only a terminal chain bound to one exact dispatched prompt."""
     accepted = set(prompt_hash.split(","))
@@ -181,9 +218,24 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
         after = list(connection.execute("SELECT id,seq,type,data FROM session_message WHERE session_id=? AND seq>? ORDER BY seq", (session_id, prompt_seq)))
         assistant = None
         receipt = None
+        recoveries, pending_recovery, recovered_identity = [], None, None
         for ident, seq, kind, data in after:
-            if kind in ("user", "compaction"):
+            # The terminal answer must immediately precede one successful idle,
+            # with no later message that could extend or supersede this result.
+            if receipt is not None or (assistant is not None and kind != "idle"):
                 return None
+            if kind in ("user", "compaction", "model-switched", "agent-switched", "location-switched"):
+                return None
+            if pending_recovery is not None:
+                # Continue emits this exact next projected row only after the
+                # native retry decision retained on the failed assistant.
+                if kind != "synthetic": return None
+                try: recovery = json.loads(data)
+                except (TypeError, json.JSONDecodeError): return None
+                if not isinstance(recovery, dict) or recovery.get("text") != _NATIVE_RECOVERY_TEXT: return None
+                recoveries.append({**pending_recovery, "recoveryID":str(ident)})
+                pending_recovery = None
+                continue
             if kind == "assistant":
                 if receipt is not None or assistant is not None: return None
                 try: item = json.loads(data)
@@ -192,16 +244,22 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
                 text = "".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text") if isinstance(content, list) else ""
                 finish=item.get("finish")
                 completed=(item.get("time") or {}).get("completed")
-                if not isinstance(completed, (int, float)) or isinstance(completed, bool) or completed <= 0:
+                if not isinstance(completed, (int, float)) or isinstance(completed, bool) or not math.isfinite(completed) or completed <= 0:
+                    return None
+                if recovered_identity is not None and _assistant_identity(item) != recovered_identity:
                     return None
                 if item.get("error") or finish in ("error", "cancelled", "aborted"):
-                    return None
+                    pending_recovery = _native_recovery(item, ident)
+                    if pending_recovery is None or len(recoveries) >= 8: return None
+                    recovered_identity = _assistant_identity(item)
+                    continue
                 if finish == "stop":
                     if receipt is not None or not text.strip(): return None
                     assistant = (str(ident), int(seq))
                 elif finish not in ("tool-calls", "tool_calls", None):
                     return None
-            elif kind == "idle" and assistant is not None:
+            elif kind == "idle":
+                if assistant is None: return None
                 try:
                     idle = json.loads(data)
                     outcome = idle.get("outcome")
@@ -212,7 +270,9 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
                 completed_at = timing.get("created") if isinstance(timing, dict) else None
                 if isinstance(completed_at, int) and not isinstance(completed_at, bool) and 0 < completed_at <= 9007199254740991:
                     receipt["completedAt"] = completed_at
-        return receipt
+                if recoveries:
+                    receipt["recoveredProviderErrors"] = recoveries
+        return None if pending_recovery is not None else receipt
 
 
 

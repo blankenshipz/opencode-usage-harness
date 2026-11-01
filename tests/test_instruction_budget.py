@@ -33,7 +33,7 @@ class InstructionBudgetTest(unittest.TestCase):
         for phrase in (
             "complexity:'routine'|'standard'|'complex'", "risk:'normal'|'high'", "resetmodel:true",
             "legacy sessions adopt", "compact:true", "wait idle", "completed/idle", "one worker per bounded lane",
-            "cumulative review", "permission loop", "completed boundary",
+            "cumulative review", "permission loop", "completed boundary", "nextdispatch.workreview", "requiredwhenidle",
         ):
             self.assertIn(phrase, routing)
 

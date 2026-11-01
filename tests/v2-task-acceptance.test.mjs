@@ -180,3 +180,26 @@ test('enum validation names the field without echoing invalid input, while needs
  assert.deepEqual(rows.at(-1).blocker,{kind:'authorization',evidence:'approval is required',nextAction:'ask the user'});
  h.cleanup();
 });
+
+test('corrective validation messages identify indexed limits without leaking evidence', async () => {
+ const rows=[], h=await harness(memoryPlugin(rows)), tool=h.tools.get('task_outcome');
+ const oversized='private-evidence-'+('x'.repeat(500));
+ await assert.rejects(tool.execute({taskId:'result-evidence',scope:'checkpoint',status:'completed',results:[{id:'check',status:'passed',mode:'local',evidence:oversized}]},call()), error => {
+   assert.match(error.message,/invalid results\[0\]\.evidence/);
+   assert.match(error.message,/max 500 characters/);
+   assert.match(error.message,new RegExp(`actual length ${oversized.length}`));
+   assert.doesNotMatch(error.message,/private-evidence|xxxxx/);
+   return true;
+ });
+ await assert.rejects(tool.execute({taskId:'validation-evidence',scope:'checkpoint',status:'completed',validationEvidence:['ok',oversized]},call()), error => {
+   assert.match(error.message,/invalid evidence\[1\]/);
+   assert.match(error.message,/max 500 characters/);
+   assert.match(error.message,new RegExp(`actual length ${oversized.length}`));
+   assert.doesNotMatch(error.message,/private-evidence|xxxxx/);
+   return true;
+ });
+ await assert.rejects(tool.execute({taskId:'waiting',scope:'checkpoint',status:'in_progress',progressState:'waiting_dependency'},call()), /waiting_dependency requires dependencySessionIDs; provide 1-8 unique, non-self session IDs/);
+ await assert.rejects(tool.execute({taskId:'blocked',scope:'checkpoint',status:'in_progress',blocker:{kind:'environment',evidence:'service unavailable',nextAction:'retry later'}},call()), /blocker is only valid for blocked outcomes; set status=blocked and progressState=needs_user_action, or omit blocker/);
+ await assert.rejects(tool.execute({taskId:'reused',scope:'checkpoint',status:'completed',results:[{id:'check',status:'passed',mode:'local',evidence:'prior check passed',freshness:'reused'}]},call()), /results\[0\]\.sourceReceipt.*freshness=reused requires sourceReceipt.*provide a receipt reference/);
+ h.cleanup();
+});
