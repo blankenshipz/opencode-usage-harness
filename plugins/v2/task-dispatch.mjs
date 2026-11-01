@@ -18,6 +18,7 @@ import { quotaRecoveryReceipt, enqueueQuotaRecovery, deliverQuotaRecovery, pendi
 import { guardNativeDispatch, isHarnessDispatchInput, isNativeAgent, canonicalHarnessRole } from './agent-mode.mjs';
 import { beginHandoffTiming, acceptHandoffTiming, collectHandoffTiming, handoffTimingStatus } from './handoff-timing.mjs';
 import { summarizeTaskDispatchStatus } from './task-dispatch-status-summary.mjs';
+import { integrationAssignmentTemplate } from './integration-assignment.mjs';
 // Ordinary workspace aliases remain supported; containment is checked after
 // resolving the nearest existing ancestor. External grants use stricter checks.
 async function canonicalWriterPath(value) {
@@ -744,7 +745,11 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         return dispatch(input,context);
       };
     });
-    editor.add({name:'task_dispatch',description:`Capability-checked durable handoff. ${guidance}`,input:schema,execute:async(input,context)=>{const {output,...rendered}=await dispatch(input,context);return rendered;}});
+    editor.add({name:'task_dispatch_template',description:'Read the compact integration-assignment template; guidance only, no dispatch or authorization.',input:{type:'object',additionalProperties:false,properties:{kind:{type:'string',enum:['integration']}},required:['kind']},execute:async input=>{
+      if (input.kind!=='integration') throw new Error('task-dispatch: unsupported assignment template; kind must be integration');
+      return {content:JSON.stringify(integrationAssignmentTemplate())};
+    }});
+    editor.add({name:'task_dispatch',description:`Capability-checked durable handoff. For a cross-component assignment, read task_dispatch_template({kind:'integration'}) once at its planning boundary. ${guidance}`,input:schema,execute:async(input,context)=>{const {output,...rendered}=await dispatch(input,context);return rendered;}});
     editor.add({name:'task_dispatch_collect',description:'Collect an exact terminal receipt for one admitted background generation without inference. Legacy or unbound generations are not collectable.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1},workKey:{type:'string',minLength:1},sessionID:{type:'string',minLength:1},generation:{type:'integer',minimum:1}},required:['taskId','workKey','sessionID','generation']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID),key=`${rootID}\0${input.taskId}\0${input.workKey}`,record=state.records.find(r=>r.key===key),child=sessions.find(s=>s.id===input.sessionID);
       if (!record || record.parentID!==context.sessionID || record.childID!==input.sessionID || record.admissionGeneration!==input.generation) throw new Error('task-dispatch: collection must name the recorded parent, task, work key, child, and generation exactly');

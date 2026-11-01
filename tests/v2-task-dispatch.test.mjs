@@ -913,3 +913,15 @@ test('review preflight covers task-wide and lane-only requirements without inven
  const raw=JSON.stringify(r);dispatchReviewRequirement(r,{due:false},2);assert.equal(JSON.stringify(r),raw);
  const summary=summarizeTaskDispatchStatus({owners:[{nextDispatch:{workReview:{requiredWhenIdle:true,laneDue:true,taskDue:false,prompt:'SECRET'}}}]});assert.equal(JSON.stringify(summary).includes('SECRET'),false);
 });
+
+
+test('integration template uses existing fields without reads, state changes, quota or execution',async t=>{
+ let quotaReads=0;const h=await harness(t,undefined,undefined,{loadQuota:async()=>{quotaReads++;return {};}});
+ let before;await h.registry('/project',async state=>{before=JSON.stringify(state);});
+ const template=JSON.parse((await h.call({kind:'integration'},'task_dispatch_template')).content);
+ assert.equal(template.kind,'integration');assert.match(template.promptTemplate,/producer -> consumer/);assert.match(template.promptTemplate,/executable integration command/);assert.match(template.promptTemplate,/next existing owner/);assert.match(template.promptTemplate,/rather than freezing and handing off each small edit/);
+ assert.match(template.fields['task_dispatch.writePaths'],/serializer, schema and test/);assert.match(template.fields['task_dispatch.checkIds'],/current assigned acceptance-check IDs/);
+ assert.match(template.authority,/No new gate/);assert.equal(h.calls.length,0);assert.equal(quotaReads,0);
+ await h.registry('/project',async state=>assert.equal(JSON.stringify(state),before));
+ await assert.rejects(h.call({kind:'unknown'},'task_dispatch_template'),/unsupported assignment template/);assert.equal(h.calls.length,0);
+});

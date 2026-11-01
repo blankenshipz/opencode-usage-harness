@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased — compact integration assignments
+
+- Add an on-demand integration template using existing intent and dispatch fields: agreed producer/consumer contract, supporting paths, one integration check and exact next-owner evidence.
+- Encourage meaningful integration before intermediate freezes without changing admission, review or execution rules.
+
 ## Unreleased — native recovery and preflight guidance
 
 - Collect narrowly recovered native provider results only with retained matching retry proof, exact recovery boundary and a later successful same-generation terminal result; preserve all earlier errors.

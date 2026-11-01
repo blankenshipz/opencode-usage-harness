@@ -473,3 +473,26 @@ notes use normal progress evidence. Correct the field pairing, not the reported
 outcome merely to pass validation. Missing reused-result references must be
 supplied; no auto-generated receipts, silently truncated evidence or relaxed
 acceptance rules are introduced.
+
+
+## Integration-assignment template
+
+At a cross-component planning boundary, call
+`task_dispatch_template({kind:"integration"})` once. It returns a compact
+`promptTemplate` and mapping to existing intent/dispatch fields. Fill the agreed
+producer/consumer representation, schema/version and exact artifact/revision
+pins; resolve an unknown contract explicitly before implementing both sides.
+Include necessary implementation, serializer, schema and test paths in the
+normal authorized scope, plus one executable integration check with observable
+assertions and the existing check's verification mode. Identify the next existing
+owner/parent/session and exact output revision/receipt, or state the remaining
+dependency explicitly.
+
+Continue through a meaningful integrated slice and targeted verification before
+another intermediate freeze. Retain immutable acceptance evidence and reuse
+unchanged pins and passing checks. A template never creates an assignment,
+expands paths, changes models, waives review, or resumes another parent's worker.
+The router still makes the normal intent, dispatch, collection and acceptance
+calls. Retrieval does not read project/session state, query quota, write a record
+or run inference. It is absent from native-agent tool contexts and adds no global
+prompt text or mandatory gate. Existing assignments remain valid without it.
