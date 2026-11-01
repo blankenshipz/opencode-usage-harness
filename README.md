@@ -236,6 +236,7 @@ result: review can use its retained, natively revalidated source-generation rece
 while the idle author awaits continuation. Compaction itself is never task
 completion. Active authors, failed or mismatched compactions, missing receipts,
 and later implementation generations still require their own completion evidence.
+Approved operator pauses have a separate [maintenance recovery procedure](docs/MAINTENANCE-RECOVERY.md): interrupted and resumed execution must retain its exact bridge evidence rather than borrowing an older answer or rerunning work.
 Use `reviewIndependence: "preferred"` normally and `"required"` for an explicit
 user requirement. Legacy `reviewOf` strings remain unverified hints.
 Same-family review remains valid when a suitable independent pool is unavailable;
