@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — idle Claude windows and installed telemetry
+
+- Treat only fresh, zero-use, unlocked Claude account session windows without a reset as unstarted; preserve unknown pacing and all scoped, exhaustion and financial guards.
+- Verify telemetry against the configured runtime state root in the installed collector.
+- Advise rereading current affected lines before rebuilding a context-mismatched patch, within the existing instruction budget.
+
 ## Unreleased — stopped generations and root updates
 
 - Add explicit parent-only terminal reconciliation across intent revisions, preserving exact native generation evidence without treating failure, cancellation or superseded success as current-task completion.

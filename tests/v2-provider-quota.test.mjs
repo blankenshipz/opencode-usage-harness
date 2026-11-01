@@ -34,6 +34,84 @@ test('missing Claude fields remain unknown and inactive metadata is preserved', 
   assert.equal(result.financial.extra_usage_enabled, null);
 });
 
+test('a fresh zero-use Claude session without a reset is explicitly idle and does not veto weekly availability', () => {
+  const payload = {
+    checked_at: new Date(now).toISOString(), extra_usage: { is_enabled: false },
+    five_hour: { utilization: 0, resets_at: null, locked_reason: null },
+    seven_day: { utilization: 20, resets_at: new Date(now + 2_000_000).toISOString() },
+  };
+  const result = normalizeClaudeQuota(payload, { now });
+  assert.equal(result.availability, 'available');
+  assert.deepEqual(result.windows[0].reset_state, 'unstarted');
+  assert.equal(result.windows[0].resets_at, null);
+  assert.equal(result.windows[0].pace_delta, null);
+  delete payload.five_hour.resets_at;
+  assert.equal(normalizeClaudeQuota(payload, { now }).windows[0].reset_state, 'unstarted');
+  payload.five_hour.scope = { account: 'selected' };
+  assert.equal(normalizeClaudeQuota(payload, { now }).windows[0].reset_state, 'unstarted');
+});
+
+test('only a literal absent reset on an unlocked zero-use account session is idle', () => {
+  const base = { checked_at: new Date(now).toISOString(), extra_usage: { is_enabled: false }, seven_day: { utilization: 20, resets_at: new Date(now + 2_000_000).toISOString() } };
+  for (const five_hour of [
+    { utilization: 1, resets_at: null },
+    { utilization: -1, resets_at: null },
+    { utilization: '0', resets_at: null },
+    { utilization: '', resets_at: null },
+    { utilization: false, resets_at: null },
+    { utilization: 0, resets_at: new Date(now - 1).toISOString() },
+    { utilization: 0, resets_at: 'invalid' },
+    { utilization: 0, resets_at: null, locked_reason: 'locked' },
+    { utilization: 0, resets_at: null, locked_reason: '' },
+    { utilization: 0, resets_at: null, locked_reason: false },
+    { utilization: 0, resets_at: null, locked_reason: {} },
+  ]) {
+    const result = normalizeClaudeQuota({ ...base, five_hour }, { now });
+    const session = result.windows.find(window => window.kind === 'session');
+    assert.notEqual(session?.reset_state, 'unstarted');
+    // Existing normalization drops malformed usage with no reset; this test
+    // only verifies that it cannot become the new idle-session exception.
+    const recognizedLock = typeof five_hour.locked_reason === 'string' && five_hour.locked_reason.length > 0;
+    assert.equal(result.availability, recognizedLock ? 'unavailable' : session ? 'unknown' : 'available');
+  }
+});
+
+test('idle session evidence cannot hide scoped or conflicting session limits', () => {
+  const base = {
+    checked_at: new Date(now).toISOString(), extra_usage: { is_enabled: false },
+    five_hour: { utilization: 0, resets_at: null, locked_reason: null },
+    seven_day: { utilization: 20, resets_at: new Date(now + 2_000_000).toISOString() },
+  };
+  const scoped = normalizeClaudeQuota({ ...base, limits: [{ kind: 'session', scope: { model: { id: 'sonnet' } }, utilization: 0, resets_at: null }] }, { now });
+  assert.equal(scoped.availability, 'unknown');
+  assert.equal(scoped.windows.length, 3);
+  assert.equal(scoped.windows.at(-1).reset_state, null);
+  for (const limit of [
+    { kind: 'session', utilization: 1, resets_at: null },
+    { kind: 'session', utilization: 0, resets_at: 'bad-reset' },
+    { kind: 'session', utilization: 0, resets_at: null, locked_reason: 'locked' },
+  ]) {
+    const result = normalizeClaudeQuota({ ...base, limits: [limit] }, { now });
+    assert.equal(result.windows.length, 3);
+    assert.equal(result.availability, limit.locked_reason ? 'unavailable' : 'unknown');
+  }
+});
+
+test('idle-session provenance rejects malformed top-level scopes and display hints', () => {
+  const base = {
+    checked_at: new Date(now).toISOString(), extra_usage: { is_enabled: false },
+    seven_day: { utilization: 20, resets_at: new Date(now + 2_000_000).toISOString() },
+  };
+  for (const scope of [{}, 17, [], { account: false, model: { id: 'sonnet' } }]) {
+    const result = normalizeClaudeQuota({ ...base, five_hour: { utilization: 0, resets_at: null, scope } }, { now });
+    assert.equal(result.availability, 'unknown');
+    assert.notEqual(result.windows[0].reset_state, 'unstarted');
+  }
+  const displayHint = normalizeClaudeQuota({ ...base, five_hour: { utilization: 0, resets_at: null, display_name: 'Sonnet' } }, { now });
+  assert.equal(displayHint.availability, 'unknown');
+  assert.notEqual(displayHint.windows[0].reset_state, 'unstarted');
+});
+
 test('normalizes Codex windows and preserves separate pool failure', async () => {
   const codex = normalizeCodexQuota({
     checked_at: new Date(now).toISOString(), credit_risk: 'none',

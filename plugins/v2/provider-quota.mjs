@@ -89,8 +89,10 @@ export function normalizeCodexQuota(raw, { now = Date.now(), maxAgeMs = DEFAULT_
 
 function claudeWindow(kind, source, raw, now, share) {
   if (!raw || typeof raw !== 'object') return null;
-  const used = percent(raw.utilization ?? raw.used_percent ?? raw.usedPercent ?? raw.percent);
-  const resetValue = timestamp(raw.resets_at ?? raw.resetsAt);
+  const reportedUsage = raw.utilization ?? raw.used_percent ?? raw.usedPercent ?? raw.percent;
+  const used = percent(reportedUsage);
+  const resetSource = raw.resets_at ?? raw.resetsAt;
+  const resetValue = timestamp(resetSource);
   const reset = resetValue !== null && resetValue > now ? resetValue : null;
   let duration = number(raw.duration_minutes ?? raw.durationMins);
   let durationSource = 'reported';
@@ -104,8 +106,25 @@ function claudeWindow(kind, source, raw, now, share) {
   const modelFamily = raw.model_family ?? structuredScope.model_family ?? modelObject.family;
   const allowance = number(share?.allowance_percent_of_weekly ?? raw.allowance_percent_of_weekly);
   const usedWeekly = number(share?.used_percent_of_weekly ?? raw.used_percent_of_weekly);
-  const window = { kind, duration_minutes: duration, duration_source: durationSource, used_percent: used, remaining_percent: used === null ? null : 100 - used, resets_at: reset, is_active: raw.is_active === false || raw.active === false ? false : raw.is_active === true || raw.active === true ? true : null, locked_reason: typeof raw.locked_reason === 'string' ? raw.locked_reason : null, scope, model_family: typeof modelFamily === 'string' ? modelFamily : null, model: typeof model === 'string' ? model : null, allowance_percent_of_weekly: allowance, used_percent_of_weekly: usedWeekly };
-  return { ...window, ...paceFields(window, now), _key: `${kind}|${scope}|${window.model ?? ''}|${window.model_family ?? ''}|${reset ?? ''}` };
+  // Claude omits a five-hour reset before the first request in a session. This
+  // is a known idle state only for a zero-use, unlocked account session. Keep
+  // the missing reset explicit instead of inventing a cycle or pace; all other
+  // missing or invalid resets remain unknown and block routing as before.
+  const hasModelScopeHint = raw.model !== undefined || raw.model_family !== undefined
+    || raw.display_name !== undefined || raw.model_display_name !== undefined
+    || structuredScope.model !== undefined || structuredScope.model_family !== undefined;
+  const scopeObject = raw.scope && typeof raw.scope === 'object' && !Array.isArray(raw.scope) ? raw.scope : null;
+  const explicitAccountScope = raw.scope === 'account'
+    || (scopeObject && typeof scopeObject.account === 'string' && scopeObject.account.trim().length > 0
+      && Object.keys(scopeObject).every(key => key === 'account'));
+  const unscopedFiveHour = source === 'five_hour' && (raw.scope === null || raw.scope === undefined);
+  const idleUnstarted = kind === 'session' && scope === 'account'
+    && typeof reportedUsage === 'number' && Number.isFinite(reportedUsage) && reportedUsage === 0
+    && (raw.locked_reason === null || raw.locked_reason === undefined)
+    && (resetSource === null || resetSource === undefined)
+    && !hasModelScopeHint && (explicitAccountScope || unscopedFiveHour);
+  const window = { kind, duration_minutes: duration, duration_source: durationSource, used_percent: used, remaining_percent: used === null ? null : 100 - used, resets_at: reset, reset_state: idleUnstarted ? 'unstarted' : null, is_active: raw.is_active === false || raw.active === false ? false : raw.is_active === true || raw.active === true ? true : null, locked_reason: typeof raw.locked_reason === 'string' ? raw.locked_reason : null, scope, model_family: typeof modelFamily === 'string' ? modelFamily : null, model: typeof model === 'string' ? model : null, allowance_percent_of_weekly: allowance, used_percent_of_weekly: usedWeekly };
+  return { ...window, ...paceFields(window, now), _key: `${kind}|${scope}|${window.model ?? ''}|${window.model_family ?? ''}|${reset ?? ''}|${idleUnstarted ? 'unstarted' : ''}` };
 }
 
 export function normalizeClaudeQuota(raw, { now = Date.now(), maxAgeMs = DEFAULT_MAX_AGE_MS } = {}) {
@@ -122,12 +141,12 @@ export function normalizeClaudeQuota(raw, { now = Date.now(), maxAgeMs = DEFAULT
   pool.checked_at = iso(checked);
   const windows = [];
   const shares = Array.isArray(raw.weekly_scoped_shares) ? raw.weekly_scoped_shares : [];
-  const add = (kind, value, index = null) => { const share = index === null ? undefined : shares.find(s => s?.limit_index === index); const w = claudeWindow(kind, kind === 'session' ? 'five_hour' : 'seven_day', value, now, share); if (w && !windows.some(x => x._key === w._key)) windows.push(w); };
-  add('session', raw.five_hour);
-  add('weekly_all', raw.seven_day);
+  const add = (kind, source, value, index = null) => { const share = index === null ? undefined : shares.find(s => s?.limit_index === index); const w = claudeWindow(kind, source, value, now, share); if (w && !windows.some(x => x._key === w._key)) windows.push(w); };
+  add('session', 'five_hour', raw.five_hour);
+  add('weekly_all', 'seven_day', raw.seven_day);
   for (const [index, item] of (Array.isArray(raw.limits) ? raw.limits : []).entries()) {
     const kind = ['session','weekly_all','weekly_scoped'].includes(item?.kind) ? item.kind : item?.scope || item?.model || item?.display_name ? 'weekly_scoped' : item?.kind;
-    if (kind === 'session' || kind === 'weekly_all' || kind === 'weekly_scoped') add(kind, item, index);
+    if (kind === 'session' || kind === 'weekly_all' || kind === 'weekly_scoped') add(kind, 'limit', item, index);
   }
   pool.windows = windows.map(({ _key, ...w }) => w);
   const accountWindows = windows.filter(w => w.scope === 'account');
@@ -135,7 +154,7 @@ export function normalizeClaudeQuota(raw, { now = Date.now(), maxAgeMs = DEFAULT
   // exhaustion signal. A live Max payload can report false while inference is
   // valid; only known usage exhaustion/lock metadata affects availability.
   const locked = accountWindows.some(w => w.locked_reason);
-  pool.availability = locked ? 'unavailable' : accountWindows.length ? (accountWindows.some(w => w.used_percent === null || w.resets_at === null) ? 'unknown' : accountWindows.some(w => w.used_percent >= 100) ? 'unavailable' : 'available') : 'unknown';
+  pool.availability = locked ? 'unavailable' : accountWindows.length ? (accountWindows.some(w => w.used_percent === null || (w.resets_at === null && w.reset_state !== 'unstarted')) ? 'unknown' : accountWindows.some(w => w.used_percent >= 100) ? 'unavailable' : 'available') : 'unknown';
   pool.financial = { extra_usage_enabled: raw.extra_usage?.is_enabled === true ? true : raw.extra_usage?.is_enabled === false ? false : null, payg: raw.extra_usage?.is_enabled === true ? true : raw.extra_usage?.is_enabled === false ? false : null };
   if (raw.account_id || raw.accountId) pool.account = { source: 'selected_oauth', id: hashIdentifier(String(raw.account_id ?? raw.accountId)) };
   pool.pace = pace(accountWindows, now);

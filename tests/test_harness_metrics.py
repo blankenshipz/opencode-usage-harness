@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from src.harness_metrics import collect_metrics
@@ -24,6 +25,17 @@ class HarnessMetricsTest(unittest.TestCase):
         evidence = {"revision": 2, "lastStatus": "completed", "lastScope": "task", "checks": {"build": {"status": "passed", "mode": "local", "selfReported": True}}}
         (ownership / "one.json").write_text(json.dumps({"intents": {"key": intent}, "intentEvidence": {"key": evidence}}))
         return db, ownership
+
+    def test_compression_uses_configured_runtime_state_root(self):
+        db, ownership = self.fixture()
+        state = db.parent / "isolated-runtime-state"
+        store = state / "tool-output-store" / "fixture"
+        store.mkdir(parents=True)
+        (store / "metadata.json").write_text(json.dumps({"session_id": "child", "created_ms": 1001, "original_chars": 200, "projected_chars": 100, "strategy": "json-whitespace"}))
+        with patch.dict("os.environ", {"HARNESS_STATE_DIR": str(state)}):
+            report = collect_metrics(db, session_id="root", days=7, now_ms=1000 + 7 * 86400000, ownership_dir=ownership)["reports"][0]
+        self.assertEqual(report["context_compression"]["prepared_results"], 1)
+        self.assertEqual(report["context_compression"]["reduced_chars"], 100)
 
     def test_tree_cutoff_tokens_tools_and_acceptance(self):
         db, ownership = self.fixture()

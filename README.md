@@ -237,7 +237,7 @@ In a managed OpenCode session, ask the agent to call **`subscription_quota`**.
 It reports separate `openai` and `anthropic` pools for enabled catalog providers,
 including available windows, utilization, reset timestamps, pacing and relevant
 financial/scoped-limit metadata. Reading quota performs no model inference.
-A missing, stale or failed read is **unknown**, not zero usage or extra capacity.
+A missing, stale or failed read is **unknown**, not zero usage or extra capacity. A fresh Claude account session window explicitly reporting zero usage, no reset timestamp and no lock is marked unstarted; it does not veto an otherwise valid weekly allowance. Its reset and pacing remain unknown. Positive usage, expired resets, scoped-limit ambiguity and financial checks retain their existing protections.
 
 | | OpenAI / ChatGPT Codex | Anthropic / Claude |
 |---|---|---|

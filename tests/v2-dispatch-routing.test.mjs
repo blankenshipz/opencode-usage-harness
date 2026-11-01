@@ -267,6 +267,35 @@ test('an unknown weekly pace remains eligible alone but loses to a measured heal
  assert.equal(single.pace,'unknown');
 });
 
+test('an idle normalized Claude session routes across families without manufacturing a reset or pace',()=>{
+ const now=Date.now(), weeklyReset=new Date(now+6*24*60*60_000).toISOString();
+ const raw=(extraUsage=false,fiveHour={utilization:0,resets_at:null,locked_reason:null})=>({
+  checked_at:new Date(now).toISOString(),extra_usage:{is_enabled:extraUsage},five_hour:fiveHour,
+  seven_day:{utilization:20,resets_at:weeklyReset},
+ });
+ const input={agent:'builder',routing:{complexity:'standard',risk:'normal'}};
+ for (const [extraUsage, financialPolicy] of [[false,undefined],[true,{mode:'app_managed_credits'}]]) {
+  const q=multi();q.pools.anthropic=normalizeClaudeQuota(raw(extraUsage),{now});q.anthropicFinancialPolicy=financialPolicy;
+  q.pools.openai=pool('openai',20);
+  const result=selectDispatchModel({...base,input,quota:q});
+  assert.equal(result.selected,'anthropic/sonnet#high');
+  assert.equal(q.pools.anthropic.windows[0].reset_state,'unstarted');
+  assert.equal(q.pools.anthropic.windows[0].pace_delta,null);
+ }
+ const uncontrolled=multi();uncontrolled.pools.anthropic=normalizeClaudeQuota(raw(true),{now});uncontrolled.pools.openai=pool('openai',0);
+ assert.equal(selectDispatchModel({...base,input,quota:uncontrolled}).selected,'openai/sol#medium');
+ const only=multi();only.pools.anthropic=normalizeClaudeQuota(raw(),{now});delete only.pools.openai;only.catalog=only.catalog.filter(model=>model.providerID==='anthropic');
+ assert.equal(selectDispatchModel({...base,agent:{model:'anthropic/sonnet#high'},input,quota:only}).selected,'anthropic/sonnet#high');
+ for (const fiveHour of [{utilization:1,resets_at:null},{utilization:0,resets_at:new Date(now-1).toISOString()},{utilization:0,resets_at:'bad-reset'},{utilization:0,resets_at:null,locked_reason:'locked'}]) {
+  const q=multi();q.pools.anthropic=normalizeClaudeQuota(raw(false,fiveHour),{now});q.pools.openai=pool('openai',0);
+  assert.equal(selectDispatchModel({...base,input,quota:q}).selected,'openai/sol#medium');
+ }
+ const scoped=multi();scoped.pools.anthropic=normalizeClaudeQuota({...raw(),limits:[{kind:'weekly_scoped',scope:{model:{id:'sonnet',display_name:'Sonnet'}},utilization:0,resets_at:null}]},{now});scoped.pools.openai=pool('openai',0);
+ assert.equal(selectDispatchModel({...base,input,quota:scoped}).selected,'openai/sol#medium');
+ const fakeOpenAI=multi();fakeOpenAI.pools.openai.windows=[{scope:'account',kind:'session',used_percent:0,reset_state:'unstarted',resets_at:null}];fakeOpenAI.pools.anthropic.availability='unavailable';
+ assert.equal(selectDispatchModel({...base,input,quota:fakeOpenAI}).selected,'openai/balanced#medium');
+});
+
 function fitPolicy() {
  return {version:1,enabled:true,roles:{builder:[
   {ref:'openai/sol#medium',taskFit:{implementation:{band:'preferred',evidence_status:'supported',evidence_ref:'benchmark-42'}}},

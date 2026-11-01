@@ -289,6 +289,11 @@ function weeklyPacingWindows(windows, now) {
     && Number.isFinite(w.duration_minutes) && w.duration_minutes >= 10080
     && timestamp(w.resets_at) !== null && timestamp(w.resets_at) > now);
 }
+function isIdleUnstartedAccountSession(provider, window) {
+  return provider === 'anthropic' && window?.scope === 'account' && window?.kind === 'session'
+    && window?.used_percent === 0 && window?.reset_state === 'unstarted'
+    && !window?.locked_reason && timestamp(window.resets_at) === null;
+}
 function candidateState(candidate, quota, reserve) {
   const provider = candidate.ref.split('/')[0], pool = quota?.pools?.[provider];
   if (provider === 'anthropic' && quota?.anthropicFinancialPolicy?.mode === 'invalid') return;
@@ -303,7 +308,7 @@ function candidateState(candidate, quota, reserve) {
   if (relations.some(entry=>entry.relation==='ambiguous')) return;
   const windows=relations.filter(entry=>entry.relation==='applicable').map(entry=>entry.window);
   if (!windows.length || windows.some(w => !Number.isFinite(w.used_percent) || w.locked_reason
-    || timestamp(w.resets_at) === null || timestamp(w.resets_at) <= now)) return;
+    || (!isIdleUnstartedAccountSession(provider, w) && (timestamp(w.resets_at) === null || timestamp(w.resets_at) <= now)))) return;
   const paid=creditMode && windows.some(w=>w.used_percent>=100-reserve);
   if (!paid && (pool.availability !== 'available' || windows.some(w=>w.used_percent>=100-reserve))) return;
   if (candidate.requiresScopedQuota && !windows.some(w => w.scope !== 'account')) return;
