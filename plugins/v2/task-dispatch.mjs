@@ -1,4 +1,5 @@
 import { readRoutingQuota, readRoutingPolicy, selectDispatchModel, modelReference, TASK_TYPES } from './dispatch-routing.mjs';
+import { waitForCompactionIdle } from './compaction-wait.mjs';
 import { observeAdmission, convergenceAdvice, userActions, recordProgress, normalizeProgressEvidence } from './convergence.mjs';
 import { checkpointSchema, normalizeCheckpoint, observedContext, contextMaintenance, beginCheckpoint, acknowledgeTaskReview, normalizeReviewAcknowledgement, prepareCheckpoint, checkpointStatus, checkpointReminder, checkpointHandoff, backgroundDispatch } from './work-checkpoint.mjs';
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
@@ -704,7 +705,26 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           await update({state:'compacting',compactionID,compactionOutcome:undefined,compactionFailed:undefined,continuationOwnerID:admission.childID,compactionSourceEvidence:admission.retainedCompactionEvidence?{...admission.retainedCompactionEvidence,compactionID}:undefined});
           await ctx.session.compact({sessionID:admission.childID,id:compactionID});
           await update({state:'compacting',inFlight:null,compactedThrough:admission.lastAssistantID,deliveredIntentRevision:undefined,deliveredCheckIds:undefined});
-          return {content:'Native same-session compaction admitted. Wait for idle, then resume this worker; full intent will be refreshed. No replacement worker created.',metadata:{sessionID:admission.childID,status:'compacting'}};
+          const waited = await waitForCompactionIdle(ctx.session,admission.childID);
+          let terminal;
+          if (waited === 'idle') {
+            // Load outside the lock; an unrelated native ID or a new admission
+            // must never settle the operation whose parent call is waiting.
+            const snapshot = await loadSessions().catch(()=>[]);
+            const child = snapshot.find(item=>item.id===admission.childID);
+            terminal = await registry(workspace,async(state,save)=>{
+              const record=state.records.find(item=>item.key===admission.key);
+              if (!record || record.admissionGeneration!==admission.generation || record.childID!==admission.childID || record.compactionID!==compactionID || child?.active!==false) return;
+              if (reconcileCompaction(record,child,now)) await save();
+              if (record.compactionOutcome?.id===compactionID && ['awaiting_continuation','awaiting_recovery'].includes(record.state))
+                return {state:record.state,status:record.compactionOutcome.status};
+            });
+          }
+          if (terminal) return {content:terminal.status==='completed'
+            ? 'Exact native compaction completed and this same child is idle, awaiting continuation, not task completion. Continue the next authorized implementation step now through normal same-child admission with refreshed full intent; retain ownership, current checks and every permission/financial gate. No replacement or inference was started by this wait.'
+            : 'Exact native compaction failed. Preserve this child and failure evidence; inspect the recorded recovery requirements. No retry, replacement or inference was started by this wait.',
+            metadata:{sessionID:admission.childID,status:terminal.state,compactionID,generation:admission.generation}};
+          return {content:'Native same-session compaction remains unverified after a bounded wait. Inspect its exact outcome at the next recovery boundary; do not infer completion, retry compaction or launch a replacement.',metadata:{sessionID:admission.childID,status:'compacting',compactionID,generation:admission.generation,wait:waited}};
         }
         const handoff = !admission.intent ? input.prompt : admission.fullIntent
           ? `${renderIntent(admission.intent,input.checkIds)}\n\nWorker assignment:\n${input.prompt}`

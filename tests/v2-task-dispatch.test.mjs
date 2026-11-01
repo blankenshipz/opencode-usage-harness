@@ -1008,3 +1008,32 @@ test('integration template uses existing fields without reads, state changes, qu
  await h.registry('/project',async state=>assert.equal(JSON.stringify(state),before));
  await assert.rejects(h.call({kind:'unknown'},'task_dispatch_template'),/unsupported assignment template/);assert.equal(h.calls.length,0);
 });
+
+test('compaction holds the parent call until exact native idle and returns continuation ownership without inference',async t=>{
+ const h=await harness(t);await h.call({...base,background:false});const child=h.sessions.find(s=>s.parentID==='root');child.lastAssistantID='last-message';let requested,release,entered;
+ const started=new Promise(resolve=>entered=resolve);h.ctx.session.compact=async input=>{requested=input;child.active=true;};
+ h.ctx.session.wait=async input=>{assert.equal(input.sessionID,child.id);entered();await new Promise(resolve=>release=resolve);child.active=false;child.lastCompaction={id:requested.id,status:'completed'};};
+ let settled=false;const pending=h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'Continue integration after summary',expectedEvidence:'retained-check'}}).then(result=>{settled=true;return result;});
+ await started;assert.equal(settled,false);assert.equal(h.calls.length,1);release();const result=await pending;
+ assert.equal(result.metadata.status,'awaiting_continuation');assert.equal(result.metadata.compactionID,requested.id);assert.match(result.content,/not task completion/);assert.equal(h.calls.length,1);
+ await h.registry('/project',async state=>{const r=state.records[0];assert.equal(r.state,'awaiting_continuation');assert.deepEqual(r.writePaths,['backend']);assert.equal(r.compactionOutcome.id,requested.id);assert.equal(r.completionReceipt,undefined);});
+});
+test('native idle after a different compaction cannot settle current parent wait',async t=>{
+ const h=await harness(t);await h.call({...base,background:false});const child=h.sessions.find(s=>s.parentID==='root');child.lastAssistantID='last-message';h.ctx.session.compact=async()=>{};
+ h.ctx.session.wait=async()=>{child.active=false;child.lastCompaction={id:'unrelated',status:'completed'};};
+ const result=await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'Continue integration',expectedEvidence:'retained-check'}});
+ assert.equal(result.metadata.status,'compacting');assert.equal(h.calls.length,1);
+});
+test('failed compaction returns recovery without native retries or child replacement',async t=>{
+ const h=await harness(t);await h.call({...base,background:false});const child=h.sessions.find(s=>s.parentID==='root');child.lastAssistantID='last-message';let request;
+ h.ctx.session.compact=async input=>{request=input;};h.ctx.session.wait=async()=>{child.active=false;child.lastCompaction={id:request.id,status:'failed'};};
+ const result=await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'Continue integration',expectedEvidence:'retained-check'}});
+ assert.equal(result.metadata.status,'awaiting_recovery');assert.equal(h.calls.length,1);assert.match(result.content,/No retry/);
+});
+
+test('a later admitted generation cannot be settled by an older compaction wait',async t=>{
+ const h=await harness(t);await h.call({...base,background:false});const child=h.sessions.find(s=>s.parentID==='root');child.lastAssistantID='last-message';let request;
+ h.ctx.session.compact=async input=>{request=input;};h.ctx.session.wait=async()=>{child.active=false;child.lastCompaction={id:request.id,status:'completed'};await h.registry('/project',async(state,save)=>{state.records[0].admissionGeneration++;state.records[0].state='starting';await save();});};
+ const result=await h.call({...base,sessionID:child.id,compact:true,checkpoint:{objective:'Continue integration',expectedEvidence:'retained-check'}});
+ assert.equal(result.metadata.status,'compacting');await h.registry('/project',async state=>{assert.equal(state.records[0].state,'starting');assert.equal(state.records[0].compactionOutcome,undefined);});assert.equal(h.calls.length,1);
+});

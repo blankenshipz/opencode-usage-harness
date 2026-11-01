@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased — compaction handoff wait
+
+- Keep the requesting parent's dispatch call open through a bounded native idle wait after same-child compaction. Return the exact generation/compaction outcome so normal continuation can proceed without a separate idle handoff.
+- Preserve pending/recovery state on timeout, unavailable observation, mismatched IDs or failure. No polling, automatic child execution, status-triggered inference or changes to admission safeguards.
+
 ## Unreleased — hands-on integration lead guidance
 
 - Clarify that an existing capable builder can lead an admitted end-to-end slice through its existing paths and gates, while the root retains intent, completion and separate review dispatch.

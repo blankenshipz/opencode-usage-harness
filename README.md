@@ -46,7 +46,12 @@ every task. The full workflow requires the compatible agent integration; install
 the standalone tools does not activate it automatically.
 
 Recovery status distinguishes a running compaction, successful compaction awaiting
-same-child continuation, and failed compaction awaiting recovery. Recoverable Codex
+same-child continuation, and failed compaction awaiting recovery. When the runtime
+supports native idle waits, a requested compaction keeps the existing parent
+dispatch call open for up to three minutes, then returns the matching outcome for
+normal same-child admission. Timeout or unavailable observation stays pending;
+the wait never starts child work, wakes an idle coordinator or bypasses a gate.
+Recoverable Codex
 quota-telemetry failures keep admission closed and retain generation-bound parent notifications;
 notification delivery never resumes inference. See the
 [staged recovery release and activation procedure](docs/recovery-release.md) for
