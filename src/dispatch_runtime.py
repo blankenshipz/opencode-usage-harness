@@ -328,6 +328,16 @@ def _assistant_identity(item):
     return agent, model["providerID"], model["id"], model.get("variant")
 
 
+def _assistant_error_outcome(item):
+    """Classify a terminal assistant error: native aborts are interruptions, not failures."""
+    error = item.get("error")
+    if isinstance(error, dict) and error.get("type") == "aborted":
+        return "interrupted"
+    if item.get("finish") in ("cancelled", "aborted") and not error:
+        return "interrupted"
+    return "failed"
+
+
 def _native_recovery(item, message_id):
     """Require retained native RetryScheduled evidence, never error text alone."""
     error, retry = item.get("error"), item.get("retry")
@@ -587,7 +597,7 @@ def terminal_receipt(session_id: str, marker: str, prompt_hash: str, *, db_path:
                         if "retry" in item:
                             return None
                     assistant = (str(ident), int(seq), completed)
-                    assistant_outcome = "failed" if item.get("error") or finish == "error" else "interrupted"
+                    assistant_outcome = _assistant_error_outcome(item)
                     terminal_assistant = True
                 elif finish == "stop":
                     if not _native_timestamp(completed):

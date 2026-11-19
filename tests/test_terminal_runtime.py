@@ -81,6 +81,35 @@ class TerminalRuntimeTest(unittest.TestCase):
         db, prompt = self.make_db([("idle", "idle", {"outcome": "succeeded"})])
         self.assertIsNone(self.receipt(db, prompt))
 
+    def test_native_aborted_step_settles_as_interrupted(self):
+        # OpenCode 2.0.30 shape of a natively interrupted child: the aborted step
+        # carries finish "error" with an "aborted" error and no retry evidence.
+        aborted = ("aborted", "assistant", {"time": {"created": 10, "streamed": 11, "completed": 12}, "finish": "error", "rawFinish": "tool_use",
+                                            "error": {"type": "aborted", "message": "Step interrupted"}, "agent": "builder", "model": {"id": "m", "providerID": "p"}})
+        step = ("step", "assistant", {"finish": "tool-calls", "time": {"created": 2, "completed": 3}, "content": []})
+        idle = ("idle", "idle", {"outcome": "interrupted", "time": {"created": 13}})
+        for rows in ([aborted, idle], [step, ("tool", "tool", {"state": "completed"}), aborted, idle]):
+            db, prompt = self.make_db(rows, idle_outcome="interrupted")
+            result = self.receipt(db, prompt)
+            self.assertIsNotNone(result)
+            self.assertEqual(result["outcome"], "interrupted")
+            self.assertEqual(result["assistantID"], "aborted")
+            self.assertEqual(result["completedAt"], 13)
+        # An aborted step never becomes a success, and stays bound to unsettled state.
+        db, prompt = self.make_db([aborted, ("idle", "idle", {"outcome": "succeeded"})])
+        self.assertIsNone(self.receipt(db, prompt))
+        db, prompt = self.make_db([aborted, idle], idle_outcome="interrupted", suspended=5)
+        self.assertIsNone(self.receipt(db, prompt))
+        db, prompt = self.make_db([aborted, idle], idle_outcome="interrupted", queued=True)
+        self.assertIsNone(self.receipt(db, prompt))
+
+    def test_real_provider_error_still_requires_failed_idle(self):
+        failed = ("failed", "assistant", {"finish": "error", "time": {"completed": 2}, "error": {"type": "provider.internal", "message": "boom"}})
+        db, prompt = self.make_db([failed, ("idle", "idle", {"outcome": "failed"})], idle_outcome="failed")
+        self.assertEqual(self.receipt(db, prompt)["outcome"], "failed")
+        db, prompt = self.make_db([failed, ("idle", "idle", {"outcome": "interrupted"})], idle_outcome="interrupted")
+        self.assertIsNone(self.receipt(db, prompt))
+
     def test_tool_calls_may_precede_terminal_assistant_but_not_follow_one(self):
         tool = ("tool", "assistant", {"finish": "tool-calls", "content": []})
         failed = ("failed", "assistant", {"finish": "error", "time": {"completed": 2}, "error": {"type": "provider.internal"}})
