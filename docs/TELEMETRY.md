@@ -67,7 +67,10 @@ The task-outcomes plugin now saves sanitized progress snapshots under
 message, and tool call to its child, including reused older children. It retains
 observed activity, reasoning/responding phase, blocked state, and observation time;
 it never stores raw tool input/output, assistant prose, or reasoning content.
-Terminal events close snapshots. A restored snapshot is **last observed**, not a
+Terminal events close snapshots. Per-call `.flock` files are removed when their
+lock is released (only the holder unlinks, and only its own empty lock inode; a
+waiter that locked an unlinked inode reopens the path). At plugin start, empty,
+unlocked lock files older than 10 minutes left by earlier releases are pruned. A restored snapshot is **last observed**, not a
 heartbeat or proof that the worker is still alive. Checkpoints and the next action
 remain in shared task evidence and compact continuation assignments, not inferred
 from a tool label.

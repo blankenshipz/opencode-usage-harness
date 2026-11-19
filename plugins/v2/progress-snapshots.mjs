@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { createRegistry } from './dispatch-registry.mjs';
+import { createRegistry, pruneStaleLocks } from './dispatch-registry.mjs';
 import { statePath } from './paths.mjs';
 const id = x => typeof x === 'string' && /^[A-Za-z0-9_-]{1,160}$/.test(x);
 const tool = x => typeof x === 'string' && /^[a-z][a-z0-9_.-]{0,47}$/i.test(x);
@@ -16,8 +16,10 @@ export function sanitizeProgress(value) {
     workerProgress:{state:p.state,...(phase?{phase}:{}),...(tool(p.tool)?{tool:p.tool}:{}),updatedAt:p.updatedAt}};
 }
 export function createProgressStore(directory=statePath('progress-snapshots')) {
-  const registry=createRegistry(directory);
+  // Per-call lock files are removed on release; display snapshots never need them afterwards.
+  const registry=createRegistry(directory,{removeLockOnRelease:true});
   return {
+    pruneLocks:options=>pruneStaleLocks(directory,options),
     async observe(event) {
       const d=event?.data??{};
       if (![d.sessionID,d.assistantMessageID,d.id].every(id)) return;
@@ -48,6 +50,8 @@ export function createProgressStore(directory=statePath('progress-snapshots')) {
 }
 export function installProgressSnapshots(ctx,{store=createProgressStore()}={}) {
   const controller=new AbortController();
+  // Best effort: clear empty lock files left by earlier releases.
+  void Promise.resolve().then(()=>store.pruneLocks?.()).catch(()=>{});
   if(ctx.event?.subscribe)void(async()=>{try{for await(const e of ctx.event.subscribe({signal:controller.signal})) {
     if(controller.signal.aborted)break;
     if(e.type==='session.tool.progress'||e.type==='session.tool.success'||e.type==='session.tool.failed') {

@@ -63,7 +63,9 @@ fresh windows, the native catalog and the financial boundary. OpenAI and Claude
 windows are independent. A Claude Fable candidate requires a matching scoped
 model limit; an account window alone is insufficient. The adapter reads the
 currently selected Claude OAuth identity. The standalone quota command cannot
-do that and reports Claude as unknown with `adapter_unavailable`.
+do that; it reports the plugin's last cached Claude snapshot with its age and a
+staleness marker (advisory only, never admission evidence), or unknown with
+`adapter_unavailable` when no cache exists.
 
 After admission, the selected model is sticky for continuations and retries do
 not switch providers. A fresh admission can choose another eligible candidate;

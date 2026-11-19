@@ -84,6 +84,28 @@ outside the harness's admission hooks. Ordinary OAuth refresh for the selected
 account remains. Failed inference responses are returned to the caller for explicit
 recovery. Preserve the package license and original commit provenance.
 
+### Installing the artifact and generating the plugin entry
+
+`install.py` copies only this repository's allowlisted source, so it does not
+produce the adapter. Build opencode-claude-auth 3.0.0 at the pinned upstream
+commit, apply `compat/claude-auth-3.0.0-subscription-only.patch`, verify the
+source hashes in `compat/claude-auth-3.0.0-subscription-only-baseline.json`, and
+vendor the built directory (`package.json`, `index.mjs`, `dist/`, production
+`node_modules`). Recommended location: `<prefix>/vendor/claude-auth`, outside the
+hash-pinned release inventory (a file added under `releases/<version>/` fails
+`install.py` and staged-release verification).
+
+When Anthropic is enabled, `configure.py` appends the adapter to the generated
+`plugins` list after the harness plugins. It uses, in order: `--claude-auth-plugin
+DIR` (persisted in `config/configure-choices.json`), the persisted path, then
+`<release>/plugins/v2/claude-auth` (hand-vendored installs), then
+`<prefix>/vendor/claude-auth`, then a still-valid `claude-auth` entry in the profile
+being replaced. A directory qualifies only if its `package.json` names
+`opencode-claude-auth` 3.0.0 and it has `index.mjs` and `dist/index.js`; this is
+an identity check, so verify the patch hashes when you vendor it. An explicit or
+persisted path that fails this check is an error. If none is found, configure
+prints a warning and omits the entry. OpenAI-only profiles never get the entry.
+
 Back up config, artifacts and release manifest; include the managed entrypoint
 and its complete payload receipt in startup integrity verification. At idle, load
 the adapter and verify the guard and authentication plugin are active, the provider
@@ -125,8 +147,13 @@ Claude Haiku 5.5 / low subscription response. Catalog visibility is not a claim
 that every listed model has been exercised. The patched artifact keeps Haiku 5.5
 effort enabled; its legacy Haiku 4.5 compatibility path strips effort because
 that model family does not support it. The standalone `subscription-quota.mjs`
-command reports Claude as `unknown [adapter_unavailable]` because it has no
-OpenCode session context and therefore cannot read the selected OAuth token.
+command has no OpenCode session context and therefore cannot read the selected
+OAuth token. It reports the newest Anthropic snapshot from the plugin's private
+cache (`$HARNESS_STATE_DIR/quota-cache`) with its verification time, age and a
+`STALE` marker once it is older than 2 minutes (`source: "quota_cache"` in
+`--json`). Cache records hold no credentials; only owner-private regular files
+are read. With no cache it still reports `unknown [adapter_unavailable]`. The
+cached report is advisory display, never admission evidence.
 Inside a running managed session, the `subscription_quota` tool reads the
 currently selected Claude OAuth usage endpoint and reports the independent
 Anthropic windows and scoped Fable limit when present.

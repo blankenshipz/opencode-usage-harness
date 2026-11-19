@@ -40,7 +40,9 @@ The patch was checked against pristine files from the checksum-pinned source arc
 Before enabling inference in a new installation, verify that absent/failed required plugins block a model request, that only the intended subscription providers are available, and that authentication
 uses their guarded subscription OAuth paths with no API-key/base-URL override.
 OpenAI requires matching Codex account and financial/quota verification; Claude
-requires the reviewed adapter and disabled usage credits. A Claude-only profile
+requires the reviewed adapter and disabled usage credits. `configure.py` adds the
+vendored adapter to the generated `plugins` list when Anthropic is enabled (see
+[CLAUDE-SUBSCRIPTION.md](CLAUDE-SUBSCRIPTION.md)). A Claude-only profile
 does not require Codex CLI. Use local fake-provider negative tests first; never use a paid request to test a financial guard.
 
 OpenChamber is an optional UI. Install and configure it separately against the same backend and state. The toolkit does not modify launchd/systemd, relay pairing, passwords, or listening addresses.

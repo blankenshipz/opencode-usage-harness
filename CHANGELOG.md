@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — monitoring fixes (quota CLI, lock files, Claude adapter entry)
+
+- `configure.py` adds the vendored opencode-claude-auth 3.0.0 adapter to the generated `plugins` list when Anthropic is enabled. New `--claude-auth-plugin DIR` (persisted). Without it, configure detects `<release>/plugins/v2/claude-auth`, `<prefix>/vendor/claude-auth`, or a still-valid entry in the profile being replaced. It warns when none is found. `install.py` does not build or vendor the adapter; see docs/CLAUDE-SUBSCRIPTION.md.
+- `bin/subscription-quota.mjs` reports the plugin's newest cached Claude snapshot with verification time, age and a `STALE` marker (older than 2 minutes) instead of `unknown [adapter_unavailable]` when one exists. Cache files hold no credentials and only owner-private regular files are read.
+- Progress snapshots remove their per-call `.flock` file on release, using an inode re-check so mutual exclusion holds. Plugin start prunes old, empty, unlocked lock files left by earlier releases. Dispatch-ownership locks are unchanged.
+- Documentation covers all fixes on this branch: handoff result delivery and background dispatch metadata, up-front `task_intent`, pending-permission re-evaluation on reload, the raw-command redirect guard, `--shell-policy permissive`, router `repo_identity`, the agent-registry 404 window on reload (docs/COMPATIBILITY.md), and the three items above.
+
 ## Unreleased — shell permissions and reload
 
 - Add `configure.py --shell-policy allowlist|permissive`. The choice is persisted in `config/configure-choices.json`, and the default stays `allowlist`. `permissive` generates `shell *` allow plus a dangerous-command ask list. Builder roles are told to write files with edit/write instead of shell redirection.

@@ -152,6 +152,56 @@ DANGEROUS_SHELL_ASK = tuple(p for flag in _RM_RECURSIVE for p in (f'rm {flag} *'
     'sh', 'bash', 'zsh', 'dash', 'sh -*', 'bash -*', 'zsh -*', 'dash -*', 'eval *', 'xargs *rm *', 'find *-delete*',
     'dd *', 'mkfs*', 'shred *', 'kill *', 'pkill *', 'killall *',
     '*.env*', '*auth.json*', '*.pem*', '*.key*', '*credentials*', '*secret*', '*financial-policy*', '*external-write-grants*')
+CLAUDE_AUTH_PACKAGE = ('opencode-claude-auth', '3.0.0')
+
+def verified_claude_auth_plugin(directory):
+    """Return the resolved directory of a built opencode-claude-auth 3.0.0 plugin, else None.
+
+    Identity check only (package name/version, directory entrypoint and built dist); the
+    subscription-only patch itself is verified when the artifact is vendored (see
+    docs/CLAUDE-SUBSCRIPTION.md)."""
+    directory = Path(directory).expanduser()
+    try:
+        if directory.is_symlink() or not directory.is_dir():
+            return None
+        package = json.loads((directory/'package.json').read_text())
+        if (package.get('name'), package.get('version')) != CLAUDE_AUTH_PACKAGE:
+            return None
+        if not (directory/'index.mjs').is_file() or not (directory/'dist'/'index.js').is_file():
+            return None
+    except (OSError, ValueError, AttributeError):
+        return None
+    return directory.resolve()
+
+def claude_auth_candidates(package_root=ROOT):
+    root = Path(package_root).resolve()
+    # Release-local vendoring (as hand-installed) first, then <prefix>/vendor/claude-auth, which
+    # stays outside the hash-pinned release inventory.
+    return [root/'plugins/v2/claude-auth', root.parent.parent/'vendor'/'claude-auth']
+
+def find_claude_auth_plugin(package_root=ROOT):
+    for candidate in claude_auth_candidates(package_root):
+        found = verified_claude_auth_plugin(candidate)
+        if found is not None:
+            return found
+    return None
+
+def previous_claude_auth_plugin(profile_path):
+    """Carry forward a still-valid claude-auth entry from the profile being replaced."""
+    from urllib.parse import unquote, urlparse
+    try:
+        plugins = json.loads(Path(profile_path).read_text()).get('plugins') or []
+    except (OSError, ValueError, AttributeError):
+        return None
+    for uri in plugins if isinstance(plugins, list) else []:
+        if isinstance(uri, str) and uri.startswith('file://'):
+            path = Path(unquote(urlparse(uri).path))
+            if path.name == 'claude-auth':
+                found = verified_claude_auth_plugin(path)
+                if found is not None:
+                    return found
+    return None
+
 SHELL_POLICIES = ('allowlist', 'permissive')
 DEFAULT_SHELL_POLICY = 'allowlist'
 BUILDER_FILE_WRITE_GUIDANCE = ('\nWrite files with the edit/write tool, not shell heredocs, echo or other redirection; '
@@ -167,7 +217,7 @@ def shell_rules(shell_policy):
                 [{'action':'shell','resource':command,'effect':'ask'} for command in DANGEROUS_SHELL_ASK])
     raise ValueError(f'shell_policy must be one of {", ".join(SHELL_POLICIES)}')
 
-def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT_SHELL_POLICY):
+def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT_SHELL_POLICY, claude_auth_plugin=None):
     shell_permissions = shell_rules(shell_policy)
     if not isinstance(models, dict):
         raise ValueError('models must be a tier-reference object')
@@ -243,7 +293,9 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
     permissions += shell_permissions
     return {'$schema':'https://opencode.ai/v2/config.json','enabled_providers':providers,'experimental':{'policies':[{'effect':'deny','action':'provider.use','resource':'*'}]+[{'effect':'allow','action':'provider.use','resource':provider} for provider in providers]},'share':'disabled','update':'disable',
         'default_agent':'harness-router','model':models['STRONG'],'permissions':permissions,'agents':agents,
-        'plugins':[(package_root/'plugins/v2'/p).resolve().as_uri() for p in ('subscription-guard','model-status','task-outcomes','large-file-context')]}
+        'plugins':[(package_root/'plugins/v2'/p).resolve().as_uri() for p in ('subscription-guard','model-status','task-outcomes','large-file-context')]
+            # The Claude OAuth adapter is loaded only when Anthropic is enabled and a verified build exists.
+            + ([Path(claude_auth_plugin).resolve().as_uri()] if claude_auth_plugin is not None and 'anthropic' in providers else [])}
 
 def load_choices(path):
     try:
@@ -273,12 +325,24 @@ def main():
     p.add_argument('--replace',action='store_true',help='Back up and replace this generated profile explicitly')
     p.add_argument('--routing-policy',type=Path,help='Explicit reviewed candidate policy; requires separately installed/authenticated subscription plugins')
     p.add_argument('--shell-policy',choices=SHELL_POLICIES,help=f'Shell permission policy: allowlist (ask for unlisted commands) or permissive (allow all except dangerous commands). Defaults to the previously persisted choice, else {DEFAULT_SHELL_POLICY}')
+    p.add_argument('--claude-auth-plugin',type=Path,help='Built, patched opencode-claude-auth 3.0.0 plugin directory (persisted). Default: previously persisted path, else <release>/plugins/v2/claude-auth, else <prefix>/vendor/claude-auth')
     a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
     directory=a.state_dir.expanduser().resolve()/'config';target=directory/'opencode.json'
     choices_path=directory/'configure-choices.json'
     choices=load_choices(choices_path)
     shell_policy=a.shell_policy or choices.get('shell_policy') or DEFAULT_SHELL_POLICY
-    result=profile(json.loads(a.models.read_text()),routing_policy=routing,shell_policy=shell_policy)
+    claude_auth=None
+    if a.claude_auth_plugin is not None:
+        claude_auth=verified_claude_auth_plugin(a.claude_auth_plugin)
+        if claude_auth is None:
+            p.error(f'--claude-auth-plugin {a.claude_auth_plugin}: not a built opencode-claude-auth 3.0.0 plugin directory')
+    elif isinstance(choices.get('claude_auth_plugin'),str):
+        claude_auth=verified_claude_auth_plugin(choices['claude_auth_plugin'])
+        if claude_auth is None:
+            p.error(f'persisted claude_auth_plugin {choices["claude_auth_plugin"]} is missing or invalid; pass --claude-auth-plugin')
+    else:
+        claude_auth=find_claude_auth_plugin() or previous_claude_auth_plugin(target)
+    result=profile(json.loads(a.models.read_text()),routing_policy=routing,shell_policy=shell_policy,claude_auth_plugin=claude_auth)
     replacing = target.exists()
     if replacing and not a.replace:
         p.error('profile exists; use --replace only after reviewing changes')
@@ -286,7 +350,9 @@ def main():
     if target.exists():
         backup=target.with_name(f'opencode.backup-{time.time_ns()}.json');backup.write_bytes(target.read_bytes());backup.chmod(0o600)
     atomic_write_text(target,json.dumps(result,indent=2)+'\n')
-    atomic_write_text(choices_path,json.dumps({**choices,'shell_policy':shell_policy},indent=2)+'\n')
+    new_choices={**choices,'shell_policy':shell_policy}
+    if a.claude_auth_plugin is not None: new_choices['claude_auth_plugin']=str(claude_auth)
+    atomic_write_text(choices_path,json.dumps(new_choices,indent=2)+'\n')
     policy_path=directory/'routing-policy.json'
     if routing is not None:
         if policy_path.exists():
@@ -302,6 +368,10 @@ def main():
     if 'openai' in result['enabled_providers']: requirements.append('OpenAI OAuth/account and financial verification')
     if 'anthropic' in result['enabled_providers']: requirements.append('reviewed Claude OAuth adapter and disabled usage credits or explicit local app-managed-credit policy')
     print(f'Shell policy: {shell_policy}.')
+    if 'anthropic' in result['enabled_providers']:
+        if claude_auth is not None: print(f'Claude auth plugin: {claude_auth}.')
+        else: print('WARNING: Anthropic is enabled but no built opencode-claude-auth 3.0.0 plugin was found; '
+                    'vendor it (docs/CLAUDE-SUBSCRIPTION.md) and rerun with --claude-auth-plugin DIR.')
     print(f'Prepared {target}; no service started. Required before inference: '+ '; '.join(requirements)+'.')
 
 if __name__=='__main__':main()

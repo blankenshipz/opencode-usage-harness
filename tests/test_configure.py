@@ -259,6 +259,63 @@ class ConfigureTests(unittest.TestCase):
             bad=subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(state),'--replace'],capture_output=True,text=True)
             self.assertNotEqual(bad.returncode,0)
 
+    @staticmethod
+    def fake_claude_auth(directory, name='opencode-claude-auth', version='3.0.0'):
+        directory=Path(directory); (directory/'dist').mkdir(parents=True)
+        (directory/'package.json').write_text(json.dumps({'name':name,'version':version}))
+        (directory/'index.mjs').write_text('export * from "./dist/index.js"\n')
+        (directory/'dist'/'index.js').write_text('export default {}\n')
+        return directory
+
+    def test_claude_auth_plugin_entry_only_for_anthropic_and_verified_build(self):
+        from configure import verified_claude_auth_plugin, find_claude_auth_plugin
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        with tempfile.TemporaryDirectory() as tmp:
+            release=Path(tmp)/'prefix'/'releases'/'0.2.0'
+            plugin=self.fake_claude_auth(release/'plugins'/'v2'/'claude-auth')
+            self.assertEqual(find_claude_auth_plugin(release),plugin.resolve())
+            claude=profile({k:'anthropic/fixture#medium' for k in tiers},claude_auth_plugin=plugin)
+            self.assertEqual(claude['plugins'][-1],plugin.resolve().as_uri())
+            self.assertEqual(len(claude['plugins']),5)
+            openai=profile({k:'openai/fixture#medium' for k in tiers},claude_auth_plugin=plugin)
+            self.assertNotIn(plugin.resolve().as_uri(),openai['plugins'])
+            self.assertEqual(len(profile({k:'anthropic/fixture#medium' for k in tiers})['plugins']),4)
+            # <prefix>/vendor/claude-auth is detected when the release has none.
+            other=Path(tmp)/'p2'/'releases'/'0.3.0'; other.mkdir(parents=True)
+            vendor=self.fake_claude_auth(Path(tmp)/'p2'/'vendor'/'claude-auth')
+            self.assertEqual(find_claude_auth_plugin(other),vendor.resolve())
+            for bad in (self.fake_claude_auth(Path(tmp)/'wrongname',name='other'),
+                        self.fake_claude_auth(Path(tmp)/'wrongversion',version='3.0.1'),Path(tmp)/'missing'):
+                self.assertIsNone(verified_claude_auth_plugin(bad))
+            unbuilt=self.fake_claude_auth(Path(tmp)/'unbuilt'); (unbuilt/'dist'/'index.js').unlink()
+            self.assertIsNone(verified_claude_auth_plugin(unbuilt))
+
+    def test_configure_cli_generates_persists_and_carries_forward_claude_auth(self):
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); models=root/'models.json'; models.write_text(json.dumps({k:'anthropic/fixture#medium' for k in tiers}))
+            state=root/'state'; config=state/'config'
+            plugin=self.fake_claude_auth(root/'vendor'/'claude-auth')
+            run=lambda *extra: subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(state),*extra],capture_output=True,text=True)
+            out=run()
+            self.assertEqual(out.returncode,0,out.stderr); self.assertIn('WARNING',out.stdout)
+            self.assertFalse(any(u.endswith('/claude-auth') for u in json.loads((config/'opencode.json').read_text())['plugins']))
+            out=run('--replace','--claude-auth-plugin',str(plugin),'--shell-policy','permissive')
+            self.assertEqual(out.returncode,0,out.stderr)
+            self.assertIn(plugin.resolve().as_uri(),json.loads((config/'opencode.json').read_text())['plugins'])
+            self.assertEqual(json.loads((config/'configure-choices.json').read_text())['claude_auth_plugin'],str(plugin.resolve()))
+            out=run('--replace')  # persisted choice keeps the entry
+            self.assertIn(plugin.resolve().as_uri(),json.loads((config/'opencode.json').read_text())['plugins'])
+            # Without a persisted choice, a still-valid entry in the replaced profile is carried forward.
+            (config/'configure-choices.json').write_text('{"shell_policy":"permissive"}')
+            out=run('--replace')
+            self.assertIn(plugin.resolve().as_uri(),json.loads((config/'opencode.json').read_text())['plugins'])
+            self.assertNotIn('WARNING',out.stdout)
+            bad=run('--replace','--claude-auth-plugin',str(root/'nope'))
+            self.assertNotEqual(bad.returncode,0)
+            (config/'configure-choices.json').write_text(json.dumps({'shell_policy':'permissive','claude_auth_plugin':str(root/'nope')}))
+            self.assertNotEqual(run('--replace').returncode,0)
+
     def test_profile_write_is_atomic_rename(self):
         with tempfile.TemporaryDirectory() as tmp:
             target=Path(tmp)/'opencode.json'; target.write_text('{"old":true}')

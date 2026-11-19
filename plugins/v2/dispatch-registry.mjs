@@ -49,14 +49,61 @@ async function acquireLock(file, legacy) {
     return handle;
   } catch (error) { await handle.close(); throw error; }
 }
-export function createRegistry(directory = statePath('dispatch-ownership')) {
+const sameFile = (a, b) => a && b && a.ino === b.ino && a.dev === b.dev;
+// With removeLockOnRelease every participant must use this protocol: after the
+// flock is granted, the path must still name the locked inode (else a releaser
+// unlinked it; reopen). The holder unlinks only while still holding its lock.
+async function acquireRemovableLock(lockPath, legacy) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const lock = await acquireLock(lockPath, legacy);
+    const [held, current] = await Promise.all([lock.stat(), fs.stat(lockPath).catch(() => null)]);
+    if (sameFile(held, current)) return lock;
+    await lock.close();
+  }
+  throw new Error('task-dispatch: registry lock kept changing; retry later');
+}
+async function releaseRemovableLock(lock, lockPath) {
+  try {
+    const [held, current] = await Promise.all([lock.stat(), fs.stat(lockPath).catch(() => null)]);
+    // Remove only our own, still-empty lock inode, and only while holding it.
+    if (sameFile(held, current) && held.size === 0) await fs.unlink(lockPath).catch(() => {});
+  } finally { await lock.close(); }
+}
+const pruneProgram = `import fcntl,os,stat,sys,time
+d=sys.argv[1];cutoff=time.time()-float(sys.argv[2]);removed=0
+for n in os.listdir(d):
+    if not n.endswith('.flock'): continue
+    p=os.path.join(d,n)
+    try:
+        st=os.lstat(p)
+        if not stat.S_ISREG(st.st_mode) or st.st_size or st.st_mtime>cutoff or st.st_uid!=os.getuid(): continue
+        fd=os.open(p,os.O_RDWR|os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            own=os.fstat(fd);cur=os.stat(p)
+            if (own.st_ino,own.st_dev)==(cur.st_ino,cur.st_dev) and own.st_size==0:
+                os.unlink(p);removed+=1
+        finally: os.close(fd)
+    except OSError: pass
+print(removed)
+`;
+// Removes leftover empty, unlocked .flock files from a removeLockOnRelease registry
+// (e.g. written by older releases that kept every lock inode). Returns the count.
+export async function pruneStaleLocks(directory, { minAgeMs = 10 * 60_000 } = {}) {
+  try { if (!(await fs.lstat(directory)).isDirectory()) return 0; } catch { return 0; }
+  const { stdout } = await exec(configuredPython, ['-c', pruneProgram, directory, String(minAgeMs / 1000)], { env: lockedEnvironment(), timeout: 30_000 });
+  return Number.parseInt(stdout, 10) || 0;
+}
+export function createRegistry(directory = statePath('dispatch-ownership'), { removeLockOnRelease = false } = {}) {
   return async (workspace, run) => {
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     const name = crypto.createHash('sha256').update(workspace).digest('hex');
     const file = path.join(directory, `${name}.json`), legacy = path.join(directory, `${name}.lock`);
     const nonce = crypto.randomUUID();
-    // Keep this inode permanently: unlinking a flock file would split owners.
-    const lock = await acquireLock(path.join(directory, `${name}.flock`), legacy);
+    const lockPath = path.join(directory, `${name}.flock`);
+    // Ownership registries keep this inode permanently (older writers do not
+    // re-check the path); removable registries use the re-check protocol above.
+    const lock = removeLockOnRelease ? await acquireRemovableLock(lockPath, legacy) : await acquireLock(lockPath, legacy);
     try {
       let state = { records: [] };
       try { state = JSON.parse(await fs.readFile(file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -65,7 +112,7 @@ export function createRegistry(directory = statePath('dispatch-ownership')) {
         try { await fs.writeFile(temp, JSON.stringify(state), { mode: 0o600 }); await fs.rename(temp, file); }
         finally { await fs.rm(temp, { force: true }).catch(() => {}); }
       });
-    } finally { await lock.close(); }
+    } finally { if (removeLockOnRelease) await releaseRemovableLock(lock, lockPath); else await lock.close(); }
   };
 }
 export function lineage(sessions, id) {

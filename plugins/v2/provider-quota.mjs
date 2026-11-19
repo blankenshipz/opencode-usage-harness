@@ -2,7 +2,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { packageRoot } from './paths.mjs';
+import fs from 'node:fs/promises';
+import { packageRoot, statePath } from './paths.mjs';
 import { defaultShortWindowPacingStore, SHORT_WINDOW_PACING_IDENTITY } from './short-window-pacing.mjs';
 
 const exec = promisify(execFile);
@@ -191,6 +192,40 @@ export async function readProviderQuotas({ readCodex, readClaude, providers = ['
     }
   })));
   return { version:1,checked_at:iso(clock()),pools };
+}
+
+// Standalone CLI fallback: without an OpenCode session the selected Claude OAuth
+// token is unavailable, but the plugin's private quota cache may hold a recent
+// snapshot. Read only regular, owner-private files; return the newest verified
+// Anthropic snapshot (cache records contain no credentials, only an opaque key).
+export async function readCachedClaudeQuota({ directory = statePath('quota-cache'), now = Date.now(), maxAgeMs = DEFAULT_MAX_AGE_MS } = {}) {
+  let names;
+  try {
+    const stat = await fs.lstat(directory);
+    if (!stat.isDirectory() || stat.uid !== process.getuid()) return null;
+    names = await fs.readdir(directory);
+  } catch { return null; }
+  let newest = null;
+  for (const name of names.filter(n => /^[0-9a-f]{64}\.json$/.test(n))) {
+    let handle;
+    try {
+      handle = await fs.open(path.join(directory, name), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077)) continue;
+      const entry = JSON.parse(await handle.readFile('utf8'));
+      if (entry?.provider !== 'anthropic' || !entry.snapshot || typeof entry.snapshot !== 'object' || !Number.isFinite(entry.verified_at) || entry.verified_at > now + 5_000) continue;
+      if (!newest || entry.verified_at > newest.verified_at) newest = entry;
+    } catch { continue; } finally { await handle?.close().catch(() => {}); }
+  }
+  if (!newest) return null;
+  const { quota_cache: _ignored, ...snapshot } = newest.snapshot;
+  const ageMs = Math.max(0, now - newest.verified_at);
+  // Normalize as of the snapshot time so windows are reported, then label age/staleness.
+  const pool = normalizeClaudeQuota({ ...snapshot, checked_at: snapshot.checked_at ?? iso(newest.verified_at) }, { now, maxAgeMs: Infinity });
+  pool.source = 'quota_cache';
+  pool.cache = { verified_at: iso(newest.verified_at), age_seconds: Math.round(ageMs / 1000), stale: ageMs > maxAgeMs };
+  pool.reason = pool.cache.stale ? 'cached_snapshot_stale' : 'cached_snapshot';
+  return pool;
 }
 
 export async function readCodexQuota({ timeoutMs = 25_000 } = {}) {
