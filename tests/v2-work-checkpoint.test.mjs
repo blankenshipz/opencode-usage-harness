@@ -1,4 +1,6 @@
 import test from 'node:test';
+// Hermetic default: a persisted operator choice must not change these fixtures.
+process.env.HARNESS_COMPACTION_TOKENS = '120000';
 import assert from 'node:assert/strict';
 import { acknowledgeTaskReview, backgroundDispatch, beginCheckpoint, CHECKPOINT_MS, checkpointStatus, contextMaintenance, observedContext, HIGH_CONTEXT_TOKENS, normalizeCheckpoint, normalizeReviewAcknowledgement, prepareCheckpoint, TASK_REVIEW_CONTINUATIONS, TASK_REVIEW_STEPS } from '../plugins/v2/work-checkpoint.mjs';
 
@@ -48,7 +50,7 @@ test('legacy slices retain known progress and explicit acknowledgement advances 
   assert.throws(() => acknowledgeTaskReview(owner, { hypothesis: 'x', evidenceReference: '' }), /invalid task review acknowledgement/);
   assert.throws(() => normalizeReviewAcknowledgement({ hypothesis: 'x', evidenceReference: 'ref', extra: true }), /invalid task review acknowledgement/);
   const tokenOnly = checkpointStatus(owner, 20, { knownContext: { tokens: HIGH_CONTEXT_TOKENS } }).highContext;
-  assert.deepEqual(tokenOnly, { used: HIGH_CONTEXT_TOKENS, advisory: tokenOnly.advisory });
+  assert.deepEqual(tokenOnly, { used: HIGH_CONTEXT_TOKENS, trigger: HIGH_CONTEXT_TOKENS, triggerBasis: 'absolute_tokens', advisory: tokenOnly.advisory });
   assert.equal('ratio' in tokenOnly, false);
 });
 
@@ -107,11 +109,14 @@ test('context maintenance is generation-bound advice at a safe same-owner checkp
 const roomyModel={providerID:'anthropic',id:'fixture-roomy',variant:'medium'};
 const roomyCatalog=[{providerID:'anthropic',id:'fixture-roomy',limit:{context:1000000,output:128000},variants:[{id:'medium'}]}];
 const roomyNative={model:roomyModel,contextModel:roomyModel,contextTokens:142000};
-test('model-aware pressure preserves roomy context below eighty percent of usable input',()=>{
- const observation=observedContext(roomyNative,roomyCatalog);
+test('a roomy known window no longer defers pressure past the absolute token threshold',()=>{
+ // 872k usable input: 80% would be 697,600 tokens, far beyond a useful builder context.
+ const observation=observedContext({...roomyNative,contextTokens:119999},roomyCatalog);
  assert.equal(observation.pressure,'normal');assert.equal(observation.limit,872000);assert.equal(observation.capacityBasis,'catalog_input_budget');
- assert.equal(observedContext({...roomyNative,contextTokens:697599},roomyCatalog).pressure,'normal');
- assert.equal(observedContext({...roomyNative,contextTokens:697600},roomyCatalog).pressure,'high');
+ assert.equal(observation.threshold,120000);assert.equal(observation.thresholdBasis,'absolute_tokens');
+ assert.equal(observedContext(roomyNative,roomyCatalog).pressure,'high');
+ assert.equal(observedContext({...roomyNative,contextTokens:284000},roomyCatalog).pressure,'high');
+ assert.equal(observedContext({...roomyNative,contextTokens:120000},roomyCatalog).pressure,'high');
 });
 test('model-aware budget respects smaller input limits, output reserve and variant overrides',()=>{
  const model={providerID:'demo',id:'small',variant:'medium'};const native={model,contextModel:model,contextTokens:45000};
@@ -133,9 +138,37 @@ test('model-aware pressure never borrows another model or trusts malformed catal
  }
 });
 test('model-aware advice still needs a safe exact-parent checkpoint and never treats a large window as a usage target',()=>{
- const native={...roomyNative,id:'child',active:false,lastAssistantID:'new'};const record={parentID:'parent',childID:'child',state:'completed'};const options={callerID:'parent',compactionAvailable:true,catalog:roomyCatalog};
+ const native={...roomyNative,contextTokens:100000,id:'child',active:false,lastAssistantID:'new'};const record={parentID:'parent',childID:'child',state:'completed'};const options={callerID:'parent',compactionAvailable:true,catalog:roomyCatalog};
  assert.equal(contextMaintenance(record,native,options).recommended,undefined);
  const high={...native,contextTokens:750000};assert.equal(contextMaintenance(record,high,options).eligibleForCompaction,true);
  assert.equal(contextMaintenance(record,{...high,active:true},options).blockedReason,'wait_for_current_work');
  assert.equal(contextMaintenance(record,high,{...options,callerID:'other'}).blockedReason,'recorded_parent_required');
+});
+
+test('absolute compaction threshold: min(absolute, 80% of known window), absolute when unknown',async()=>{
+ const {contextTrigger,compactionTokenThreshold,DEFAULT_COMPACTION_TOKENS,COMPACTION_TOKENS_ENV}=await import('../plugins/v2/work-checkpoint.mjs');
+ assert.equal(DEFAULT_COMPACTION_TOKENS,120000);assert.equal(COMPACTION_TOKENS_ENV,'HARNESS_COMPACTION_TOKENS');
+ assert.deepEqual(contextTrigger(872000,120000),{trigger:120000,basis:'absolute_tokens',absolute:120000});
+ assert.deepEqual(contextTrigger(100000,120000),{trigger:80000,basis:'window_ratio',absolute:120000});
+ assert.deepEqual(contextTrigger(undefined,90000),{trigger:90000,basis:'absolute_tokens',absolute:90000});
+ assert.equal(contextTrigger(undefined,0).trigger,120000);
+ // Small window: 80% cap still applies below the absolute threshold.
+ const model={providerID:'demo',id:'small'};const catalog=[{...model,limit:{context:64000,output:8000}}];
+ const small=observedContext({model,contextModel:model,contextTokens:44800},catalog);
+ assert.equal(small.limit,56000);assert.equal(small.threshold,44800);assert.equal(small.thresholdBasis,'window_ratio');assert.equal(small.pressure,'high');
+ assert.equal(observedContext({model,contextModel:model,contextTokens:44799},catalog).pressure,'normal');
+ // Configurable absolute threshold, explicit option wins over the environment default.
+ assert.equal(observedContext({...roomyNative,contextTokens:150000},roomyCatalog,{threshold:200000}).pressure,'normal');
+ assert.equal(observedContext({...roomyNative,contextTokens:200000},roomyCatalog,{threshold:200000}).pressure,'high');
+ // Resolution order: env, then persisted configure choice, then default; invalid values fall through.
+ const choices=value=>()=>JSON.stringify({shell_policy:'allowlist',compaction_tokens:value});
+ assert.equal(compactionTokenThreshold({env:{HARNESS_COMPACTION_TOKENS:'80000'},readFile:choices(90000)}),80000);
+ assert.equal(compactionTokenThreshold({env:{},readFile:choices(90000)}),90000);
+ assert.equal(compactionTokenThreshold({env:{HARNESS_COMPACTION_TOKENS:'nope'},readFile:choices(90000)}),90000);
+ assert.equal(compactionTokenThreshold({env:{HARNESS_COMPACTION_TOKENS:'5'},readFile:choices('x')}),120000);
+ assert.equal(compactionTokenThreshold({env:{},readFile:()=>{throw Object.assign(new Error('missing'),{code:'ENOENT'});}}),120000);
+ // Status advice uses the same trigger.
+ const record={parentID:'parent',childID:'child',state:'completed'};
+ const advice=contextMaintenance(record,{...roomyNative,id:'child',active:false,lastAssistantID:'new',contextTokens:284000},{callerID:'parent',compactionAvailable:true,catalog:roomyCatalog});
+ assert.equal(advice.pressure,'high');assert.equal(advice.eligibleForCompaction,true);
 });

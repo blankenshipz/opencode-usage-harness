@@ -324,12 +324,30 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
             # The Claude OAuth adapter is loaded only when Anthropic is enabled and a verified build exists.
             + ([Path(claude_auth_plugin).resolve().as_uri()] if claude_auth_plugin is not None and 'anthropic' in providers else [])}
 
+# Absolute context-token trigger for high pressure and compaction eligibility
+# (persisted as compaction_tokens; read by plugins/v2/work-checkpoint.mjs). The
+# effective trigger is min(this, 80% of a known model window). The
+# HARNESS_COMPACTION_TOKENS environment variable overrides the persisted value.
+DEFAULT_COMPACTION_TOKENS = 120000
+MIN_COMPACTION_TOKENS, MAX_COMPACTION_TOKENS = 1000, 10000000
+
+def valid_compaction_tokens(value):
+    return isinstance(value,int) and not isinstance(value,bool) and MIN_COMPACTION_TOKENS <= value <= MAX_COMPACTION_TOKENS
+
+def compaction_tokens_arg(text):
+    try: value=int(text)
+    except ValueError: raise argparse.ArgumentTypeError(f'invalid integer {text!r}')
+    if not valid_compaction_tokens(value):
+        raise argparse.ArgumentTypeError(f'must be between {MIN_COMPACTION_TOKENS} and {MAX_COMPACTION_TOKENS}')
+    return value
+
 def load_choices(path):
     try:
         value=json.loads(path.read_text())
     except FileNotFoundError:
         return {}
-    if not isinstance(value,dict) or value.get('shell_policy',DEFAULT_SHELL_POLICY) not in SHELL_POLICIES or not isinstance(value.get('tmp_scratch',False),bool):
+    if not isinstance(value,dict) or value.get('shell_policy',DEFAULT_SHELL_POLICY) not in SHELL_POLICIES or not isinstance(value.get('tmp_scratch',False),bool) \
+            or not valid_compaction_tokens(value.get('compaction_tokens',DEFAULT_COMPACTION_TOKENS)):
         raise SystemExit(f'{path}: invalid persisted configure choices')
     return value
 
@@ -354,12 +372,14 @@ def main():
     p.add_argument('--shell-policy',choices=SHELL_POLICIES,help=f'Shell permission policy: allowlist (ask for unlisted commands) or permissive (allow all except dangerous commands). Defaults to the previously persisted choice, else {DEFAULT_SHELL_POLICY}')
     p.add_argument('--claude-auth-plugin',type=Path,help='Built, patched opencode-claude-auth 3.0.0 plugin directory (persisted). Default: previously persisted path, else <release>/plugins/v2/claude-auth, else <prefix>/vendor/claude-auth')
     p.add_argument('--allow-tmp-scratch',action=argparse.BooleanOptionalAction,default=None,help='Allow agents to use /tmp/* outside the workspace without an external_directory prompt (persisted; --no-allow-tmp-scratch turns it off). Default: previously persisted choice, else off')
+    p.add_argument('--compaction-tokens',type=compaction_tokens_arg,default=None,metavar='N',help=f'Absolute context tokens that mark a session high-pressure and eligible for compaction, even when a larger model window is known (effective trigger: min(N, 80%% of the window)); persisted. HARNESS_COMPACTION_TOKENS overrides it at runtime. Default: previously persisted choice, else {DEFAULT_COMPACTION_TOKENS}')
     a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
     directory=a.state_dir.expanduser().resolve()/'config';target=directory/'opencode.json'
     choices_path=directory/'configure-choices.json'
     choices=load_choices(choices_path)
     shell_policy=a.shell_policy or choices.get('shell_policy') or DEFAULT_SHELL_POLICY
     tmp_scratch=a.allow_tmp_scratch if a.allow_tmp_scratch is not None else choices.get('tmp_scratch',False)
+    compaction_tokens=a.compaction_tokens if a.compaction_tokens is not None else choices.get('compaction_tokens',DEFAULT_COMPACTION_TOKENS)
     claude_auth=None
     if a.claude_auth_plugin is not None:
         claude_auth=verified_claude_auth_plugin(a.claude_auth_plugin)
@@ -380,6 +400,7 @@ def main():
         backup=target.with_name(f'opencode.backup-{time.time_ns()}.json');backup.write_bytes(target.read_bytes());backup.chmod(0o600)
     atomic_write_text(target,json.dumps(result,indent=2)+'\n')
     new_choices={**choices,'shell_policy':shell_policy,'tmp_scratch':tmp_scratch}
+    if a.compaction_tokens is not None or 'compaction_tokens' in choices: new_choices['compaction_tokens']=compaction_tokens
     if a.claude_auth_plugin is not None: new_choices['claude_auth_plugin']=str(claude_auth)
     atomic_write_text(choices_path,json.dumps(new_choices,indent=2)+'\n')
     policy_path=directory/'routing-policy.json'
@@ -398,6 +419,7 @@ def main():
     if 'anthropic' in result['enabled_providers']: requirements.append('reviewed Claude OAuth adapter and disabled usage credits or explicit local app-managed-credit policy')
     print(f'Shell policy: {shell_policy}.')
     print(f'/tmp scratch (external_directory /tmp/*): {"allowed" if tmp_scratch else "ask"}.')
+    print(f'Compaction token threshold: {compaction_tokens} (or 80% of a smaller known window).')
     if 'anthropic' in result['enabled_providers']:
         if claude_auth is not None: print(f'Claude auth plugin: {claude_auth}.')
         else: print('WARNING: Anthropic is enabled but no built opencode-claude-auth 3.0.0 plugin was found; '

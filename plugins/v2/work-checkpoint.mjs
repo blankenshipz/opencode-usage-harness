@@ -1,4 +1,7 @@
 // Cooperative work slices: no timers, cancellations, extra requests or permission changes.
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { managedConfigRoot } from './paths.mjs';
 export const checkpointSchema = {
   type: 'object', additionalProperties: false,
   properties: {
@@ -21,7 +24,33 @@ export const CHECKPOINT_STEPS = 30;
 export const TASK_REVIEW_STEPS = 120;
 export const TASK_REVIEW_CONTINUATIONS = 6;
 export const HIGH_CONTEXT_RATIO = 0.8;
-export const HIGH_CONTEXT_TOKENS = 120000;
+// Absolute high-pressure/compaction trigger. A very large model window (for
+// example 872k usable input tokens) is headroom, not a target: the trigger is
+// min(absolute, 80% of the known window), or the absolute value when unknown.
+export const DEFAULT_COMPACTION_TOKENS = 120000;
+export const HIGH_CONTEXT_TOKENS = DEFAULT_COMPACTION_TOKENS;
+export const COMPACTION_TOKENS_ENV = 'HARNESS_COMPACTION_TOKENS';
+export const MIN_COMPACTION_TOKENS = 1000, MAX_COMPACTION_TOKENS = 10000000;
+const validThreshold = value => Number.isSafeInteger(value) && value >= MIN_COMPACTION_TOKENS && value <= MAX_COMPACTION_TOKENS;
+// Precedence: HARNESS_COMPACTION_TOKENS, then configure.py's persisted
+// `compaction_tokens` choice, then the default. Invalid values never disable
+// the trigger; they fall through to the next source.
+export function compactionTokenThreshold({ env = process.env, readFile = readFileSync, choicesPath = path.join(managedConfigRoot, 'configure-choices.json') } = {}) {
+  const raw = env?.[COMPACTION_TOKENS_ENV];
+  if (typeof raw === 'string' && /^\d{1,9}$/.test(raw.trim()) && validThreshold(Number(raw.trim()))) return Number(raw.trim());
+  try {
+    const persisted = JSON.parse(readFile(choicesPath, 'utf8'))?.compaction_tokens;
+    if (validThreshold(persisted)) return persisted;
+  } catch { /* missing or unreadable choices keep the default */ }
+  return DEFAULT_COMPACTION_TOKENS;
+}
+// Returns the effective trigger and which rule set it.
+export function contextTrigger(limit, absolute = compactionTokenThreshold()) {
+  const threshold = validThreshold(absolute) ? absolute : DEFAULT_COMPACTION_TOKENS;
+  if (Number.isFinite(limit) && limit > 0 && HIGH_CONTEXT_RATIO * limit < threshold)
+    return { trigger: Math.ceil(HIGH_CONTEXT_RATIO * limit), basis: 'window_ratio', absolute: threshold };
+  return { trigger: threshold, basis: 'absolute_tokens', absolute: threshold };
+}
 
 const positiveLimit = value => Number.isSafeInteger(value) && value > 0;
 const modelIdentity = value => value && ['providerID','id'].every(key=>typeof value[key]==='string' && /^[\w.-]{1,160}$/.test(value[key]))
@@ -80,36 +109,40 @@ function accountingFor(record) {
   return accounting;
 }
 
-function contextAdvisory(knownContext) {
+const HIGH_CONTEXT_ADVISORY = 'Known context is high. Reassess the next hypothesis with retained evidence before adding more work.';
+// High pressure: used >= min(absolute threshold, 80% of a known window), or
+// used >= absolute threshold when the window is unknown.
+function contextAdvisory(knownContext, absolute) {
   if (knownContext === undefined || knownContext === null || (typeof knownContext !== 'number' && (typeof knownContext !== 'object' || Array.isArray(knownContext)))) return undefined;
   const used = typeof knownContext === 'number' ? knownContext : knownContext.used ?? knownContext.tokens ?? knownContext.usedTokens;
-  const limit = typeof knownContext === 'number' ? undefined : knownContext.limit ?? knownContext.maxTokens ?? knownContext.contextWindow;
+  const rawLimit = typeof knownContext === 'number' ? undefined : knownContext.limit ?? knownContext.maxTokens ?? knownContext.contextWindow;
   if (!Number.isFinite(used) || used < 0) return undefined;
-  if (Number.isFinite(limit) && limit > 0) {
-    const ratio = used / limit;
-    return ratio >= HIGH_CONTEXT_RATIO ? { used, limit, ratio, advisory: 'Known context is high. Reassess the next hypothesis with retained evidence before adding more work.' } : undefined;
-  }
-  return used >= HIGH_CONTEXT_TOKENS ? { used, advisory: 'Known context is high. Reassess the next hypothesis with retained evidence before adding more work.' } : undefined;
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
+  const { trigger, basis } = contextTrigger(limit, absolute ?? (typeof knownContext === 'object' ? knownContext.threshold : undefined) ?? compactionTokenThreshold());
+  if (used < trigger) return undefined;
+  return { used, ...(limit ? { limit, ratio: used / limit } : {}), trigger, triggerBasis: basis, advisory: HIGH_CONTEXT_ADVISORY };
 }
 
 // An observation describes a completed model input, not an in-flight placeholder.
 // Unknown usage stays unknown; metadata is allowlisted so status never exports prompts.
-export function observedContext(native, catalog) {
+export function observedContext(native, catalog, { threshold = compactionTokenThreshold() } = {}) {
   const tokens = native?.contextTokens;
   if (!Number.isFinite(tokens) || tokens < 0) return { status: 'unknown' };
   const capacity=observedCapacity(native,catalog);
+  const { trigger, basis } = contextTrigger(capacity.limit, threshold);
   const observation = { status: 'known', tokens, basis: 'last_completed_model_input', ...capacity,
     ...(capacity.limit ? {ratio:tokens/capacity.limit} : {}),
-    pressure: contextAdvisory({ tokens,limit:capacity.limit }) ? 'high' : 'normal' };
+    threshold: trigger, thresholdBasis: basis, absoluteThreshold: contextTrigger(undefined, threshold).trigger,
+    pressure: tokens >= trigger ? 'high' : 'normal' };
   if (Number.isFinite(native.contextObservedAt) && native.contextObservedAt > 0) observation.observedAt = native.contextObservedAt;
   if (typeof native.contextMessageID === 'string' && native.contextMessageID.length <= 160) observation.messageID = native.contextMessageID;
   return observation;
 }
 
 // Advice only. A status read never compacts, resumes, collects or releases a lease.
-export function contextMaintenance(record, native, { callerID, activeDescendants = [], compactionAvailable = false, needsRebind = false, catalog } = {}) {
-  const observation = observedContext(native,catalog);
-  const pressure = contextAdvisory(observation);
+export function contextMaintenance(record, native, { callerID, activeDescendants = [], compactionAvailable = false, needsRebind = false, catalog, threshold = compactionTokenThreshold() } = {}) {
+  const observation = observedContext(native,catalog,{threshold});
+  const pressure = observation.status === 'known' && observation.pressure === 'high';
   if (!pressure) return { ...observation, pressure: observation.status === 'known' ? 'normal' : 'unknown' };
   let blockedReason;
   if (!native || typeof native.active !== 'boolean') blockedReason = 'native_state_unknown';
@@ -154,7 +187,7 @@ export function beginCheckpoint(record, checkpoint, now = Date.now()) {
   if (continuing) accounting.continuations = Math.min(accounting.continuations + 1, 1000000);
   record.workCheckpoint = { startedAt: now, preparedSteps: 0, ...(checkpoint ? { target: checkpoint } : {}) };
 }
-export function checkpointStatus(record, now = Date.now(), { knownContext } = {}) {
+export function checkpointStatus(record, now = Date.now(), { knownContext, threshold } = {}) {
   const slice = record.workCheckpoint;
   if (!slice || !Number.isFinite(slice.startedAt)) return undefined;
   const elapsedMs = Math.max(0, now - slice.startedAt);
@@ -163,7 +196,7 @@ export function checkpointStatus(record, now = Date.now(), { knownContext } = {}
   const sinceReview = { preparedSteps: Math.max(0, accounting.preparedSteps - baseline.preparedSteps), continuations: Math.max(0, accounting.continuations - baseline.continuations) };
   const taskReview = { due: sinceReview.preparedSteps >= TASK_REVIEW_STEPS || sinceReview.continuations >= TASK_REVIEW_CONTINUATIONS,
     sinceReview, limits: { preparedSteps: TASK_REVIEW_STEPS, continuations: TASK_REVIEW_CONTINUATIONS }, baseline: { ...baseline }, ...(accounting.lastReview ? { lastAcknowledgement: { ...accounting.lastReview } } : {}) };
-  const highContext = contextAdvisory(knownContext);
+  const highContext = contextAdvisory(knownContext, threshold);
   return { ...slice, elapsedMs, due: elapsedMs >= CHECKPOINT_MS || slice.preparedSteps >= CHECKPOINT_STEPS,
     cooperative: true, limits: { elapsedMs: CHECKPOINT_MS, preparedSteps: CHECKPOINT_STEPS }, cumulative: { preparedSteps: accounting.preparedSteps, continuations: accounting.continuations }, taskReview, ...(highContext ? { highContext } : {}) };
 }

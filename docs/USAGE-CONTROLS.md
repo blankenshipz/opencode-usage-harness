@@ -71,8 +71,15 @@ binding. The lookup scans at most 64 recent assistant messages.
 
 Full and summary status expose `selfContext` for the caller and `context` for each
 owned child, with observation identity/time, pressure and a safe next action.
-The checkpoint status includes the same high-context advisory at 120,000 observed
-input tokens (or 80% when a context limit is known). Before another substantial
+The checkpoint status includes the same high-context advisory. High pressure and
+compaction eligibility start at `min(absolute, 80% of the known window)` observed
+input tokens, or at the absolute threshold when no window is known. The absolute
+threshold defaults to 120,000 tokens and is configurable: `HARNESS_COMPACTION_TOKENS`
+(environment, wins), else `configure.py --compaction-tokens N` (persisted as
+`compaction_tokens` in `config/configure-choices.json`), else 120,000. A very large
+window (for example 872k usable input tokens, whose 80% is ~698k) therefore no longer
+defers pressure; status reports the effective `threshold` and `thresholdBasis`
+(`absolute_tokens` or `window_ratio`). Before another substantial
 continuation, collect current results, retain a concise checkpoint, then use
 `compact:true` on the same child when `eligibleForCompaction` is true. Active tools
 or descendants, pending admission, stale intent, denied work, an uncollected or

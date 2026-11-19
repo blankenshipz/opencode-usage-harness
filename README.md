@@ -73,13 +73,15 @@ dispatch call open for up to three minutes, then returns the matching outcome fo
 normal same-child admission. Timeout or unavailable observation stays pending;
 the wait never starts child work, wakes an idle coordinator or bypasses a gate.
 Manual-compaction advice uses the actual model catalog and the model attached to
-the last completed input. Pressure starts at 80% of the smaller of an explicit
-input limit and context capacity minus the maximum output allowance. A large
-window is available headroom, not a target to fill. This avoids recommending
-compaction at 120,000 tokens for every model and may preserve reusable cached
-prefixes longer; it does not promise a particular quota saving. Unknown or
-inconsistent model/limit evidence retains the conservative 120,000-token fallback
-and reports why. Native automatic compaction and all safe-checkpoint gates remain
+the last completed input. The usable window is the smaller of an explicit input
+limit and context capacity minus the maximum output allowance. Pressure starts at
+`min(absolute threshold, 80% of that window)`; a large window is available
+headroom, not a target to fill, so an 872k window no longer defers pressure to
+~698k tokens. The absolute threshold defaults to 120,000 tokens
+(`HARNESS_COMPACTION_TOKENS`, else `configure.py --compaction-tokens N`). Smaller
+windows still trigger at 80%. Unknown or inconsistent model/limit evidence uses
+the absolute threshold and reports why. This does not promise a particular quota
+saving; quota is account-wide and shared with agents outside this harness. Native automatic compaction and all safe-checkpoint gates remain
 unchanged. Status exposes the budget, usage ratio and evidence basis for both the
 router and its workers; reading status never initiates compaction or inference.
 Recoverable Codex

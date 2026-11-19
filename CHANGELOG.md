@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — absolute-token compaction trigger
+
+- High context pressure and compaction eligibility now start at `min(absolute, 80% of the known usable window)` observed input tokens, or at the absolute threshold when the window is unknown. Previously a known window disabled the absolute rule, so an 872k window deferred pressure to ~698k tokens while a builder grew to 284k.
+- The absolute threshold defaults to 120000 and is configurable: `HARNESS_COMPACTION_TOKENS` (environment, wins), else `configure.py --compaction-tokens N` (persisted as `compaction_tokens` in `config/configure-choices.json`), else the default. Invalid values fall through to the next source and never disable the trigger.
+- Context observations report the effective `threshold`, `thresholdBasis` (`absolute_tokens` or `window_ratio`) and `absoluteThreshold`; high-context advisories add `trigger` and `triggerBasis`.
+
 ## Unreleased — settle cancelled, interrupted and orphaned dispatches
 
 - At plugin start, stale `starting`/`running` dispatch-ownership rows and in-flight admissions are reconciled against native state. A row whose child's exact native outcome is `failed`/`interrupted`, whose child session is missing, or whose admitting server process has exited (with the child idle) is settled to `interrupted`/`failed`. The settlement is recorded in `reconciliation`, the dead admission marker is cleared, and the row's global writer leases are released, so a new overlapping lane is no longer rejected. Rows are never touched while the owning process is alive, while the child or a descendant is active, or while an unreported native child of the same parent and role is active. A successful child is never marked failed.

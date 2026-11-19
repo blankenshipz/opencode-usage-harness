@@ -335,6 +335,27 @@ class ConfigureTests(unittest.TestCase):
             bad=subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(state),'--replace'],capture_output=True,text=True)
             self.assertNotEqual(bad.returncode,0)
 
+    def test_compaction_token_threshold_is_optional_validated_and_persisted(self):
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); models=root/'models.json'; models.write_text(json.dumps({k:'anthropic/fixture#medium' for k in tiers}))
+            state=root/'state'; config=state/'config'
+            cmd=lambda *extra: [sys.executable,'configure.py','--models',str(models),'--state-dir',str(state),*extra]
+            out=subprocess.run(cmd(),check=True,capture_output=True,text=True)
+            self.assertIn('Compaction token threshold: 120000',out.stdout)
+            self.assertNotIn('compaction_tokens',json.loads((config/'configure-choices.json').read_text()))
+            out=subprocess.run(cmd('--replace','--compaction-tokens','90000'),check=True,capture_output=True,text=True)
+            self.assertIn('Compaction token threshold: 90000',out.stdout)
+            self.assertEqual(json.loads((config/'configure-choices.json').read_text())['compaction_tokens'],90000)
+            subprocess.run(cmd('--replace'),check=True,capture_output=True,text=True)  # no flag keeps the persisted value
+            self.assertEqual(json.loads((config/'configure-choices.json').read_text())['compaction_tokens'],90000)
+            for bad in ('0','999','abc','10000001'):
+                result=subprocess.run(cmd('--replace','--compaction-tokens',bad),capture_output=True,text=True)
+                self.assertNotEqual(result.returncode,0,bad)
+            self.assertEqual(json.loads((config/'configure-choices.json').read_text())['compaction_tokens'],90000)
+            (config/'configure-choices.json').write_text('{"shell_policy":"allowlist","compaction_tokens":true}')
+            self.assertNotEqual(subprocess.run(cmd('--replace'),capture_output=True,text=True).returncode,0)
+
     @staticmethod
     def fake_claude_auth(directory, name='opencode-claude-auth', version='3.0.0'):
         directory=Path(directory); (directory/'dist').mkdir(parents=True)
