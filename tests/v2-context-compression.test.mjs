@@ -213,3 +213,40 @@ test('diagnostics distinguish capacity from unprofitable projections',async t=>{
  assert.equal(await createOutputStore(f.directory)(base,0,original,{...c,text:original},r=>reasons.push(r)),undefined);
  assert.equal(reasons.at(-1),'no_net_saving');
 });
+
+test('structured shell commands are classified narrowly as search or git summaries',()=>{
+ const kind=command=>compressionKind({...base,tool:'shell',input:{command}});
+ for(const command of ['rg -n "foo(bar" src','grep -rn TODO . 2>/dev/null','git grep -n createStore']) assert.equal(kind(command),'search',command);
+ for(const command of ['git status','git status --short && git diff --stat && git log --oneline -20','git -C repo status; echo ---; git log --format="%h %s" -n 30','git diff --stat HEAD~3','git show --stat HEAD','git log --stat -5']) assert.equal(kind(command),'git',command);
+ for(const command of ['rg foo | head','rg x > out','grep -rn $HOME .','git status | head','git status && git diff','git log -p','git show HEAD','git status; cat .env']) assert.equal(kind(command),'json',command);
+ assert.equal(kind('git diff --cached src/app.ts'),'diff');
+});
+test('near-miss structured results are now prepared, with a retrieval marker; protected tools stay verbatim',async t=>{
+ const f=await fixture(t), reasons=[], hooks={};
+ await installContextCompression({tool:{hook:async(n,fn)=>{hooks[n]=fn;}}},{save:createOutputStore(f.directory),diagnostics:{record:e=>reasons.push([e.reason,e.strategy])}});
+ const rows=Array.from({length:40},(_,i)=>`{"id":"dispatch_${i}_7c1e","status":"${i===12?'failed':'completed'}","agent":"harness-builder","model":"anthropic/claude-sonnet-5-5","tokens":${4000+i}${i===12?',"error":"provider quota exhausted: retry after 2026-11-19T18:00Z"':''}}`);
+ const status=`{"state":"ok","quota":{"remaining_percent":41,"reset_ms":1763577600000},"dispatches":[${rows.join(',')}]}`;
+ const grep=Array.from({length:110},(_,i)=>`src/feature-${i%11}/handler.ts:${i+10}:  if (!request.session) throw new SessionError('missing session');`).join('\n');
+ const git=['On branch main','Changes not staged for commit:',...Array.from({length:100},(_,i)=>`\tmodified:   plugins/v2/generated-file-${i}.mjs`),'',' 100 files changed, 900 insertions(+), 12 deletions(-)'].join('\n');
+ const cases=[['execute',{},status,'status-json'],['shell',{command:'rg -n "request.session" src'},grep,'grep-groups'],['shell',{command:'git status && git diff --shortstat'},git,'git-summary']];
+ for(const [tool,input,content,strategy] of cases){
+  assert.ok(content.length>=4096&&content.length<16*1024,strategy);
+  // Before this change these shell outputs were classified 'json' and the status JSON was already minified: no useful projection.
+  if(tool==='shell') assert.equal(compactToolText(content,'json'),undefined);
+  else assert.equal(JSON.stringify(JSON.parse(content)),content);
+  const e={...base,id:strategy,tool,input,status:'completed',result:{content}};
+  await hooks['execute.before'](e);await hooks['execute.after'](e);
+  assert.deepEqual(reasons.at(-1),['prepared',strategy]);
+  assert.ok(e.result.content.includes(`\n[harness compacted ${strategy}; this `));
+  assert.match(e.result.content,/the exact original is saved for retrieval\. Exact original snapshot: /);
+  assert.match(e.result.content,/For bounded retrieval use native read on .*chunks\.jsonl, offset=1, limit=3/);
+ }
+ const statusOut=reasons.length;
+ assert.ok((await fs.readdir(f.directory)).filter(x=>!x.startsWith('.')).length===3);
+ for(const tool of ['task_dispatch_status','read','task_outcome']){
+  const e={...base,id:`p-${tool}`,tool,status:'completed',result:{content:status}};
+  await hooks['execute.before'](e);await hooks['execute.after'](e);
+  assert.equal(e.result.content,status); assert.equal(reasons.at(-1)[0],'protected_tool');
+ }
+ assert.equal(reasons.length,statusOut+3);
+});

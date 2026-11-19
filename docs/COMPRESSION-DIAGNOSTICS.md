@@ -50,3 +50,33 @@ lengths by reason; absent lengths are unknown, not evidence of zero output.
 prepared. These counters never contain source, prompts, paths or model tokens.
 Use actual coverage to choose future transforms; do not lower safety thresholds
 or compress protected reads just to produce a positive savings number.
+
+## Structured projections
+
+Besides the lossless strategies (`json-whitespace`, `json-table`,
+`exact-repeat-lines`, `path-prefix`) and the large-result previews
+(`search-preview`, `diff-context-preview`), three lossy strategies cover
+structured results from the 4 KiB minimum upward:
+
+- `status-json`: JSON with a `status`/`state`/`outcome`/`phase`/`health`
+  field. Long arrays keep their first five entries plus every error entry and
+  end with an omitted count and status counts; identical consecutive entries
+  fold into one with a repeat count; non-error strings over 240 characters are
+  cut. Error fields and failed entries stay verbatim and numbers keep their
+  source spelling.
+- `grep-groups`: text from a single `rg`, `grep` or `git grep` shell command,
+  grouped by file with per-file match counts and the first matches of each
+  file; `rg:`/`grep:` and error lines stay verbatim.
+- `git-summary`: output of `git status`, `log`, `diff --stat`/`--name-only`
+  and similar summary commands, alone or joined with `&&`/`;`/`echo`. Long
+  file and commit lists keep their first entries and a count by status;
+  branch, summary, `fatal:`/`error:`/`warning:` and conflict lines stay verbatim.
+  Commands that can print a patch keep the native result (or the diff preview).
+
+Native `grep` results also get a `search-preview` from 4 KiB. Below 16 KiB a
+lossy projection is used only when no lossless strategy is useful, and every
+projection must still save at least 512 characters and be at most 85% of the
+original. Protected tools (`read`, `edit`, `write`, `patch`, `task_*`) are
+never projected. Every projection ends with the standard
+`[harness compacted …]` marker naming the exact saved original and how to
+read it.

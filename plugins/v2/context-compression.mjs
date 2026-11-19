@@ -13,6 +13,31 @@ const key = e => JSON.stringify([e.sessionID, e.messageID, e.id]);
 const marker = '[harness compacted';
 const MAX_RECORDS = 256, MAX_STORE_BYTES = 128 * 1024 * 1024;
 
+// Shell arguments for structured commands: bare words or simple quoted strings
+// without expansion. Pipes, redirection and substitution disqualify a command.
+const SHELL_ARG = String.raw`(?:[\w./:@,+=~^%-]|'[^'\n]*'|"[^"$\x60\\\n]*")+`;
+const GIT_PREFIX = String.raw`git(?:\s+(?:-C\s+${SHELL_ARG}|--no-pager|-c\s+${SHELL_ARG}))*`;
+const ARGS = String.raw`(?:\s+${SHELL_ARG})*`;
+const SEARCH_COMMAND = new RegExp(String.raw`^(?:rg|grep|egrep|${GIT_PREFIX}\s+grep)${ARGS}(?:\s+2>\/dev\/null)?$`);
+const GIT_SUMMARY_SEGMENT = new RegExp(String.raw`^${GIT_PREFIX}\s+(?:status|log|diff|show|branch|shortlog|stash\s+list|rev-parse|remote|tag)${ARGS}$`);
+const GIT_PATCH_FLAG = /(?:^|\s)(?:-p|-u|--patch|--patch-with-stat|--cc|-c)(?:\s|$)/;
+const GIT_SUMMARY_FLAG = /(?:^|\s)--(?:stat|shortstat|numstat|name-only|name-status|summary|dirstat)\b|(?:^|\s)(?:-s|--no-patch)(?:\s|$)/;
+// Compound status/log/diff-summary commands, optionally joined by echo
+// separators. A segment that can print a patch keeps the native result.
+function gitSummaryCommand(command) {
+  const segments = command.replace(/\s+2>&1(?=\s|$)/g, '').split(/\s*(?:&&|;|\n)\s*/).filter(Boolean);
+  let git = 0;
+  for (const segment of segments) {
+    if (new RegExp(String.raw`^echo${ARGS}$`).test(segment)) continue;
+    if (!GIT_SUMMARY_SEGMENT.test(segment)) return false;
+    const sub = segment.replace(new RegExp(String.raw`^${GIT_PREFIX}\s+`), '');
+    if (/^(?:diff|show)\b/.test(sub) && !GIT_SUMMARY_FLAG.test(sub)) return false;
+    if (/^(?:log|show)\b/.test(sub) && GIT_PATCH_FLAG.test(sub.replace(/^\S+/, ''))) return false;
+    git++;
+  }
+  return git > 0;
+}
+
 export function compressionKind(event) {
   // No speculative classification of third-party tools: unknown means unchanged.
   if (event.tool === 'execute') return 'json';
@@ -23,6 +48,8 @@ export function compressionKind(event) {
     // source reads, pipes and redirection are deliberately excluded.
     if (typeof command !== 'string') return 'json';
     const trimmed = command.trim();
+    if (gitSummaryCommand(trimmed)) return 'git';
+    if (SEARCH_COMMAND.test(trimmed)) return 'search';
     if (/^git diff(?:\s+(?:--[\w-]+(?:=[\w./:@,+-]+)?|[\w./:@,+-]+))*\s*$/.test(trimmed)) return 'diff';
     return /^(?:npm (?:test|run (?:test|build|lint|typecheck))|pnpm (?:test|build|lint|typecheck)|bun test|pytest|python3? -m (?:pytest|unittest)|cargo (?:test|check|build)|go test)(?:\s+[\w./=@,:+-]+)*\s*$/.test(trimmed) ? 'shell' : 'json';
   }
