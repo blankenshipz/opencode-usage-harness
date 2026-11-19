@@ -8,7 +8,7 @@ a later `configure.py --replace` without the flag keeps it. New installs default
 | Policy | Generated global shell rules |
 |---|---|
 | `allowlist` (default) | Global `* ask`, then allows for exactly `pwd`, `git status*`, `git diff*`, `git log*`, `npm test*`, `npm run test*`, `pytest*`, `python3 -m pytest*`, `go test*`, `gofmt *`. Anything else asks. |
-| `permissive` | `shell *` allow, followed by the `DANGEROUS_SHELL_ASK` ask list in `configure.py`: recursive `rm`, `sudo`/`doas`/`su`, `git push`, `git reset --hard`, `git clean -f`, `git checkout -- …`/`.`/`-f`, `git restore`, `git rebase`, `git commit`, `git stash`, `git branch -D`, `--force`/`-f`, `filter-branch`, `update-ref -d`, `chmod`/`chown -R`, bare or flagged `sh`/`bash`/`zsh`/`dash` (pipe-to-shell, `-c`), `eval`, `xargs … rm`, `find -delete`, `dd`, `mkfs`, `shred`, `kill`/`pkill`/`killall`, and secret-looking paths (`*.env*`, `*auth.json*`, `*.pem*`, `*.key*`, `*credentials*`, `*secret*`, `*financial-policy*`, `*external-write-grants*`). |
+| `permissive` | `shell *` allow, followed by the `DANGEROUS_SHELL_ASK` ask list in `configure.py`: recursive `rm`, `sudo`/`doas`/`su`, `git push`, `git reset --hard`, `git clean -f`, `git checkout -- …`/`.`/`-f`, `git restore`, `git rebase`, `git commit`, `git stash`, `git branch -D`, `--force`/`-f`, `filter-branch`, `update-ref -d`, `chmod`/`chown -R`, bare or flagged `sh`/`bash`/`zsh`/`dash` (pipe-to-shell, `-c`), `eval`, `xargs … rm`, `find -delete`, `dd`, `mkfs`, `shred`, `kill`/`pkill`/`killall`, and secret-looking paths (`*.env*`, `*auth.json*`, `*.pem*`, `*.key*`, `*credentials*`, `*secret*`, `*financial-policy*`, `*external-write-grants*`). Env templates (`.env.example`, `.env.sample`, `.env.template` as a whole word, any directory) are allowed after the secret asks and before the command asks, so `rm -rf .env.example` still asks. |
 
 The last matching rule wins. With either policy, the read-only roles (router,
 coordinator, scout, architect, reviewer) keep an agent-level `shell * deny`, and
@@ -27,7 +27,11 @@ It forces a native permission ask, using the full raw command as the resource, w
 
 - an unquoted redirect (`>`, `>>`, `>|`, `&>`, `N>`, `<`, `>&file`) targets a secret-looking
   path (`.env`, `.env.*`, `*credentials*`, `*.pem`, `*.key`, `auth.json`, `*secret*`,
-  `*financial-policy*`, `*external-write-grants*`)
+  `*financial-policy*`, `*external-write-grants*`). Env templates (`.env.example`,
+  `.env.sample`, `.env.template`, case-insensitive basename) are not secret.
+- a segment that the configured rules allow only through an env-template exception still
+  matches an ask/deny rule, or names a secret-looking path, once its template words are
+  removed (`cp .env.example .env`, `diff .env.example .env.local`)
 - a redirect has no command word (`> f`, `true; >> log`)
 - in a compound command (a list, a pipeline, a subshell or `$(…)`), a segment that carries
   a redirect matches an explicit `shell` ask rule. The parser would have dropped that

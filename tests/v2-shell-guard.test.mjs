@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { analyzeShellCommand, scanShell, isSecretPath, installShellGuard, markers } from '../plugins/v2/shell-guard.mjs';
+import { analyzeShellCommand, scanShell, isSecretPath, isEnvTemplatePath, explicitShellEffect, installShellGuard, markers } from '../plugins/v2/shell-guard.mjs';
 
 const PERMISSIVE = [
   { action: '*', resource: '*', effect: 'ask' },
@@ -102,6 +102,46 @@ test('secret path classifier', () => {
     assert.equal(isSecretPath(path), true, path);
   for (const path of ['env.txt', 'environment.md', 'keys.txt', 'report.json', '/dev/null', 'authors.json'])
     assert.equal(isSecretPath(path), false, path);
+});
+
+test('env templates are not secret paths, real env files are', () => {
+  for (const path of ['.env.example', 'apps/api/.env.sample', '/w/.ENV.Template', 'C:\\repo\\.env.example'])
+    assert.equal(isSecretPath(path), false, path);
+  for (const path of ['.env', '.env.local', '.env.production', '.env.development.local', '.env.example.bak', 'secrets/.env.example'])
+    assert.equal(isSecretPath(path), true, path);
+  assert.equal(isEnvTemplatePath('x.env.example'), false);
+});
+
+// Mirrors configure.py's permissive order: secret asks, env-template allows, command asks.
+const TEMPLATE_RULES = ['.env.example', '.env.sample', '.env.template'].flatMap(name =>
+  [`* ${name}`, `* ${name} *`, `* */${name}`, `* */${name} *`].map(resource => ({ action: 'shell', resource, effect: 'allow' })));
+const PERMISSIVE_TEMPLATES = [
+  { action: '*', resource: '*', effect: 'ask' },
+  { action: 'shell', resource: '*', effect: 'allow' },
+  ...['*.env*', '*.pem*', '*secret*'].map(resource => ({ action: 'shell', resource, effect: 'ask' })),
+  ...TEMPLATE_RULES,
+  { action: 'shell', resource: 'rm -rf *', effect: 'ask' },
+  { action: 'shell', resource: 'mkfs*', effect: 'deny' },
+];
+
+test('env templates pass under permissive rules, other secrets beside them still ask', () => {
+  for (const command of ['cat .env.example', 'cp apps/api/.env.sample notes.txt', 'grep -n KEY .env.template',
+    'echo A=1 >> .env.example', 'cd apps && cat config/.env.example'])
+    assert.equal(analyzeShellCommand(command, PERMISSIVE_TEMPLATES).action, 'allow', command);
+  for (const command of ['cp .env.example .env', 'diff .env.example .env.local', 'cat .env.example cert.pem',
+    'cat .env.example > .env', 'grep secret .env.example', 'cat .env.example .env.production'])
+    assert.equal(analyzeShellCommand(command, PERMISSIVE_TEMPLATES).action, 'ask', command);
+  assert.equal(analyzeShellCommand('mkfs .env.example', PERMISSIVE_TEMPLATES).action, 'allow', 'native deny still applies');
+  // Native evaluation (last match wins) of single commands under these rules.
+  const native = command => explicitShellEffect(command, PERMISSIVE_TEMPLATES)?.effect;
+  assert.equal(native('cat .env.example'), 'allow');
+  assert.equal(native('cat sub/.env.sample'), 'allow');
+  assert.equal(native('cat .env'), 'ask');
+  assert.equal(native('cat .env.local'), 'ask');
+  assert.equal(native('cat .env.example.bak'), 'ask');
+  assert.equal(native('rm -rf .env.example'), 'ask');
+  // Without template exceptions (allowlist policy) the guard adds no extra prompt.
+  assert.equal(analyzeShellCommand('diff .env.example .env', ALLOWLIST).action, 'allow');
 });
 
 function fakeContext({ permissions = PERMISSIVE, assertImpl, permissionApi = true } = {}) {

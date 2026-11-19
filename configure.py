@@ -146,15 +146,27 @@ ALLOWLIST_SHELL_ALLOW = ('pwd','git status*','git diff*','git log*','npm test*',
 # Permissive shell policy: allow by default, ask only for clearly dangerous commands.
 # Lexical, not a sandbox: e.g. `bash -c '...'` contents are not parsed, so those ask.
 _RM_RECURSIVE = ('-r', '-R', '-rf', '-fr', '-Rf', '-fR', '-rF', '-Fr', '-rfv', '-vrf', '-frv', '-rvf', '-fvr', '-vfr', '--recursive')
-DANGEROUS_SHELL_ASK = tuple(p for flag in _RM_RECURSIVE for p in (f'rm {flag} *', f'rm * {flag} *', f'rm * {flag}')) + (
+DANGEROUS_COMMAND_ASK = tuple(p for flag in _RM_RECURSIVE for p in (f'rm {flag} *', f'rm * {flag} *', f'rm * {flag}')) + (
     'sudo *', '* sudo *', 'doas *', 'su', 'su *',
     'git push*', 'git reset *--hard*', 'git clean *-*f*', 'git checkout -- *', 'git checkout * -- *', 'git checkout .',
     'git checkout -f*', 'git restore *', 'git rebase*', 'git commit*', 'git stash*', 'git branch -D*', 'git branch * -D*',
     'git * --force*', 'git * -f', 'git filter-branch*', 'git update-ref -d*',
     'chmod -R*', 'chmod * -R*', 'chown -R*', 'chown * -R*',
     'sh', 'bash', 'zsh', 'dash', 'sh -*', 'bash -*', 'zsh -*', 'dash -*', 'eval *', 'xargs *rm *', 'find *-delete*',
-    'dd *', 'mkfs*', 'shred *', 'kill *', 'pkill *', 'killall *',
-    '*.env*', '*auth.json*', '*.pem*', '*.key*', '*credentials*', '*secret*', '*financial-policy*', '*external-write-grants*')
+    'dd *', 'mkfs*', 'shred *', 'kill *', 'pkill *', 'killall *')
+SECRET_SHELL_ASK = ('*.env*', '*auth.json*', '*.pem*', '*.key*', '*credentials*', '*secret*', '*financial-policy*', '*external-write-grants*')
+DANGEROUS_SHELL_ASK = DANGEROUS_COMMAND_ASK + SECRET_SHELL_ASK
+# Committed env templates hold placeholder values, not secrets. Exceptions match the exact
+# basename (any directory) and follow the secret deny/ask rules they relax (last match wins).
+# Real .env, .env.local, .env.production, ... stay protected.
+ENV_TEMPLATE_NAMES = ('.env.example', '.env.sample', '.env.template')
+SECRET_FILE_DENY = ('*.env','*.env.*','*auth.json','*.pem','*.key','*anthropic-financial-policy.json','*external-write-grants.json')
+ENV_TEMPLATE_FILE_ALLOW = tuple(p for name in ENV_TEMPLATE_NAMES for p in (name, f'*/{name}'))
+# Shell resources are whole command strings: allow a template only as a space-separated word.
+# These sit after the secret asks but before the dangerous-command asks, so `rm -rf .env.example`
+# still asks; the shell guard re-asks when a template appears next to another secret word.
+ENV_TEMPLATE_SHELL_ALLOW = tuple(p for name in ENV_TEMPLATE_NAMES
+                                 for p in (f'* {name}', f'* {name} *', f'* */{name}', f'* */{name} *'))
 CLAUDE_AUTH_PACKAGE = ('opencode-claude-auth', '3.0.0')
 
 def verified_claude_auth_plugin(directory):
@@ -217,7 +229,9 @@ def shell_rules(shell_policy):
         return [{'action':'shell','resource':command,'effect':'allow'} for command in ALLOWLIST_SHELL_ALLOW]
     if shell_policy == 'permissive':
         return ([{'action':'shell','resource':'*','effect':'allow'}] +
-                [{'action':'shell','resource':command,'effect':'ask'} for command in DANGEROUS_SHELL_ASK])
+                [{'action':'shell','resource':p,'effect':'ask'} for p in SECRET_SHELL_ASK] +
+                [{'action':'shell','resource':p,'effect':'allow'} for p in ENV_TEMPLATE_SHELL_ALLOW] +
+                [{'action':'shell','resource':command,'effect':'ask'} for command in DANGEROUS_COMMAND_ASK])
     raise ValueError(f'shell_policy must be one of {", ".join(SHELL_POLICIES)}')
 
 # Opt-in scratch space outside the workspace (--allow-tmp-scratch; persisted). Only the native
@@ -267,9 +281,10 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
             # Native permissions are lexical; this is not a filesystem sandbox.
             rules += [{'action':'edit','resource':p,'effect':'allow'}
                       for p in ('.artifacts/*', '*/.artifacts/*')]
-            rules += [{'action':'edit','resource':p,'effect':'deny'} for p in
-                      ('*.env','*.env.*','*auth.json','*.pem','*.key',
-                       '*anthropic-financial-policy.json','*external-write-grants.json')]
+            rules += [{'action':'edit','resource':p,'effect':'deny'} for p in SECRET_FILE_DENY]
+            # Env templates are not secrets, but the verifier still writes only under .artifacts.
+            rules += [{'action':'edit','resource':f'{root}.artifacts/{sub}{name}','effect':'allow'}
+                      for root in ('', '*/') for sub in ('', '*/') for name in ENV_TEMPLATE_NAMES]
 
         identity_guidance = ('\nUse visible harness-* IDs for new handoffs. When continuing an existing worker, '
                              'pass its exact stored agent ID and sessionID; never rename or adopt it.')
@@ -297,7 +312,8 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
     permissions = [{'action':'*','resource':'*','effect':'ask'}]
     permissions += [{'action':a,'resource':'*','effect':'allow'} for a in ('read','glob','grep','edit','webfetch','codex_quota','model_status','task_contract','task_intent','task_artifact','task_dispatch_status','task_outcome','large_file_check','large_file_summary','subscription_quota','repo_identity')]
     for action in ('read','edit'):
-        permissions += [{'action':action,'resource':p,'effect':'deny'} for p in ('*.env','*.env.*','*auth.json','*.pem','*.key','*anthropic-financial-policy.json','*external-write-grants.json')]
+        permissions += [{'action':action,'resource':p,'effect':'deny'} for p in SECRET_FILE_DENY]
+        permissions += [{'action':action,'resource':p,'effect':'allow'} for p in ENV_TEMPLATE_FILE_ALLOW]
     permissions += shell_permissions
     if tmp_scratch:
         permissions += [dict(rule) for rule in TMP_SCRATCH_RULES]

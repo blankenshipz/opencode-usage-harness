@@ -15,15 +15,23 @@ const SECRET_BASENAME = [
   /^\.env$/i, /^\.env\..+/i, /credentials/i, /\.pem$/i, /\.key$/i, /^auth\.json$/i,
   /secret/i, /financial-policy/i, /external-write-grants/i,
 ];
+// Committed env templates hold placeholders, not secrets (exact basename, any directory).
+const ENV_TEMPLATE_BASENAME = /^\.env\.(example|sample|template)$/i;
 const GUARD_MARKER = 'harnessShellGuard';
 const PROBE_MARKER = 'harnessPermissionProbe';
+
+export function isEnvTemplatePath(target) {
+  if (typeof target !== 'string' || !target) return false;
+  const base = target.replaceAll('\\', '/').split('/').filter(Boolean).at(-1) ?? '';
+  return ENV_TEMPLATE_BASENAME.test(base);
+}
 
 export function isSecretPath(target) {
   if (typeof target !== 'string' || !target) return false;
   const normalized = target.replaceAll('\\', '/');
   const parts = normalized.split('/').filter(Boolean);
   const base = parts.at(-1) ?? '';
-  if (SECRET_BASENAME.some(pattern => pattern.test(base))) return true;
+  if (!isEnvTemplatePath(target) && SECRET_BASENAME.some(pattern => pattern.test(base))) return true;
   // Directory components named like secrets (e.g. secrets/token.txt, .env.d/x).
   return parts.slice(0, -1).some(part => /secret|credentials/i.test(part));
 }
@@ -168,6 +176,20 @@ export function analyzeShellCommand(command, rules = []) {
     for (const redirect of segment.redirects) {
       if (redirect.file && isSecretPath(redirect.target))
         reasons.push(`redirect ${redirect.op} targets secret-looking path ${JSON.stringify(redirect.target)}`);
+    }
+    // Configured shell rules may allow env templates after the secret asks. A template must
+    // not carry another secret word through that exception (e.g. `cp .env.example .env`):
+    // when the rules would allow the segment, re-evaluate it without its template words.
+    if (segment.words.some(isEnvTemplatePath) && explicitShellEffect(segment.text, rules)?.effect === 'allow') {
+      const rest = segment.words.filter(word => !isEnvTemplatePath(word));
+      const matched = explicitShellEffect(rest.join(' '), rules);
+      const secretWord = rest.find(isSecretPath);
+      if (matched && matched.effect !== 'allow') {
+        reasons.push(`segment ${JSON.stringify(segment.text.slice(0, 200))} names an env template together with input matching shell ${matched.effect} rule ${JSON.stringify(matched.pattern)}`);
+        if (matched.effect === 'deny') action = 'deny';
+      } else if (secretWord !== undefined) {
+        reasons.push(`segment ${JSON.stringify(segment.text.slice(0, 200))} names an env template together with secret-looking path ${JSON.stringify(secretWord)}`);
+      }
     }
     if (!segment.hasCommand && segment.redirects.some(redirect => redirect.file))
       reasons.push(`bare redirection ${JSON.stringify(segment.text)} has no command, so OpenCode would not check it`);

@@ -1,3 +1,4 @@
+import re
 import unittest
 import copy
 import json
@@ -7,7 +8,7 @@ import subprocess
 import tempfile
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from configure import profile, namespace_harness_agents, DANGEROUS_SHELL_ASK, ALLOWLIST_SHELL_ALLOW, BUILDER_FILE_WRITE_GUIDANCE, atomic_write_text
+from configure import profile, namespace_harness_agents, DANGEROUS_SHELL_ASK, ENV_TEMPLATE_SHELL_ALLOW, ALLOWLIST_SHELL_ALLOW, BUILDER_FILE_WRITE_GUIDANCE, atomic_write_text
 
 class ConfigureTests(unittest.TestCase):
     def test_roles_and_safe_public_defaults(self):
@@ -92,6 +93,39 @@ class ConfigureTests(unittest.TestCase):
                          '.artifacts/check/auth.json','.artifacts/check/private.key',
                          '.artifacts/check/external-write-grants.json'):
             self.assertEqual(effect(resource), 'deny')
+
+    def test_env_templates_are_not_secrets_but_real_env_files_stay_protected(self):
+        def native(rules, action, resource):
+            # OpenCode 2.0.30 Wildcard.match + Permission.evaluate: last matching rule wins.
+            def match(value, pattern):
+                escaped = re.sub(r'[.+^${}()|[\]\\]', lambda m: '\\'+m.group(0), pattern).replace('*','.*').replace('?','.')
+                if escaped.endswith(' .*'): escaped = escaped[:-3]+'( .*)?'
+                return re.fullmatch(escaped, value, re.S) is not None
+            found = [r['effect'] for r in rules if match(action, r['action']) and match(resource, r['resource'])]
+            return found[-1] if found else None
+        templates = ('.env.example','apps/api/.env.sample','/workspace/app/.env.template')
+        secrets = ('.env','.env.local','apps/api/.env.production','/w/.env.development.local','.env.example.bak','id.key')
+        for policy in ('allowlist','permissive'):
+            p = profile({t:'openai/example#medium' for t in ('FAST','BALANCED','STRONG','MAXIMUM')}, shell_policy=policy)
+            builder = p['permissions'] + p['agents']['harness-builder']['permissions']
+            for action in ('read','edit'):
+                for resource in templates: self.assertEqual(native(builder, action, resource), 'allow', (policy, action, resource))
+                for resource in secrets: self.assertEqual(native(builder, action, resource), 'deny', (policy, action, resource))
+            # Read-only roles still cannot edit templates.
+            scout = p['permissions'] + p['agents']['harness-scout']['permissions']
+            self.assertEqual(native(scout, 'edit', '.env.example'), 'deny')
+            verifier = p['permissions'] + p['agents']['harness-verifier']['permissions']
+            self.assertEqual(native(verifier, 'edit', 'app/.env.example'), 'deny')
+            self.assertEqual(native(verifier, 'edit', '.artifacts/check/.env.example'), 'allow')
+            self.assertEqual(native(verifier, 'edit', '/w/.artifacts/.env.sample'), 'allow')
+            self.assertEqual(native(verifier, 'edit', '.artifacts/check/.env.local'), 'deny')
+            if policy == 'permissive':
+                for command in ('cat .env.example','cat apps/api/.env.sample','head -5 .env.template'):
+                    self.assertEqual(native(builder, 'shell', command), 'allow', command)
+                for command in ('cat .env','cat .env.local','cat .env.example.bak','rm -rf .env.example','git commit -m x .env.example'):
+                    self.assertEqual(native(builder, 'shell', command), 'ask', command)
+            else:
+                self.assertFalse(any(r['resource'] in ENV_TEMPLATE_SHELL_ALLOW for r in builder if r['action']=='shell'))
 
     def test_namespace_helper_is_idempotent_and_preserves_hidden_compatibility(self):
         agents = {'router': {'system': 'router', 'permissions': [
@@ -228,8 +262,9 @@ class ConfigureTests(unittest.TestCase):
         permissive=profile(models,shell_policy='permissive')
         shell=[r for r in permissive['permissions'] if r['action']=='shell']
         self.assertEqual(shell[0],{'action':'shell','resource':'*','effect':'allow'})
-        self.assertEqual([r['resource'] for r in shell[1:]],list(DANGEROUS_SHELL_ASK))
-        self.assertTrue(all(r['effect']=='ask' for r in shell[1:]))
+        asks=[r['resource'] for r in shell[1:] if r['effect']=='ask']
+        self.assertEqual(sorted(asks),sorted(DANGEROUS_SHELL_ASK))
+        self.assertTrue(all(r['effect']=='ask' or r['resource'] in ENV_TEMPLATE_SHELL_ALLOW for r in shell[1:]))
         for required in ('git push*','sudo *','rm -rf *','*.env*','bash -*','eval *','git commit*'):
             self.assertIn(required,DANGEROUS_SHELL_ASK)
         # Read-only roles keep their agent-level shell deny, which follows the global allow.
