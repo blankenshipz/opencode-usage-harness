@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from configure import profile, namespace_harness_agents
+from configure import profile, namespace_harness_agents, DANGEROUS_SHELL_ASK, ALLOWLIST_SHELL_ALLOW, BUILDER_FILE_WRITE_GUIDANCE, atomic_write_text
 
 class ConfigureTests(unittest.TestCase):
     def test_roles_and_safe_public_defaults(self):
@@ -202,5 +202,72 @@ class ConfigureTests(unittest.TestCase):
                 generated=json.loads((state/'config'/'opencode.json').read_text())
                 self.assertIn(protected,generated['permissions'])
                 self.assertIn(protected,generated['agents']['harness-builder']['permissions'])
+
+    def test_shell_policy_allowlist_default_and_permissive_option(self):
+        models={k:'anthropic/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')}
+        default=profile(models)
+        shell=[r for r in default['permissions'] if r['action']=='shell']
+        self.assertEqual(shell,[{'action':'shell','resource':c,'effect':'allow'} for c in ALLOWLIST_SHELL_ALLOW])
+        self.assertNotIn({'action':'shell','resource':'*','effect':'allow'},default['permissions'])
+        self.assertEqual(default['permissions'][0],{'action':'*','resource':'*','effect':'ask'})
+        permissive=profile(models,shell_policy='permissive')
+        shell=[r for r in permissive['permissions'] if r['action']=='shell']
+        self.assertEqual(shell[0],{'action':'shell','resource':'*','effect':'allow'})
+        self.assertEqual([r['resource'] for r in shell[1:]],list(DANGEROUS_SHELL_ASK))
+        self.assertTrue(all(r['effect']=='ask' for r in shell[1:]))
+        for required in ('git push*','sudo *','rm -rf *','*.env*','bash -*','eval *','git commit*'):
+            self.assertIn(required,DANGEROUS_SHELL_ASK)
+        # Read-only roles keep their agent-level shell deny, which follows the global allow.
+        for role in ('harness-router','harness-scout','harness-reviewer'):
+            self.assertIn({'action':'shell','resource':'*','effect':'deny'},permissive['agents'][role]['permissions'])
+        for generated in (default,permissive):
+            for role in ('harness-builder','harness-quick-builder','builder'):
+                self.assertTrue(generated['agents'][role]['system'].endswith(BUILDER_FILE_WRITE_GUIDANCE))
+            self.assertNotIn(BUILDER_FILE_WRITE_GUIDANCE,generated['agents']['harness-verifier']['system'])
+        with self.assertRaises(ValueError):
+            profile(models,shell_policy='yolo')
+
+    def test_readonly_roles_get_repo_identity_instead_of_shell(self):
+        p=profile({k:'anthropic/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
+        self.assertIn({'action':'repo_identity','resource':'*','effect':'allow'},p['permissions'])
+        router=p['agents']['harness-router']
+        self.assertIn({'action':'shell','resource':'*','effect':'deny'},router['permissions'])
+        self.assertIn('repo_identity',router['system'])
+        self.assertNotIn('repo_identity',p['agents']['harness-builder']['system'])
+
+    def test_shell_policy_choice_is_persisted_across_replace(self):
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); models=root/'models.json'; models.write_text(json.dumps({k:'anthropic/fixture#medium' for k in tiers}))
+            state=root/'state'; config=state/'config'
+            run=lambda *extra: subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(state),*extra],check=True,capture_output=True,text=True)
+            run()
+            self.assertEqual(json.loads((config/'configure-choices.json').read_text()),{'shell_policy':'allowlist'})
+            out=run('--replace','--shell-policy','permissive')
+            self.assertIn('Shell policy: permissive',out.stdout)
+            generated=json.loads((config/'opencode.json').read_text())
+            self.assertIn({'action':'shell','resource':'*','effect':'allow'},generated['permissions'])
+            run('--replace')  # no flag: keeps the persisted permissive choice
+            generated=json.loads((config/'opencode.json').read_text())
+            self.assertIn({'action':'shell','resource':'*','effect':'allow'},generated['permissions'])
+            run('--replace','--shell-policy','allowlist')
+            generated=json.loads((config/'opencode.json').read_text())
+            self.assertNotIn({'action':'shell','resource':'*','effect':'allow'},generated['permissions'])
+            self.assertEqual(oct((config/'opencode.json').stat().st_mode & 0o777),'0o600')
+            self.assertEqual([p.name for p in config.iterdir() if p.name.endswith('.tmp')],[])
+            (config/'configure-choices.json').write_text('{"shell_policy":"bogus"}')
+            bad=subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(state),'--replace'],capture_output=True,text=True)
+            self.assertNotEqual(bad.returncode,0)
+
+    def test_profile_write_is_atomic_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target=Path(tmp)/'opencode.json'; target.write_text('{"old":true}')
+            inode=target.stat().st_ino
+            atomic_write_text(target,'{"new":true}\n')
+            self.assertEqual(target.read_text(),'{"new":true}\n')
+            # Replaced by rename (new inode), never truncated in place.
+            self.assertNotEqual(target.stat().st_ino,inode)
+            self.assertEqual(oct(target.stat().st_mode & 0o777),'0o600')
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()),['opencode.json'])
 
 if __name__=='__main__':unittest.main()

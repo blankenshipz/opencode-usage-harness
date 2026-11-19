@@ -44,3 +44,17 @@ requires the reviewed adapter and disabled usage credits. A Claude-only profile
 does not require Codex CLI. Use local fake-provider negative tests first; never use a paid request to test a financial guard.
 
 OpenChamber is an optional UI. Install and configure it separately against the same backend and state. The toolkit does not modify launchd/systemd, relay pairing, passwords, or listening addresses.
+
+## Known 2.0.30 permission and reload gaps
+
+- Shell parser: redirects after `&&`/`|` lose their command, and a bare `> f` has no
+  permission check. The harness shell guard covers this. See [SHELL-PERMISSIONS.md](SHELL-PERMISSIONS.md).
+- Pending asks are not re-evaluated on config reload. The harness re-checks them after
+  `config.updated`/`agent.updated` and replies `once` only for requests that are now allowed.
+- Agent registry after a config write: `GET /api/agent/<name>` was observed to return 404 for about
+  1–3 s after the profile was rewritten. `configure.py` now writes the profile and its
+  choices file atomically (private temp file, fsync, rename), so the runtime never reads a
+  truncated profile. If a short 404 window remains, it comes from OpenCode's own reload. During
+  it, missing agents evaluate as deny-all (`missingAgentPermissions`), so no permission is
+  granted by mistake, but a tool call in that window can be denied. Rewrite the profile at an
+  idle point.

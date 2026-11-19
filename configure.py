@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -133,7 +134,41 @@ def namespace_harness_agents(agents):
             permissions[:] = expanded
     return result
 
-def profile(models, package_root=ROOT, routing_policy=None):
+# Shell policies (selectable with --shell-policy; persisted in config/configure-choices.json).
+# Native shell permissions match each parsed command separately (cd/pushd become directory
+# checks); a command's resource includes its own redirections; the last matching rule wins.
+# OpenCode 2.0.30 drops redirects after && and skips bare `> f`; the task-outcomes plugin's
+# raw-command shell guard covers those gaps under either policy.
+ALLOWLIST_SHELL_ALLOW = ('pwd','git status*','git diff*','git log*','npm test*','npm run test*','pytest*','python3 -m pytest*','go test*','gofmt *')
+# Permissive shell policy: allow by default, ask only for clearly dangerous commands.
+# Lexical, not a sandbox: e.g. `bash -c '...'` contents are not parsed, so those ask.
+_RM_RECURSIVE = ('-r', '-R', '-rf', '-fr', '-Rf', '-fR', '-rF', '-Fr', '-rfv', '-vrf', '-frv', '-rvf', '-fvr', '-vfr', '--recursive')
+DANGEROUS_SHELL_ASK = tuple(p for flag in _RM_RECURSIVE for p in (f'rm {flag} *', f'rm * {flag} *', f'rm * {flag}')) + (
+    'sudo *', '* sudo *', 'doas *', 'su', 'su *',
+    'git push*', 'git reset *--hard*', 'git clean *-*f*', 'git checkout -- *', 'git checkout * -- *', 'git checkout .',
+    'git checkout -f*', 'git restore *', 'git rebase*', 'git commit*', 'git stash*', 'git branch -D*', 'git branch * -D*',
+    'git * --force*', 'git * -f', 'git filter-branch*', 'git update-ref -d*',
+    'chmod -R*', 'chmod * -R*', 'chown -R*', 'chown * -R*',
+    'sh', 'bash', 'zsh', 'dash', 'sh -*', 'bash -*', 'zsh -*', 'dash -*', 'eval *', 'xargs *rm *', 'find *-delete*',
+    'dd *', 'mkfs*', 'shred *', 'kill *', 'pkill *', 'killall *',
+    '*.env*', '*auth.json*', '*.pem*', '*.key*', '*credentials*', '*secret*', '*financial-policy*', '*external-write-grants*')
+SHELL_POLICIES = ('allowlist', 'permissive')
+DEFAULT_SHELL_POLICY = 'allowlist'
+BUILDER_FILE_WRITE_GUIDANCE = ('\nWrite files with the edit/write tool, not shell heredocs, echo or other redirection; '
+                               'shell output already includes stderr, so omit 2>&1 and > redirects.')
+READONLY_IDENTITY_GUIDANCE = ('\nYou have no shell. For the working directory, git toplevel, branch, HEAD and dirty state, '
+                              'call repo_identity instead of asking for pwd or git commands.')
+
+def shell_rules(shell_policy):
+    if shell_policy == 'allowlist':
+        return [{'action':'shell','resource':command,'effect':'allow'} for command in ALLOWLIST_SHELL_ALLOW]
+    if shell_policy == 'permissive':
+        return ([{'action':'shell','resource':'*','effect':'allow'}] +
+                [{'action':'shell','resource':command,'effect':'ask'} for command in DANGEROUS_SHELL_ASK])
+    raise ValueError(f'shell_policy must be one of {", ".join(SHELL_POLICIES)}')
+
+def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT_SHELL_POLICY):
+    shell_permissions = shell_rules(shell_policy)
     if not isinstance(models, dict):
         raise ValueError('models must be a tier-reference object')
     for tier in ('FAST', 'BALANCED', 'STRONG', 'MAXIMUM'):
@@ -182,6 +217,10 @@ def profile(models, package_root=ROOT, routing_policy=None):
                              'pass its exact stored agent ID and sessionID; never rename or adopt it.')
         definition = {'description':f'harness {role.replace("-", " ")}', 'mode':'primary' if role == 'router' else 'all',
             'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance+(INTENT_FIRST_GUIDANCE if delegate else ''), 'permissions':rules}
+        if 'builder' in role:
+            definition['system'] += BUILDER_FILE_WRITE_GUIDANCE
+        if readonly:
+            definition['system'] += READONLY_IDENTITY_GUIDANCE
         if role == 'verifier':
             definition['system'] += '\nExecute the assigned checks and report commands, exit codes and findings. Do not implement production repairs. Create verification scripts and fixtures only in the explicitly assigned .artifacts directory; reserve that directory in writePaths before writing. Never use artifact paths or symlinks to evade a production edit denial. Shell execution can write artifacts; retain declared workspace ownership and all native approvals. This role is not a read-only sandbox.'
         agents[visible_role(role)] = definition
@@ -198,14 +237,34 @@ def profile(models, package_root=ROOT, routing_policy=None):
         if builtin == 'explore':
             agents[builtin]['permissions'].append({'action':'edit','resource':'*','effect':'deny'})
     permissions = [{'action':'*','resource':'*','effect':'ask'}]
-    permissions += [{'action':a,'resource':'*','effect':'allow'} for a in ('read','glob','grep','edit','webfetch','codex_quota','model_status','task_contract','task_intent','task_artifact','task_dispatch_status','task_outcome','large_file_check','large_file_summary','subscription_quota')]
+    permissions += [{'action':a,'resource':'*','effect':'allow'} for a in ('read','glob','grep','edit','webfetch','codex_quota','model_status','task_contract','task_intent','task_artifact','task_dispatch_status','task_outcome','large_file_check','large_file_summary','subscription_quota','repo_identity')]
     for action in ('read','edit'):
         permissions += [{'action':action,'resource':p,'effect':'deny'} for p in ('*.env','*.env.*','*auth.json','*.pem','*.key','*anthropic-financial-policy.json','*external-write-grants.json')]
-    for command in ('pwd','git status*','git diff*','git log*','npm test*','npm run test*','pytest*','python3 -m pytest*','go test*','gofmt *'):
-        permissions.append({'action':'shell','resource':command,'effect':'allow'})
+    permissions += shell_permissions
     return {'$schema':'https://opencode.ai/v2/config.json','enabled_providers':providers,'experimental':{'policies':[{'effect':'deny','action':'provider.use','resource':'*'}]+[{'effect':'allow','action':'provider.use','resource':provider} for provider in providers]},'share':'disabled','update':'disable',
         'default_agent':'harness-router','model':models['STRONG'],'permissions':permissions,'agents':agents,
         'plugins':[(package_root/'plugins/v2'/p).resolve().as_uri() for p in ('subscription-guard','model-status','task-outcomes','large-file-context')]}
+
+def load_choices(path):
+    try:
+        value=json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value,dict) or value.get('shell_policy',DEFAULT_SHELL_POLICY) not in SHELL_POLICIES:
+        raise SystemExit(f'{path}: invalid persisted configure choices')
+    return value
+
+def atomic_write_text(target,text):
+    """Write via a private temp file + rename so a watching runtime never reads a partial profile."""
+    fd,temporary=tempfile.mkstemp(dir=target.parent,prefix=f'.{target.name}.',suffix='.tmp')
+    try:
+        with os.fdopen(fd,'w') as handle:
+            handle.write(text);handle.flush();os.fsync(handle.fileno())
+        os.chmod(temporary,0o600);os.replace(temporary,target)
+    except BaseException:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
+        raise
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -213,16 +272,21 @@ def main():
     p.add_argument('--state-dir',type=Path,default=Path(os.environ.get('HARNESS_STATE_DIR',str(Path.home()/'.local/state/opencode-usage-harness'))))
     p.add_argument('--replace',action='store_true',help='Back up and replace this generated profile explicitly')
     p.add_argument('--routing-policy',type=Path,help='Explicit reviewed candidate policy; requires separately installed/authenticated subscription plugins')
+    p.add_argument('--shell-policy',choices=SHELL_POLICIES,help=f'Shell permission policy: allowlist (ask for unlisted commands) or permissive (allow all except dangerous commands). Defaults to the previously persisted choice, else {DEFAULT_SHELL_POLICY}')
     a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
-    result=profile(json.loads(a.models.read_text()),routing_policy=routing)
     directory=a.state_dir.expanduser().resolve()/'config';target=directory/'opencode.json'
+    choices_path=directory/'configure-choices.json'
+    choices=load_choices(choices_path)
+    shell_policy=a.shell_policy or choices.get('shell_policy') or DEFAULT_SHELL_POLICY
+    result=profile(json.loads(a.models.read_text()),routing_policy=routing,shell_policy=shell_policy)
     replacing = target.exists()
     if replacing and not a.replace:
         p.error('profile exists; use --replace only after reviewing changes')
     directory.mkdir(parents=True,exist_ok=True,mode=0o700)
     if target.exists():
         backup=target.with_name(f'opencode.backup-{time.time_ns()}.json');backup.write_bytes(target.read_bytes());backup.chmod(0o600)
-    target.write_text(json.dumps(result,indent=2)+'\n');target.chmod(0o600)
+    atomic_write_text(target,json.dumps(result,indent=2)+'\n')
+    atomic_write_text(choices_path,json.dumps({**choices,'shell_policy':shell_policy},indent=2)+'\n')
     policy_path=directory/'routing-policy.json'
     if routing is not None:
         if policy_path.exists():
@@ -237,6 +301,7 @@ def main():
     requirements=[]
     if 'openai' in result['enabled_providers']: requirements.append('OpenAI OAuth/account and financial verification')
     if 'anthropic' in result['enabled_providers']: requirements.append('reviewed Claude OAuth adapter and disabled usage credits or explicit local app-managed-credit policy')
+    print(f'Shell policy: {shell_policy}.')
     print(f'Prepared {target}; no service started. Required before inference: '+ '; '.join(requirements)+'.')
 
 if __name__=='__main__':main()

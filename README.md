@@ -104,7 +104,7 @@ The generated profile in [configure.py](configure.py) maps roles as follows:
 
 | Agent | Configured tier | Intended work and capabilities |
 |---|---|---|
-| `harness-router` | STRONG | Own the goal, choose workers, integrate evidence; no shell or edits. |
+| `harness-router` | STRONG | Own the goal, choose workers, integrate evidence; no shell or edits (read-only `repo_identity` for cwd/branch/HEAD). |
 | `harness-coordinator` | BALANCED | Coordinate multiple sustained lanes through terminal workers; no shell or edits. |
 | `harness-scout` | FAST | Focused repository exploration and summaries; no shell, edits or delegation. |
 | `harness-quick-builder` | FAST | Mechanical fixes, small localized changes and straightforward tests. |
@@ -572,7 +572,7 @@ The database is opened read-only. The public repository includes no database. Hi
 
 Read [COMPATIBILITY.md](docs/COMPATIBILITY.md) and [SETUP.md](docs/SETUP.md). The installer does **not** silently modify an existing OpenCode profile, choose account-specific model IDs, authenticate, buy credits, or install remote services.
 
-The generated public profile asks approval for unknown shell commands, pushes, deployments, and destructive actions. Reasoned one-use large-file grants do not require a separate confirmation. Existing file permissions still apply. Your local preference for broader permissions can be configured explicitly.
+The generated public profile asks approval for unknown shell commands, pushes, deployments, and destructive actions. Reasoned one-use large-file grants do not require a separate confirmation. Existing file permissions still apply. For broader permissions, use `configure.py --shell-policy permissive`: it allows all shell commands except a dangerous-command ask list. The default is `allowlist`. A raw-command guard asks for redirects to secret-looking paths and for redirects the 2.0.30 shell parser drops; see [shell permissions](docs/SHELL-PERMISSIONS.md).
 
 For an explicitly authorized repository relocation, an operator can issue an expiring external-write grant to an existing worker. It is bound to the workspace, task, owner, intent revision, checks and destination. The dispatcher revalidates it on continuations and coordinates harness-managed destination ownership across workspaces; ordinary requests cannot grant themselves access by naming an absolute path. Native permissions still apply. This permits scoped destination work—it does not relocate sessions, copy files or approve publication automatically.
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — shell permissions and reload
+
+- Add `configure.py --shell-policy allowlist|permissive`. The choice is persisted in `config/configure-choices.json`, and the default stays `allowlist`. `permissive` generates `shell *` allow plus a dangerous-command ask list. Builder roles are told to write files with edit/write instead of shell redirection.
+- Add a raw-command shell guard. It forces a native ask for unquoted redirects to secret-looking paths, for bare redirects, and for compound-command redirect segments that match a shell ask rule the OpenCode 2.0.30 parser drops.
+- Re-check pending permission asks after a config reload and reply `once` only for requests the current rules allow. Probes never create new asks.
+- Add a read-only `repo_identity` tool for roles without shell.
+- Write the generated profile atomically (temp file, then rename).
+
 ## Unreleased — handoff results reach the parent
 
 - Fix lost handoff results: harness dispatch metadata (for example `routing.modelOverride: undefined`) failed OpenCode's strict JSON tool-event validation after the call was marked settled, so foreground reports never reached the parent and background calls stayed "running" until marked interrupted. Dispatch results now carry plain JSON metadata, and harness-only subagent results always include the declared `{sessionID,status,output}`.

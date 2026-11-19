@@ -10,6 +10,9 @@ import { installContextCompression } from './context-compression.mjs';
 import { installCheckTools } from './check-tools.mjs';
 import { installExecutionTiming } from './execution-timing.mjs';
 import { createRegistry } from './dispatch-registry.mjs';
+import { installShellGuard } from './shell-guard.mjs';
+import { installPermissionReevaluation } from './permission-reevaluate.mjs';
+import { installRepoIdentity } from './repo-identity.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -145,6 +148,10 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
   const handle = await fs.open(file, 'a', 0o600); try { await handle.writeFile(JSON.stringify(record) + '\n'); } finally { await handle.close(); } await fs.chmod(file, 0o600);
 }, loadContract = loadStoredContract, saveContract = saveStoredContract, loadArtifacts = loadStoredArtifacts, mutateArtifacts = mutateStoredArtifacts, now = () => Date.now() } = {}) {
   return { id: 'subscription.task-outcomes', async setup(ctx) {
+    // Registered first so a guarded shell call is rejected before other before-hooks track it.
+    await installShellGuard(ctx);
+    const reevaluation = await installPermissionReevaluation(ctx);
+    await installRepoIdentity(ctx);
     const shared = await installTaskDispatch(ctx,dispatchOptions);
     if (ctx.session?.hook) await ctx.session.hook('context', async event => {
       hideCoordinatorMutationTools(event);
@@ -230,7 +237,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
     await ctx.tool.transform(editor => editor.add({ name: 'task_artifact', description: 'Record the current self-reported target revision for a task artifact. This declaration is not an automatic validation of Git or any other provider.', input: { type: 'object', additionalProperties: false, properties: { taskId: { type: 'string', minLength: 1, maxLength: 128 }, subject: { type: 'string', minLength: 1, maxLength: 128 }, revision: { type: 'string', minLength: 1, maxLength: 500 } }, required: ['taskId', 'subject', 'revision'] }, execute: async (args, call) => { const sessionID = text(call.sessionID, 'sessionID'), taskID = text(args.taskId, 'taskId'), subject = text(args.subject, 'subject'), revision = text(args.revision, 'revision', 500); const artifacts = await mutateCurrentArtifacts(sessionID, taskID, current => { const prior = current[subject], generation = prior?.revision === revision ? prior.generation : (prior?.generation ?? 0) + 1, artifacts = { ...current, [subject]: { revision, generation, selfReported: true } }; return { artifacts, value: artifacts }; }); return { content: `Recorded self-reported artifact ${subject} revision generation ${artifacts[subject].generation} for task ${taskID}; this does not automatically validate Git or any provider.`, details: { taskId: taskID, artifacts } }; } }));
     await ctx.tool.transform(editor => editor.add({ name: 'task_contract', description: 'Return the current-session contract and current self-reported artifact targets for a task, if a contract was stored.', input: { type: 'object', additionalProperties: false, properties: { taskId: { type: 'string', minLength: 1, maxLength: 128 } }, required: ['taskId'] }, execute: async (args, call) => { const sessionID = text(call.sessionID, 'sessionID'), taskID = text(args.taskId, 'taskId'), contract = await loadContract(sessionID, taskID); const artifacts = contract ? await loadArtifacts(sessionID, taskID) : {}; const details = contract ? { contract, artifacts } : undefined; return { content: contract ? JSON.stringify({ taskId: taskID, ...details }) : `No contract found for task ${taskID} in this session.`, details }; } }));
     void (async () => { try { for await (const event of ctx.event.subscribe({ signal: controller.signal })) { if (event.type === 'session.deleted') { const sessionID = event.data.sessionID; for (const key of tasks.keys()) if (JSON.parse(key)[0] === sessionID) tasks.delete(key); for (const key of messages.keys()) if (JSON.parse(key)[0] === sessionID) messages.delete(key); } if (event.type !== 'session.step.started') continue; const info = event.data; if (messages.size >= 32768) messages.delete(messages.keys().next().value); messages.set(JSON.stringify([info.sessionID, info.assistantMessageID]), { model: `${info.model.providerID}/${info.model.id}`, effort: info.model.variant ?? null }); } } catch (error) { if (!controller.signal.aborted) console.error('task-outcomes provenance stopped', error); } })();
-    return () => { controller.abort(); stopCacheDrift(); stopCompression(); stopTiming(); stopSnapshots(); stopMilestones(); stopEditRecovery(); shared?.dispose?.(); tasks.clear(); messages.clear(); artifactUpdates.clear(); };
+    return () => { controller.abort(); reevaluation.stop(); stopCacheDrift(); stopCompression(); stopTiming(); stopSnapshots(); stopMilestones(); stopEditRecovery(); shared?.dispose?.(); tasks.clear(); messages.clear(); artifactUpdates.clear(); };
   } };
 }
 export default createV2TaskOutcomes();
