@@ -27,6 +27,7 @@ import { createTerminalSettler, terminalSettlementEligibility } from './terminal
 import { createDispatchCanceller, cancelInputSchema } from './task-dispatch-cancel.mjs';
 import { createResultDelivery } from './result-delivery.mjs';
 import { createStaleReconciler } from './dispatch-reconcile.mjs';
+import { midRunCompactionEnabled, midRunCompactionDecision, settleMidRunCompaction, admitMidRunCompaction, recordAdmitted, recordAdmissionFailure, recordBaseline, buildContinuation, activeContinuation, midRunCompactionStatus, pendingCompactionPreservation, BRIEF_LIMIT } from './mid-run-compaction.mjs';
 
 const readContextCatalog = async ctx => {
   try { return (await ctx.model?.list())?.data; } catch { return undefined; }
@@ -462,12 +463,60 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           getIntent(state, owner.rootID, owner.taskId)?.revision !== owner.intentRevision) return;
       const status = prepareCheckpoint(owner, now());
       await save();
-      return status;
+      return { status, key: owner.key };
     });
-    if (checkpoint?.due && Array.isArray(event.system) && !event.system.some(p => p.text === checkpointReminder)) {
+    if (checkpoint?.status?.due && Array.isArray(event.system) && !event.system.some(p => p.text === checkpointReminder)) {
       event.system.push({ type: 'text', text: checkpointReminder });
     }
+    // Mid-run compaction is optional maintenance: any failure leaves the step untouched.
+    let continuation;
+    if (checkpoint?.key) try { continuation = await midRunCompaction(event.sessionID, checkpoint.key); } catch { /* never block a model step */ }
+    if (continuation && Array.isArray(event.system) && !event.system.some(p => p.text === continuation))
+      event.system.push({ type: 'text', text: continuation });
   });
+  // The native summary request of a pending mid-run compaction must keep the
+  // running assignment; system text here reaches only that summary request.
+  if (ctx.session?.hook) await ctx.session.hook('compaction', async event => {
+    try {
+      const text = await registry(workspace, async state => pendingCompactionPreservation(state.records.find(r => r.childID === event.sessionID && r.midRunCompaction?.pending)));
+      if (text && Array.isArray(event.system) && !event.system.some(p => p.text === text)) event.system.push({ type: 'text', text });
+    } catch { /* never block native compaction */ }
+  });
+  // At a native step boundary (this request is being prepared, so the previous
+  // step and its tools have settled), admit one steered compaction for a running
+  // child whose observed context reached the absolute trigger. The runtime runs
+  // it before the next model request; see mid-run-compaction.mjs for the gates.
+  const midRunCompaction = async (sessionID, key) => {
+    if (typeof ctx.session?.compact !== 'function') return;
+    const [sessions, catalog] = await Promise.all([loadSessions(), readContextCatalog(ctx)]);
+    const native = sessions.find(s => s.id === sessionID);
+    const planned = await registry(workspace, async (state, save) => {
+      const record = state.records.find(r => r.key === key && r.childID === sessionID);
+      if (!record) return {};
+      let changed = settleMidRunCompaction(record, native, now());
+      const intentCurrent = getIntent(state, record.rootID, record.taskId)?.revision === record.intentRevision;
+      const decision = midRunCompactionDecision(record, native, { sessions, catalog, compactionAvailable: midRunCompactionEnabled(), intentCurrent });
+      if (decision.baselineTokens !== undefined) changed = recordBaseline(record, decision.baselineTokens) || changed;
+      let id;
+      if (decision.admit) {
+        const continuationText = buildContinuation(record, { intent: getIntent(state, record.rootID, record.taskId), evidence: state.intentEvidence?.[JSON.stringify([record.rootID, record.taskId])] });
+        id = admitMidRunCompaction(record, decision, continuationText, now());
+        changed = true;
+      }
+      if (changed) await save();
+      return { id, observation: decision.observation, continuation: activeContinuation(record) };
+    });
+    if (planned.id) {
+      let admitted = false;
+      try { await ctx.session.compact({ sessionID, id: planned.id }); admitted = true; }
+      catch { /* conflict with another pending compaction or unavailable: record and stop retrying this observation */ }
+      await registry(workspace, async (state, save) => {
+        const record = state.records.find(r => r.key === key && r.childID === sessionID);
+        if (record && (admitted ? recordAdmitted(record, planned.id) : recordAdmissionFailure(record, planned.id, planned.observation, now()))) await save();
+      });
+    }
+    return planned.continuation;
+  };
   let stockInput = nativeSubagentSchema, stockDescription = 'Launch or resume a native subagent.';
   if (ctx.session?.hook) await ctx.session.hook('context', async event => {
     if (!event.tools?.subagent) return;
@@ -862,7 +911,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         pendingDelivery={generation:admission.generation,status:'pending',mode:completionBinding.background?'background':'foreground',parentID:context.sessionID,
           ...(typeof context.messageID==='string'?{messageID:context.messageID}:{}),...(typeof context.id==='string'?{callID:context.id}:{}),since:now(),
           marker,promptHash:`${promptHash},${prefixedPromptHash}`,agent:input.agent,description:input.description,taskId:input.taskId,workKey:input.workKey};
-        await update({completionBinding,completionReceipt:undefined,resultDelivery:pendingDelivery});
+        // A bounded copy of the assignment survives a later mid-run compaction (never exported by status).
+        await update({completionBinding,completionReceipt:undefined,resultDelivery:pendingDelivery,handoffBrief:typeof input.prompt==='string'?{generation:admission.generation,text:input.prompt.slice(0,BRIEF_LIMIT)}:undefined});
         const result = await rawExecute({ agent:input.agent,description:input.description,prompt:boundedHandoff,...(admission.childID?{sessionID:admission.childID}:{}),...(admission.routing.selected?{model:admission.routing.selected}:{}),background:backgroundDispatch(input) }, {
           ...context, progress: async progress => {
             if(progress.sessionID) { observed=progress.sessionID;await update({childID:observed,state:'running'}); }
@@ -992,7 +1042,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         }
         if (delivered) await save();
       } catch { /* status remains read-safe; the durable receipt stays pending for a later explicit retry */ }
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),terminalBlocked=terminalSettlementEligibility(r,native,sessions,context.sessionID),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,...workerObservation(r,native,current,state.records,now()),key:undefined,foregroundResult:undefined,handoffTimings:undefined,resultDelivery:r.resultDelivery?Object.fromEntries(['generation','status','mode','via','outcome','reason','deliveredAt'].filter(k=>r.resultDelivery[k]!==undefined).map(k=>[k,r.resultDelivery[k]])):undefined,timing:handoffTimingStatus(r),nextDispatch:{workReview:dispatchReviewRequirement(r,taskWorkStatus(state,rootID,r.taskId),now())},recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:r.completionBinding?.generation===r.admissionGeneration&&r.childID?{action:'task_dispatch_collect',mode:'foreground',eligibleForInspection:!r.inFlight&&native?.active!==true,resultRetained:r.foregroundResult?.generation===r.admissionGeneration,responsibleParentID:r.parentID,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,terminalReconciliation:r.completionBinding?.background?{action:'task_dispatch_reconcile_terminal',eligibleForInspection:!terminalBlocked,blockedReason:terminalBlocked,responsibleParentID:r.parentID,generation:r.admissionGeneration,...(r.terminalSettlement?.generation===r.admissionGeneration?{outcome:r.terminalSettlement.receipt.outcome,acceptedForCurrentIntent:false}: {})}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind,catalog:contextCatalog}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native,contextCatalog)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),terminalBlocked=terminalSettlementEligibility(r,native,sessions,context.sessionID),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,...workerObservation(r,native,current,state.records,now()),key:undefined,foregroundResult:undefined,handoffTimings:undefined,handoffBrief:undefined,midRunCompaction:midRunCompactionStatus(r),resultDelivery:r.resultDelivery?Object.fromEntries(['generation','status','mode','via','outcome','reason','deliveredAt'].filter(k=>r.resultDelivery[k]!==undefined).map(k=>[k,r.resultDelivery[k]])):undefined,timing:handoffTimingStatus(r),nextDispatch:{workReview:dispatchReviewRequirement(r,taskWorkStatus(state,rootID,r.taskId),now())},recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:r.completionBinding?.generation===r.admissionGeneration&&r.childID?{action:'task_dispatch_collect',mode:'foreground',eligibleForInspection:!r.inFlight&&native?.active!==true,resultRetained:r.foregroundResult?.generation===r.admissionGeneration,responsibleParentID:r.parentID,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,terminalReconciliation:r.completionBinding?.background?{action:'task_dispatch_reconcile_terminal',eligibleForInspection:!terminalBlocked,blockedReason:terminalBlocked,responsibleParentID:r.parentID,generation:r.admissionGeneration,...(r.terminalSettlement?.generation===r.admissionGeneration?{outcome:r.terminalSettlement.receipt.outcome,acceptedForCurrentIntent:false}: {})}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind,catalog:contextCatalog}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native,contextCatalog)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }

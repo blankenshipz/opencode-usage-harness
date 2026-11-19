@@ -347,6 +347,28 @@ def _native_recovery(item, message_id):
     return {"errorID":str(message_id), "type":error["type"], "attempt":attempt}
 
 
+# Harness mid-run compactions (plugins/v2/mid-run-compaction.mjs) use IDs
+# derived from the generation's completion marker. Only these exact manual
+# compaction rows may appear inside a generation's terminal chain; any other
+# compaction still invalidates the receipt. Keep equal to MAX_MID_RUN_SEQUENCE.
+MID_RUN_COMPACTION_SEQUENCES = 10
+
+
+def mid_run_compaction_ids(marker: str) -> set[str]:
+    return {"msg_" + hashlib.sha256(f"{marker}\0mid-run-compaction\0{sequence}".encode()).hexdigest()[:32]
+            for sequence in range(1, MID_RUN_COMPACTION_SEQUENCES + 1)}
+
+
+def _harness_compaction(kind: str, ident: object, data: object, allowed: set[str], statuses: tuple[str, ...]) -> bool:
+    if kind != "compaction" or str(ident) not in allowed:
+        return False
+    try:
+        item = json.loads(data)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(item, dict) and item.get("reason") == "manual" and item.get("status") in statuses
+
+
 def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_path: str | Path | None = None) -> dict[str, object] | None:
     """Return only a terminal chain bound to one exact dispatched prompt."""
     accepted = set(prompt_hash.split(","))
@@ -379,7 +401,13 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
         assistant = None
         receipt = None
         recoveries, pending_recovery, recovered_identity = [], None, None
+        harness_compactions = mid_run_compaction_ids(marker)
         for ident, seq, kind, data in after:
+            # A completed harness mid-run compaction runs at a step boundary
+            # (possibly right after the final answer); it neither extends nor
+            # supersedes the result.
+            if receipt is None and pending_recovery is None and _harness_compaction(kind, ident, data, harness_compactions, ("completed",)):
+                continue
             # The terminal answer must immediately precede one successful idle,
             # with no later message that could extend or supersede this result.
             if receipt is not None or (assistant is not None and kind != "idle"):
@@ -508,9 +536,13 @@ def terminal_receipt(session_id: str, marker: str, prompt_hash: str, *, db_path:
         recovered_identity = None
         terminal_idle = None
         terminal_idle_data = None
+        harness_compactions = mid_run_compaction_ids(marker)
         for ident, seq, kind, data in rows:
             if terminal_idle is not None:
                 return None
+            # A failed harness compaction is part of a failed run's terminal chain.
+            if pending_recovery is None and _harness_compaction(kind, ident, data, harness_compactions, ("completed", "failed")):
+                continue
             if kind in ("user", "compaction", "model-switched", "agent-switched", "location-switched"):
                 return None
             try:

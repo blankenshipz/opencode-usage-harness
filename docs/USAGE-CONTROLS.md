@@ -93,14 +93,48 @@ inspection; a compaction-only generation is never relabeled as a task result.
 Compaction cannot rebind stale intent: deliver the correction through the same
 child first. A final completed task needs no compaction.
 
-Status never collects, compacts or resumes work. Native same-session compaction
-must be explicitly admitted by the existing parent with the retained checkpoint;
-its ordinary authorization still applies. Wait for the matching durable outcome
+### Mid-run compaction of a running child
+
+A long-running managed child no longer has to finish and be collected before it
+can be compacted. When a running child's observed context reaches the trigger
+above, the harness admits one native same-session compaction from the child's
+own model-request preparation hook. OpenCode 2.0.30 queues it as a steered inbox
+control and runs it only at the next step boundary: after the current model step
+and all of its tool calls have settled, before the next model request. It never
+runs mid-stream or while a tool call is pending. Additional gates: the record's
+current generation is running with current intent and no denial or cancellation;
+no explicit parent compaction is in progress (that compaction-wait lock wins);
+native state shows the child active with no running tools and no active
+descendants; only one mid-run compaction is pending at a time; a later one needs
+a new completed observation after the previous compaction and growth of at least
+a quarter of the trigger over the first post-compaction observation; a failed
+compaction stops further attempts for that generation; at most 8 per generation
+and 2 admission failures.
+
+The native summary request receives the preserved assignment as system data: the
+handoff brief (bounded copy), the `task_intent` continuation reference, recorded
+check results, the latest checkpoint and the previous completion receipt. After the
+compaction completes, every later model request of that generation carries the
+same frozen continuation, so none of it depends on the summary keeping it.
+Compaction IDs are derived from the generation's completion marker, and the
+completion and terminal receipt readers accept exactly those compaction rows
+inside the generation's chain. Any other compaction still invalidates the
+receipt. If the step that admitted the compaction was the final answer, the
+compaction runs after it; the receipt still binds that answer. Status shows
+`midRunCompaction` (count, pending/last ID and status), never the brief.
+`HARNESS_MID_RUN_COMPACTION=off` disables new mid-run admissions. Each compaction
+is a model request against the provider's account-wide quota, which other agents
+outside this harness also use.
+
+Status never collects, compacts or resumes work. Explicit native same-session
+compaction of an idle child must be admitted by the existing parent with the
+retained checkpoint; its ordinary authorization still applies. Wait for the matching durable outcome
 and idle state, then continue the same worker with refreshed full intent. Do not
 interrupt tools, clone a worker, retry a failed compaction unchanged, or manufacture
-work to obtain savings. Compaction can consume subscription capacity. Root
-`selfContext` makes pressure visible without inventing a cross-parent compaction
-route or automatically starting native compaction.
+work to obtain savings. Compaction consumes account-wide quota shared with agents
+outside this harness. Root `selfContext` makes pressure visible without inventing
+a cross-parent compaction route; only managed running children are compacted
+mid-run, as described above.
 
 Keep one bounded lane root → worker. Use a coordinator only for genuinely parallel
 or multi-component integration. Batch intent/receipt bookkeeping at meaningful

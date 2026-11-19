@@ -55,6 +55,19 @@ class TerminalRuntimeTest(unittest.TestCase):
             db, prompt = self.make_db(rows + [("boundary", kind, {})])
             self.assertIsNone(self.receipt(db, prompt))
 
+    def test_harness_mid_run_compaction_is_part_of_the_terminal_chain(self):
+        from src.dispatch_runtime import mid_run_compaction_ids
+        harness = sorted(mid_run_compaction_ids("marker"))[0]
+        step = ("step", "assistant", {"finish": "tool-calls", "time": {"completed": 2}, "content": []})
+        answer = ("answer", "assistant", {"finish": "stop", "time": {"completed": 4}, "content": [{"type": "text", "text": "ok"}]})
+        db, prompt = self.make_db([step, (harness, "compaction", {"reason": "manual", "status": "completed"}), answer, ("idle", "idle", {"outcome": "succeeded"})])
+        self.assertEqual(self.receipt(db, prompt)["outcome"], "succeeded")
+        db, prompt = self.make_db([step, (harness, "compaction", {"reason": "manual", "status": "failed"}), ("idle", "idle", {"outcome": "failed"})], idle_outcome="failed")
+        self.assertEqual(self.receipt(db, prompt)["outcome"], "failed")
+        for ident, data in (("msg_foreign", {"reason": "manual", "status": "completed"}), (harness, {"reason": "auto", "status": "completed"})):
+            db, prompt = self.make_db([step, (ident, "compaction", data), answer, ("idle", "idle", {"outcome": "succeeded"})])
+            self.assertIsNone(self.receipt(db, prompt))
+
     def test_failed_gate_can_settle_without_assistant(self):
         db, prompt = self.make_db([("idle", "idle", {"outcome": "failed", "time": {"created": 4}}),], idle_outcome="failed")
         self.assertEqual(self.receipt(db, prompt)["outcome"], "failed")

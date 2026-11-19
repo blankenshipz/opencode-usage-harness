@@ -324,6 +324,35 @@ class DispatchRuntimeTest(unittest.TestCase):
         self.assertIsNone(completion_receipt("child",marker,digest,db_path=make({"finish":"stop","content":[{"type":"text","text":"done"}]})))
 
 
+    def test_completion_receipt_accepts_only_exact_harness_mid_run_compactions(self):
+        from src.dispatch_runtime import mid_run_compaction_ids, MID_RUN_COMPACTION_SEQUENCES
+        marker="marker-mid"; text=f"work\nDispatch completion marker: {marker}"; digest=__import__('hashlib').sha256(text.encode()).hexdigest()
+        allowed=sorted(mid_run_compaction_ids(marker)); self.assertEqual(len(allowed),MID_RUN_COMPACTION_SEQUENCES)
+        derived="msg_"+__import__('hashlib').sha256(f"{marker}\0mid-run-compaction\0{1}".encode()).hexdigest()[:32]
+        self.assertIn(derived,allowed)
+        step={"finish":"tool-calls","time":{"completed":2},"content":[]}
+        answer={"finish":"stop","time":{"completed":5},"content":[{"type":"text","text":"done"}]}
+        def make(rows):
+            tmp=tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup); db=Path(tmp.name)/"opencode.db"
+            with sqlite3.connect(db) as c:
+                c.executescript("create table session_v2 (id text, idle_outcome text); create table session_message (id text,session_id text,type text,seq integer,data text); create table session_inbox (id text,session_id text,type text,payload text,delivery text,enqueued_seq integer,time_created integer);")
+                c.execute("insert into session_v2 values ('child','succeeded')")
+                c.executemany("insert into session_message values (?,?,?,?,?)",[("prompt","child","user",1,json.dumps({"text":text}))]+[(ident,"child",kind,seq,json.dumps(data)) for seq,(ident,kind,data) in enumerate(rows,2)])
+            return db
+        compaction=lambda ident,status="completed",reason="manual":(ident,"compaction",{"reason":reason,"status":status})
+        # Between steps, and right after the final answer (admitted during the last step).
+        mid=make([("s1","assistant",step),compaction(derived),("answer","assistant",answer),("idle","idle",{"outcome":"succeeded"})])
+        self.assertEqual(completion_receipt("child",marker,digest,db_path=mid)["assistantID"],"answer")
+        after=make([("s1","assistant",step),("answer","assistant",answer),compaction(derived),("idle","idle",{"outcome":"succeeded"})])
+        self.assertEqual(completion_receipt("child",marker,digest,db_path=after)["assistantID"],"answer")
+        # Foreign, auto, failed or another generation's compaction still invalidates the chain.
+        other="msg_"+__import__('hashlib').sha256("other-marker\0mid-run-compaction\01".encode()).hexdigest()[:32]
+        for row in (compaction("msg_foreign"),compaction(derived,reason="auto"),compaction(derived,status="failed"),compaction(derived,status="running"),compaction(other)):
+            db=make([("s1","assistant",step),row,("answer","assistant",answer),("idle","idle",{"outcome":"succeeded"})])
+            self.assertIsNone(completion_receipt("child",marker,digest,db_path=db),row)
+        late=make([("s1","assistant",step),("answer","assistant",answer),("idle","idle",{"outcome":"succeeded"}),compaction(derived)])
+        self.assertIsNone(completion_receipt("child",marker,digest,db_path=late))
+
     def test_final_text_returns_only_bounded_visible_text_of_exact_completed_answer(self):
         db = self.fixture()
         answer = {"finish": "stop", "time": {"completed": 5}, "content": [

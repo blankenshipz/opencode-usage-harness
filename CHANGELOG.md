@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — mid-run compaction of a running child
+
+- A running managed child whose observed context reaches the absolute trigger (`min(HARNESS_COMPACTION_TOKENS or compaction_tokens, 80% of a known window)`) is compacted without waiting for it to finish and be collected. The harness admits one native steered compaction from the child's model-request `context` hook; OpenCode 2.0.30 runs it at the next step boundary, after the current step and its tool calls settle and before the next model request.
+- Gates: current running generation with current intent, no denial or cancellation; no explicit parent compaction in progress; native state active with no running tools and no active descendants; one pending at a time; growth since the previous one (new observation and at least a quarter of the trigger over the first post-compaction observation); a failed compaction stops further attempts for that generation; at most 8 per generation and 2 admission failures. `HARNESS_MID_RUN_COMPACTION=off` disables new admissions.
+- The native summary request receives the handoff brief, `task_intent` continuation reference, recorded check results, latest checkpoint and previous completion receipt as system data. After the compaction completes, later requests of that generation carry the same frozen continuation.
+- Compaction IDs derive from the generation's completion marker. `dispatch_runtime.py` completion and terminal receipts accept exactly those compaction rows inside the generation's chain; any other compaction still invalidates a receipt. Status shows `midRunCompaction` metadata, never the brief. `subscription-guard.mjs` is unchanged (hash-pinned): a quota failure in a mid-run summary request is not given its own compaction receipt; it marks mid-run compaction failed for the generation, and the child's next request reports the quota block as a dispatch receipt.
+
 ## Unreleased — absolute-token compaction trigger
 
 - High context pressure and compaction eligibility now start at `min(absolute, 80% of the known usable window)` observed input tokens, or at the absolute threshold when the window is unknown. Previously a known window disabled the absolute rule, so an 872k window deferred pressure to ~698k tokens while a builder grew to 284k.

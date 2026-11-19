@@ -81,9 +81,12 @@ headroom, not a target to fill, so an 872k window no longer defers pressure to
 (`HARNESS_COMPACTION_TOKENS`, else `configure.py --compaction-tokens N`). Smaller
 windows still trigger at 80%. Unknown or inconsistent model/limit evidence uses
 the absolute threshold and reports why. This does not promise a particular quota
-saving; quota is account-wide and shared with agents outside this harness. Native automatic compaction and all safe-checkpoint gates remain
-unchanged. Status exposes the budget, usage ratio and evidence basis for both the
-router and its workers; reading status never initiates compaction or inference.
+saving; quota is account-wide and shared with agents outside this harness.
+A running managed child that reaches the trigger is compacted mid-run at the next native step boundary (never mid-stream or during a tool call), with
+its brief, intent reference, check results and checkpoint preserved; see
+[USAGE-CONTROLS.md](docs/USAGE-CONTROLS.md#mid-run-compaction-of-a-running-child).
+Native automatic compaction is unchanged. Status exposes the budget, usage
+ratio and evidence basis for both the router and its workers; reading status never initiates compaction or inference.
 Recoverable Codex
 quota-telemetry failures keep admission closed and retain generation-bound parent notifications;
 notification delivery never resumes inference. See the
