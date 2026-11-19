@@ -4,7 +4,17 @@ import { shellReads as legacyShellReads } from '../large-file-context/core.mjs';
 import { isNativeAgent, canonicalHarnessRole } from './agent-mode.mjs';
 import { createStructuredJSONRead } from './structured-json-read.mjs';
 
+// LIMIT is the nominal broad-read cap and the maximum explicit page size.
 const LIMIT = 350;
+// Soft allowance: an unbounded read of a file up to 25% over LIMIT is served in
+// full in one call. Blocking a 356-line file forced paging that re-read it at
+// over twice its size, so a near-miss costs less to return than to mediate.
+export const SOFT_LINE_LIMIT = Math.floor(LIMIT * 1.25); // 437
+// Byte budget for any unbounded full read (including files within LIMIT). It
+// sits just under the native read's ~50 KB page budget, so a full read is never
+// silently clipped, and it stops few-but-very-long-line files (minified bundles,
+// single-line JSON, lockfiles) from riding the line allowance.
+export const FULL_READ_MAX_BYTES = 48 * 1024;
 const SUMMARY_LIMIT = 6000;
 const READ_ONLY_AGENTS = new Set(['scout', 'router', 'architect', 'reviewer', 'coordinator']);
 const fingerprint = stat => [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
@@ -106,10 +116,12 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
         if (!nativeRead) return { kind: 'unavailable' };
         // The native tool remains the permission and byte-access boundary. This result
         // is inspected only for paging metadata and is never returned to the caller.
-        const result = await nativeRead({ path: input.path, offset: 1, limit: LIMIT + 1 }, context);
+        const result = await nativeRead({ path: input.path, offset: 1, limit: SOFT_LINE_LIMIT + 1 }, context);
         const page = textPage(result);
         if (!page) return { kind: nativeResult(result) ? 'native' : 'other' };
-        return { kind: !page.truncated && lineCount(page.content) <= LIMIT ? 'small' : 'large', page };
+        const lines = lineCount(page.content), bytes = Buffer.byteLength(page.content);
+        const fits = !page.truncated && lines <= SOFT_LINE_LIMIT && bytes <= FULL_READ_MAX_BYTES;
+        return { kind: fits ? 'small' : 'large', page, lines, bytes };
       };
       const callNativeRead = (input, context) => normalizedNativeRead(nativeRead, input, context);
       const directGrant = async (input, context) => {
@@ -135,7 +147,18 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
       const denial = message => ({ content: message });
       const readDenial = message => ({ output: { type: 'text-page', mime: 'text/plain', content: message, offset: 1, truncated: false }, content: message, metadata: { truncated: false } });
       const shellDenial = message => ({ output: { exit: 1, output: message, truncated: false }, content: message, metadata: { exit: 1 } });
-      const blockLarge = input => readDenial(`Large-file context block for ${JSON.stringify(input.path)}. Use an explicit bounded native read (limit <= ${LIMIT}); a router or coordinator can use large_file_summary for a broad question; or request large_file_allow_direct for a one-use exception.`);
+      // Guidance instead of a bare block: the costly failure mode is an agent
+      // paging sequentially through the whole file, which re-reads far more than
+      // one targeted range. Point it at the cheapest route for its role.
+      const blockLarge = (input, check, context) => {
+        const role = canonicalHarnessRole(context?.agent);
+        const seen = check.lines > SOFT_LINE_LIMIT || check.page?.truncated ? `more than ${SOFT_LINE_LIMIT} lines` : `${Math.ceil(check.bytes / 1024)} KiB in ${check.lines} lines`;
+        const broad = delegatingAgents.has(role)
+          ? `For a broad question, call large_file_summary with the path and your question; a scout returns a bounded summary with file:line references.`
+          : `For a broad question, ask your router or coordinator for a large_file_summary instead of reading it all yourself.`;
+        const exception = READ_ONLY_AGENTS.has(role) ? '' : ' If you truly need the whole file, request large_file_allow_direct once with a reason.';
+        return readDenial(`Large-file context block for ${JSON.stringify(input.path)}: it has ${seen}, over the full-read allowance (${SOFT_LINE_LIMIT} lines and ${FULL_READ_MAX_BYTES / 1024} KiB). Do not page through the whole file. Locate what you need first (grep for the symbol or heading), then make one explicit bounded native read (offset plus limit <= ${LIMIT}) around it. ${broad}${exception}`);
+      };
       const isLargePath = async (file, context) => (await preflight({ path: file }, context)).kind === 'large';
 
       await ctx.tool.transform(editor => {
@@ -145,7 +168,7 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
         nativeRead = read?.execute;
         nativeSubagent = subagent?.execute;
         if (read) editor.update('read', tool => {
-          tool.description += `\nLarge-file policy: direct text reads are capped at ${LIMIT} lines. Use explicit bounded reads; for long single-line JSON use large_file_json for exact hash-bound character pages without shell access; a router or coordinator can use large_file_summary for broad files.`;
+          tool.description += `\nLarge-file policy: direct text reads are capped at ${LIMIT} lines per page; an unbounded read returns a whole file of up to ${SOFT_LINE_LIMIT} lines and ${FULL_READ_MAX_BYTES / 1024} KiB. Use explicit bounded reads; for long single-line JSON use large_file_json for exact hash-bound character pages without shell access; a router or coordinator can use large_file_summary for broad files.`;
           // The stock ReadTool output uses Schema.Class for pages. A policy denial is
           // a plain JSON result, so use the equivalent structural public contract.
           tool.output = readOutput;
@@ -159,17 +182,18 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
               return result;
             }
             // Reject invalid or oversized requested final ranges before preflight.
-            // A preflight is deliberately fixed at 351 lines and must not mask this.
+            // A preflight is deliberately fixed at SOFT_LINE_LIMIT + 1 lines and must not mask this.
             const range = bounded(input);
             if (!range) return readDenial(`large-file-context: direct reads must use a limit from 1 to ${LIMIT} lines.`);
             // Explicit bounded ranges remain usable by scouts and other leaf roles.
             if (input.limit !== undefined) return callNativeRead(input, context);
             if (input.offset !== undefined) return callNativeRead(range, context);
             const page = await preflight(input, context);
-            if (page.kind === 'large') return blockLarge(input);
+            if (page.kind === 'large') return blockLarge(input, page, context);
             if (page.kind === 'denied' || page.kind === 'unavailable') return readDenial(`large-file-context: native preflight was unavailable or denied. Use an explicit bounded native read (limit <= ${LIMIT}) or ask the parent to summarize the file.`);
             if (page.kind === 'native') return callNativeRead(input, context);
-            return callNativeRead(range, context);
+            // Within the soft allowance, return the whole file in one call.
+            return callNativeRead(page.lines > LIMIT ? { ...range, limit: SOFT_LINE_LIMIT } : range, context);
           };
         });
         if (shell) editor.update('shell', tool => {
@@ -196,12 +220,12 @@ export function createLargeFileContext({ fs: fileSystem = fs, now = () => Date.n
         if (nativeRead) editor.add(createStructuredJSONRead({ directory, nativeRead }));
         editor.add({
           name: 'large_file_check',
-          description: `Check whether a file exceeds ${LIMIT} text lines without returning its contents. Then use an explicit bounded native read, or have a router or coordinator use large_file_summary for a broad question.`,
+          description: `Check whether a file exceeds the full-read allowance (${SOFT_LINE_LIMIT} text lines and ${FULL_READ_MAX_BYTES / 1024} KiB) without returning its contents. Then use an explicit bounded native read, or have a router or coordinator use large_file_summary for a broad question.`,
           input: { type: 'object', additionalProperties: false, properties: { path: { type: 'string' } }, required: ['path'] },
           execute: async (input, context) => {
             const result = await preflight(input, context);
-            if (result.kind === 'small') return denial(`File is at most ${LIMIT} lines; use an explicit bounded native read (limit <= ${LIMIT}).`);
-            if (result.kind === 'large') return denial(`File exceeds ${LIMIT} lines; use an explicit bounded native read (limit <= ${LIMIT}) or have a router or coordinator request large_file_summary.`);
+            if (result.kind === 'small') return denial(`File is within the full-read allowance (${SOFT_LINE_LIMIT} lines and ${FULL_READ_MAX_BYTES / 1024} KiB); an unbounded native read returns it whole.`);
+            if (result.kind === 'large') return denial(`File exceeds the full-read allowance (${SOFT_LINE_LIMIT} lines and ${FULL_READ_MAX_BYTES / 1024} KiB); do not page through it all; use an explicit bounded native read (limit <= ${LIMIT}) or have a router or coordinator request large_file_summary.`);
             return denial('Native file handling applies; use the native read tool for the normal attachment, directory, or binary result.');
           },
         });

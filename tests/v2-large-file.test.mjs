@@ -4,10 +4,10 @@ import { createLargeFileContext, shellReads } from '../plugins/v2/large-file-con
 
 const page = (content, truncated = false) => ({ output: { type: 'text-page', content, offset: 1, truncated, ...(truncated ? { next: 352 } : {}) }, content: content });
 const denied = async (promise, pattern) => assert.match((await promise).content, pattern);
-function harness({ lines = 351, subagentOutput = 'fixture.txt:4: concise finding', nativeOutput, nativeReadError, changeDuringDirectRead = false, now = () => Date.now(), agent = 'builder' } = {}) {
+function harness({ lines = 500, width = 0, subagentOutput = 'fixture.txt:4: concise finding', nativeOutput, nativeReadError, changeDuringDirectRead = false, now = () => Date.now(), agent = 'builder' } = {}) {
   const calls = []; const tools = new Map(); const file = '/tmp/large-file-context-fixture.txt';
   let version = 4;
-  const nativeRead = async input => { calls.push({ kind: 'read', input }); if (nativeReadError) throw new Error(nativeReadError); if (changeDuringDirectRead && input.limit > 351) version++; return nativeOutput ? { output: nativeOutput(), content: 'native content', metadata: { retained: true } } : page(Array.from({ length: Math.min(input.limit, lines) }, (_, i) => `SECRET ${i + 1}`).join('\n'), lines > input.limit); };
+  const nativeRead = async input => { calls.push({ kind: 'read', input }); if (nativeReadError) throw new Error(nativeReadError); if (changeDuringDirectRead && input.limit > 438) version++; return nativeOutput ? { output: nativeOutput(), content: 'native content', metadata: { retained: true } } : page(Array.from({ length: Math.min(input.limit, lines) }, (_, i) => `SECRET ${i + 1}`.padEnd(width, '.')).join('\n'), lines > input.limit); };
   const nativeQuestion = async input => { calls.push({ kind: 'question', input }); return { output: { answers: [['Allow once']] }, content: '' }; };
   const nativeSubagent = async input => { calls.push({ kind: 'subagent', input }); return { output: { output: subagentOutput }, content: '' }; };
   const nativeShell = async input => { calls.push({ kind: 'shell', input }); return { output: {}, content: 'ok' }; };
@@ -19,10 +19,45 @@ function harness({ lines = 351, subagentOutput = 'fixture.txt:4: concise finding
 test('preflight does not leak bytes and accepts exactly 350 lines', async () => {
   const h = await harness({ lines: 350 }); const result = await h.tools.get('read').execute({ path: h.file }, h.context);
   assert.equal(h.calls.filter(c => c.kind === 'read').length, 2);
-  assert.equal(h.calls[0].input.limit, 351); assert.equal(h.calls[1].input.limit, 350);
+  assert.equal(h.calls[0].input.limit, 438); assert.equal(h.calls[1].input.limit, 350);
   assert.match(result.content, /SECRET 1/);
   const check = await h.tools.get('large_file_check').execute({ path: h.file }, h.context);
   assert.doesNotMatch(check.content, /SECRET/);
+});
+
+for (const lines of [356, 437]) test(`${lines} lines are within the soft allowance and returned whole in one read`, async () => {
+  const h = await harness({ lines }); const result = await h.tools.get('read').execute({ path: h.file }, h.context);
+  const reads = h.calls.filter(c => c.kind === 'read');
+  assert.deepEqual(reads.map(c => c.input.limit), [438, 437]);
+  assert.match(result.content, new RegExp(`SECRET ${lines}$`));
+  assert.doesNotMatch(result.content, /Large-file/);
+  assert.match((await h.tools.get('large_file_check').execute({ path: h.file }, h.context)).content, /within the full-read allowance/);
+  await denied(h.tools.get('large_file_allow_direct').execute({ path: h.file, reason: 'Need complete function context.' }, h.context), /preflight was small/);
+  await h.tools.get('shell').execute({ command: `cat '${h.file}'` }, h.context);
+  assert.ok(h.calls.some(c => c.kind === 'shell'), 'shell dump of a soft-allowance file is not blocked');
+});
+
+test('438 lines are blocked with guidance that discourages sequential paging', async () => {
+  const leaf = await harness({ lines: 438 });
+  const result = (await leaf.tools.get('read').execute({ path: leaf.file }, leaf.context)).content;
+  assert.match(result, /Large-file context block/); assert.match(result, /more than 437 lines/);
+  assert.match(result, /Do not page through the whole file/); assert.match(result, /grep/);
+  assert.match(result, /ask your router or coordinator for a large_file_summary/); assert.match(result, /large_file_allow_direct/);
+  assert.doesNotMatch(result, /SECRET/);
+  const coordinator = await harness({ lines: 438, agent: 'coordinator' });
+  const routed = (await coordinator.tools.get('read').execute({ path: coordinator.file }, coordinator.context)).content;
+  assert.match(routed, /call large_file_summary with the path and your question/); assert.doesNotMatch(routed, /large_file_allow_direct/);
+  await denied(leaf.tools.get('shell').execute({ command: `cat '${leaf.file}'` }, leaf.context), /shell bypass blocked/);
+});
+
+test('few lines with a huge byte size are blocked by the byte budget', async () => {
+  const h = await harness({ lines: 100, width: 1000 });
+  const result = (await h.tools.get('read').execute({ path: h.file }, h.context)).content;
+  assert.match(result, /Large-file context block/); assert.match(result, /98 KiB in 100 lines/); assert.match(result, /48 KiB/);
+  assert.doesNotMatch(result, /SECRET/);
+  assert.equal(h.calls.filter(c => c.kind === 'read').length, 1, 'only the preflight runs');
+  const ok = await harness({ lines: 100, width: 400 });
+  assert.match((await ok.tools.get('read').execute({ path: ok.file }, ok.context)).content, /SECRET 100/);
 });
 
 test('reviewers discover shell-free JSON paging alongside native read', async () => {
@@ -32,9 +67,10 @@ test('reviewers discover shell-free JSON paging alongside native read', async ()
   assert.equal(h.calls.length, 0, 'registering the reader must not access files');
 });
 
-test('351 lines route broad reads but keep bounded ranges usable for scouts', async () => {
+test('438 lines route broad reads but keep bounded ranges usable for scouts', async () => {
   const h = await harness();
   await denied(h.tools.get('read').execute({ path: h.file }, h.context), /Large-file context block/);
+  await denied(h.tools.get('read').execute({ path: h.file }, h.context), /Do not page through the whole file/);
   await h.tools.get('read').execute({ path: h.file, offset: 99 }, h.context);
   await h.tools.get('read').execute({ path: h.file, offset: 99, limit: 20 }, { ...h.context, agent: 'scout' });
   assert.deepEqual(h.calls.filter(call => call.kind === 'read').at(-1).input, { path: h.file, offset: 99, limit: 20 });
