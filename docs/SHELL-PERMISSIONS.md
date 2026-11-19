@@ -69,3 +69,7 @@ HEAD and a dirty summary (staged/modified/untracked/conflicted counts, first 20 
 runs fixed `git` argv without a shell, with `--no-optional-locks`, `core.fsmonitor=false`
 and `GIT_OPTIONAL_LOCKS=0`, so it cannot write the index or run repository-configured
 fsmonitor commands.
+
+## /tmp scratch space
+
+`configure.py --allow-tmp-scratch` (persisted as `tmp_scratch` in `config/configure-choices.json`; `--no-allow-tmp-scratch` turns it off) adds a single global rule `{"action":"external_directory","resource":"/tmp/*","effect":"allow"}`. Without it, any access outside the workspace (including scratch files under `/tmp/opencode/...`) raises an `external_directory` prompt, which stalls headless runs. The rule does not relax read/edit secret denials, shell asks, or agent-level denies.

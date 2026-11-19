@@ -217,7 +217,11 @@ def shell_rules(shell_policy):
                 [{'action':'shell','resource':command,'effect':'ask'} for command in DANGEROUS_SHELL_ASK])
     raise ValueError(f'shell_policy must be one of {", ".join(SHELL_POLICIES)}')
 
-def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT_SHELL_POLICY, claude_auth_plugin=None):
+# Opt-in scratch space outside the workspace (--allow-tmp-scratch; persisted). Only the native
+# external_directory gate is relaxed for /tmp/*; read/edit secret denials and shell rules still apply.
+TMP_SCRATCH_RULES = ({'action':'external_directory','resource':'/tmp/*','effect':'allow'},)
+
+def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT_SHELL_POLICY, claude_auth_plugin=None, tmp_scratch=False):
     shell_permissions = shell_rules(shell_policy)
     if not isinstance(models, dict):
         raise ValueError('models must be a tier-reference object')
@@ -291,6 +295,8 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
     for action in ('read','edit'):
         permissions += [{'action':action,'resource':p,'effect':'deny'} for p in ('*.env','*.env.*','*auth.json','*.pem','*.key','*anthropic-financial-policy.json','*external-write-grants.json')]
     permissions += shell_permissions
+    if tmp_scratch:
+        permissions += [dict(rule) for rule in TMP_SCRATCH_RULES]
     return {'$schema':'https://opencode.ai/v2/config.json','enabled_providers':providers,'experimental':{'policies':[{'effect':'deny','action':'provider.use','resource':'*'}]+[{'effect':'allow','action':'provider.use','resource':provider} for provider in providers]},'share':'disabled','update':'disable',
         'default_agent':'harness-router','model':models['STRONG'],'permissions':permissions,'agents':agents,
         'plugins':[(package_root/'plugins/v2'/p).resolve().as_uri() for p in ('subscription-guard','model-status','task-outcomes','large-file-context')]
@@ -302,7 +308,7 @@ def load_choices(path):
         value=json.loads(path.read_text())
     except FileNotFoundError:
         return {}
-    if not isinstance(value,dict) or value.get('shell_policy',DEFAULT_SHELL_POLICY) not in SHELL_POLICIES:
+    if not isinstance(value,dict) or value.get('shell_policy',DEFAULT_SHELL_POLICY) not in SHELL_POLICIES or not isinstance(value.get('tmp_scratch',False),bool):
         raise SystemExit(f'{path}: invalid persisted configure choices')
     return value
 
@@ -326,11 +332,13 @@ def main():
     p.add_argument('--routing-policy',type=Path,help='Explicit reviewed candidate policy; requires separately installed/authenticated subscription plugins')
     p.add_argument('--shell-policy',choices=SHELL_POLICIES,help=f'Shell permission policy: allowlist (ask for unlisted commands) or permissive (allow all except dangerous commands). Defaults to the previously persisted choice, else {DEFAULT_SHELL_POLICY}')
     p.add_argument('--claude-auth-plugin',type=Path,help='Built, patched opencode-claude-auth 3.0.0 plugin directory (persisted). Default: previously persisted path, else <release>/plugins/v2/claude-auth, else <prefix>/vendor/claude-auth')
+    p.add_argument('--allow-tmp-scratch',action=argparse.BooleanOptionalAction,default=None,help='Allow agents to use /tmp/* outside the workspace without an external_directory prompt (persisted; --no-allow-tmp-scratch turns it off). Default: previously persisted choice, else off')
     a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
     directory=a.state_dir.expanduser().resolve()/'config';target=directory/'opencode.json'
     choices_path=directory/'configure-choices.json'
     choices=load_choices(choices_path)
     shell_policy=a.shell_policy or choices.get('shell_policy') or DEFAULT_SHELL_POLICY
+    tmp_scratch=a.allow_tmp_scratch if a.allow_tmp_scratch is not None else choices.get('tmp_scratch',False)
     claude_auth=None
     if a.claude_auth_plugin is not None:
         claude_auth=verified_claude_auth_plugin(a.claude_auth_plugin)
@@ -342,7 +350,7 @@ def main():
             p.error(f'persisted claude_auth_plugin {choices["claude_auth_plugin"]} is missing or invalid; pass --claude-auth-plugin')
     else:
         claude_auth=find_claude_auth_plugin() or previous_claude_auth_plugin(target)
-    result=profile(json.loads(a.models.read_text()),routing_policy=routing,shell_policy=shell_policy,claude_auth_plugin=claude_auth)
+    result=profile(json.loads(a.models.read_text()),routing_policy=routing,shell_policy=shell_policy,claude_auth_plugin=claude_auth,tmp_scratch=tmp_scratch)
     replacing = target.exists()
     if replacing and not a.replace:
         p.error('profile exists; use --replace only after reviewing changes')
@@ -350,7 +358,7 @@ def main():
     if target.exists():
         backup=target.with_name(f'opencode.backup-{time.time_ns()}.json');backup.write_bytes(target.read_bytes());backup.chmod(0o600)
     atomic_write_text(target,json.dumps(result,indent=2)+'\n')
-    new_choices={**choices,'shell_policy':shell_policy}
+    new_choices={**choices,'shell_policy':shell_policy,'tmp_scratch':tmp_scratch}
     if a.claude_auth_plugin is not None: new_choices['claude_auth_plugin']=str(claude_auth)
     atomic_write_text(choices_path,json.dumps(new_choices,indent=2)+'\n')
     policy_path=directory/'routing-policy.json'
@@ -368,6 +376,7 @@ def main():
     if 'openai' in result['enabled_providers']: requirements.append('OpenAI OAuth/account and financial verification')
     if 'anthropic' in result['enabled_providers']: requirements.append('reviewed Claude OAuth adapter and disabled usage credits or explicit local app-managed-credit policy')
     print(f'Shell policy: {shell_policy}.')
+    print(f'/tmp scratch (external_directory /tmp/*): {"allowed" if tmp_scratch else "ask"}.')
     if 'anthropic' in result['enabled_providers']:
         if claude_auth is not None: print(f'Claude auth plugin: {claude_auth}.')
         else: print('WARNING: Anthropic is enabled but no built opencode-claude-auth 3.0.0 plugin was found; '

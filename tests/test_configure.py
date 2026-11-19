@@ -227,6 +227,30 @@ class ConfigureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             profile(models,shell_policy='yolo')
 
+    def test_tmp_scratch_is_opt_in_persisted_and_narrow(self):
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        rule={'action':'external_directory','resource':'/tmp/*','effect':'allow'}
+        models={k:'anthropic/fixture#medium' for k in tiers}
+        base,scratch=profile(models,shell_policy='permissive'),profile(models,shell_policy='permissive',tmp_scratch=True)
+        self.assertNotIn(rule,base['permissions'])
+        self.assertIn(rule,scratch['permissions'])
+        # Nothing else changes, and no agent overrides external_directory.
+        self.assertEqual([r for r in scratch['permissions'] if r!=rule],base['permissions'])
+        self.assertEqual(scratch['agents'],base['agents'])
+        self.assertFalse(any(r['action']=='external_directory' for a in scratch['agents'].values() for r in a.get('permissions',[])))
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); mfile=root/'models.json'; mfile.write_text(json.dumps(models))
+            state=root/'state'; config=state/'config'
+            run=lambda *extra: subprocess.run([sys.executable,'configure.py','--models',str(mfile),'--state-dir',str(state),*extra],check=True,capture_output=True,text=True)
+            out=run('--allow-tmp-scratch')
+            self.assertIn('/tmp scratch (external_directory /tmp/*): allowed',out.stdout)
+            self.assertIn(rule,json.loads((config/'opencode.json').read_text())['permissions'])
+            run('--replace')  # persisted
+            self.assertIn(rule,json.loads((config/'opencode.json').read_text())['permissions'])
+            run('--replace','--no-allow-tmp-scratch')
+            self.assertNotIn(rule,json.loads((config/'opencode.json').read_text())['permissions'])
+            self.assertFalse(json.loads((config/'configure-choices.json').read_text())['tmp_scratch'])
+
     def test_readonly_roles_get_repo_identity_instead_of_shell(self):
         p=profile({k:'anthropic/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
         self.assertIn({'action':'repo_identity','resource':'*','effect':'allow'},p['permissions'])
@@ -242,7 +266,7 @@ class ConfigureTests(unittest.TestCase):
             state=root/'state'; config=state/'config'
             run=lambda *extra: subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(state),*extra],check=True,capture_output=True,text=True)
             run()
-            self.assertEqual(json.loads((config/'configure-choices.json').read_text()),{'shell_policy':'allowlist'})
+            self.assertEqual(json.loads((config/'configure-choices.json').read_text()),{'shell_policy':'allowlist','tmp_scratch':False})
             out=run('--replace','--shell-policy','permissive')
             self.assertIn('Shell policy: permissive',out.stdout)
             generated=json.loads((config/'opencode.json').read_text())

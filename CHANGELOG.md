@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — /tmp scratch space
+
+- Add `configure.py --allow-tmp-scratch` / `--no-allow-tmp-scratch` (persisted as `tmp_scratch`, default off). When on, the profile adds one global rule, `external_directory /tmp/*` allow, so agents can use /tmp scratch files without a prompt. Read/edit secret denials, shell rules and agent-level rules are unchanged.
+
 ## Unreleased — monitoring fixes (quota CLI, lock files, Claude adapter entry)
 
 - `configure.py` adds the vendored opencode-claude-auth 3.0.0 adapter to the generated `plugins` list when Anthropic is enabled. New `--claude-auth-plugin DIR` (persisted). Without it, configure detects `<release>/plugins/v2/claude-auth`, `<prefix>/vendor/claude-auth`, or a still-valid entry in the profile being replaced. It warns when none is found. `install.py` does not build or vendor the adapter; see docs/CLAUDE-SUBSCRIPTION.md.
