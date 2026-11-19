@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — parent cancellation of dispatched children
+
+- Add `task_dispatch_cancel {taskId, workKey and/or sessionID, reason}` for delegating roles (router, coordinator). Only the recorded dispatcher of a child can cancel it. Grandchildren are refused unless the caller dispatched them. Other task trees never match.
+- Cancellation rejects the child subtree's pending permission asks (plain `reject`), interrupts the child and its active descendants with `session.interrupt({resume:false})`, then records `state:'cancelled'` and `cancellation {reason, cancelledAt, cancelledBy, generation, previousState, interrupted, pendingPermissionsRejected}`. It also clears the record's write scope and removes the child's global writer leases. Records the cancelled child dispatched are cancelled with it. The result lists the released locks.
+- Repeated calls return `already_cancelled`, and idle children return `already_finished` with no changes. If the native interrupt fails, nothing is released.
+- A cancelled child and its descendants cannot start another model request until the parent re-admits them through `task_dispatch`. A foreground handoff that is cancelled while running keeps the cancellation.
+- `task_dispatch_status` reports `cancellation` per owner and a `cancelledChildren` list, including in `summary:true`. `configure.py` allows `task_dispatch_cancel` only for delegating roles (built-in agents keep `task_*` denied) and adds one line to their guidance.
+
 ## Unreleased — /tmp scratch space
 
 - Add `configure.py --allow-tmp-scratch` / `--no-allow-tmp-scratch` (persisted as `tmp_scratch`, default off). When on, the profile adds one global rule, `external_directory /tmp/*` allow, so agents can use /tmp scratch files without a prompt. Read/edit secret denials, shell rules and agent-level rules are unchanged.

@@ -24,6 +24,7 @@ import { summarizeTaskDispatchStatus } from './task-dispatch-status-summary.mjs'
 import { integrationAssignmentTemplate } from './integration-assignment.mjs';
 import { rootProgressStatus, rootProgressReminder } from './root-progress.mjs';
 import { createTerminalSettler, terminalSettlementEligibility } from './terminal-settlement.mjs';
+import { createDispatchCanceller, cancelInputSchema } from './task-dispatch-cancel.mjs';
 
 const readContextCatalog = async ctx => {
   try { return (await ctx.model?.list())?.data; } catch { return undefined; }
@@ -360,6 +361,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
   const settleTerminal = createTerminalSettler({ registry, globalRegistry, workspace,
     canonicalWorkspace:()=>canonicalWriterPath(workspace), loadSessions, loadTerminalReceipt, now });
+  const cancelChild = createDispatchCanceller({ registry, globalRegistry, workspace,
+    canonicalWorkspace:()=>canonicalWriterPath(workspace), loadSessions, ctx, now });
   const quotaNotifier = async notice => {
     if (typeof ctx.session?.synthetic !== 'function') throw new Error('task-dispatch: synthetic notification unavailable');
     await ctx.session.synthetic(quotaRecoverySyntheticInput(notice));
@@ -418,6 +421,10 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       if (state.records.some(r => r.childID === event.sessionID || (r.rootID === rootID && r.state !== 'completed')))
         throw new Error('task-dispatch: native mode cannot bypass existing managed task ownership; continue its recorded owner or start an independent fresh native chat.');
     }
+    // An explicitly cancelled child (or a descendant of one) never infers again
+    // until its parent re-admits it through task_dispatch.
+    const cancelled = state.records.find(r => r.state === 'cancelled' && r.childID && (r.childID === event.sessionID || descendant(sessions,event.sessionID,r.childID)));
+    if (cancelled) throw new Error(`task-dispatch: child ${cancelled.childID} was cancelled by its parent (${cancelled.cancellation?.reason ?? 'no reason'}); stop. Only the parent may re-admit it via task_dispatch.`);
     const owner = state.records.find(r => r.childID === event.sessionID && r.intentRevision);
     if (!owner) return;
     const current = getIntent(state,owner.rootID,owner.taskId);
@@ -762,7 +769,10 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       });
       if (admission.existing) return { content:`Existing child ${admission.existing} is still running or awaiting its admitted compaction outcome. ${guidance}`, metadata:{sessionID:admission.existing,status:'running'}, output:{sessionID:admission.existing,status:'running',output:'Existing worker retained; no duplicate was launched.'} };
       const update = async (patch, accepted = false) => globalRegistry('all-writers',async(globalState,saveGlobal)=>registry(workspace,async(state,save)=> {
-        const r=state.records.find(r=>r.key===admission.key); if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly');
+        const r=state.records.find(r=>r.key===admission.key);
+        // The parent cancelled this generation: its record and leases are already released.
+        if(r?.state==='cancelled'&&r.cancellation?.generation===admission.generation) return;
+        if(r?.inFlight!==token) throw new Error('task-dispatch: ownership changed unexpectedly');
         if(admission.writerLease) {
           const lease=globalState.leases?.find(item=>item.token===token);
           if(!lease) throw new Error('task-dispatch: global writer lease changed unexpectedly');
@@ -883,6 +893,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       return {content:JSON.stringify(integrationAssignmentTemplate())};
     }});
     editor.add({name:'task_dispatch',description:`Capability-checked durable handoff. ${INTENT_FIRST_HELP} For a cross-component assignment, read task_dispatch_template({kind:'integration'}) once at its planning boundary. ${guidance}`,input:schema,execute:async(input,context)=>{const {output,metadata:raw,...rendered}=await dispatch(input,context),metadata=jsonMetadata(raw);return metadata?{...rendered,metadata}:rendered;}});
+    editor.add({name:'task_dispatch_cancel',description:'Recorded dispatcher only: interrupt a child this session dispatched (and its active descendants), reject their pending permission asks, record the cancellation (reason required) and release its ownership and writer leases so a new lane can be admitted. Idempotent; refuses children you did not dispatch.',input:cancelInputSchema,execute:cancelChild});
     editor.add({name:'task_dispatch_reconcile_terminal',description:'Recorded parent only: explicitly settle an exact stopped background generation after supersession or failure. Read-only native evidence plus exact ownership release; no inference, retry, new permission or current-task success. For successful current-intent results use task_dispatch_collect.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1},workKey:{type:'string',minLength:1},sessionID:{type:'string',minLength:1},generation:{type:'integer',minimum:1}},required:['taskId','workKey','sessionID','generation']},execute:settleTerminal});
     // A foreground handoff returns its report inline. Retain an exact,
     // bounded copy so the parent can recover it when that result was lost.
@@ -950,7 +961,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }
       const currentRecovery = entry => state.records.some(r => r.rootID===rootID && r.parentID===entry.target.parentID && r.childID===entry.target.childID && r.admissionGeneration===entry.target.generation);
       const self=sessions.find(s=>s.id===context.sessionID);
-      const status={owners,rootProgress:rootProgressStatus(self,now()),selfContext:observedContext(self,contextCatalog),quotaRecoveryPending:pendingQuotaRecovery(state).filter(currentRecovery),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))};
+      const status={owners,rootProgress:rootProgressStatus(self,now()),selfContext:observedContext(self,contextCatalog),quotaRecoveryPending:pendingQuotaRecovery(state).filter(currentRecovery),taskWork:input.taskId?taskWorkStatus(state,rootID,input.taskId):undefined,userActions:state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).flatMap(r=>userActions([r],getIntent(state,rootID,r.taskId)?.revision)),cancelledChildren:state.records.filter(r=>r.rootID===rootID&&r.state==='cancelled'&&(!input.taskId||r.taskId===input.taskId)).map(r=>({taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.cancellation?.generation,reason:r.cancellation?.reason,cancelledAt:r.cancellation?.cancelledAt,cancelledBy:r.cancellation?.cancelledBy,...(r.cancellation?.cascadeFrom?{cascadeFrom:r.cancellation.cascadeFrom}:{})})),existingUntracked:legacy,workspaceActive:workspaceBlockers.map(s=>({id:s.id,agent:s.agent,...recovery(sessions,s.id,context.sessionID,state.records)}))};
       return {content:JSON.stringify(input.summary===true?summarizeTaskDispatchStatus(status):status)};
     })});
   });

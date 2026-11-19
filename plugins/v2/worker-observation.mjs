@@ -1,7 +1,7 @@
 // Passive observations only. Silence and native activity are not task acceptance.
 const time = v => Number.isSafeInteger(v) && v > 0 ? v : undefined;
 const age = (v, now) => time(v) && now >= v ? now-v : undefined;
-const names = new Set(['read','write','edit','patch','apply_patch','shell','bash','glob','grep','list','question','plan_enter','plan_exit','task_dispatch','task_dispatch_collect','task_dispatch_status','task_intent','task_outcome','task_artifact','webfetch']);
+const names = new Set(['read','write','edit','patch','apply_patch','shell','bash','glob','grep','list','question','plan_enter','plan_exit','task_dispatch','task_dispatch_cancel','task_dispatch_collect','task_dispatch_status','task_intent','task_outcome','task_artifact','webfetch']);
 function tool(t) {
   const result={name:names.has(t?.name)?t.name:'other',status:['streaming','completed','error','cancelled'].includes(t?.status)?t.status:'other'};
   for (const key of ['messageID','toolID']) if (typeof t?.[key] === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(t[key])) result[key]=t[key];

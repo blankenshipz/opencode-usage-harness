@@ -74,6 +74,9 @@ INTENT_FIRST_GUIDANCE = ("\nBefore the first task_dispatch/subagent handoff of a
     "intent:{outcome, target, nonGoals, authorizedEffects, assumptions, checks:[{id, description, mode}], sourceMessageIDs}}. "
     "Pass its current.revision as intentRevision and the chosen check ids as checkIds in that handoff; "
     "a handoff without them is rejected and its whole prompt must be re-sent.")
+# Delegating roles can stop only children they dispatched themselves.
+CANCEL_GUIDANCE = ("\nTo stop a child you dispatched (e.g. after a rule change), call task_dispatch_cancel "
+    "{taskId, workKey, reason}; it interrupts it and releases its locks.")
 
 NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','deep-debugger','deep-debugger-high','architect','reviewer','verifier','maximum','maximum-max')
 ROLES = {
@@ -248,7 +251,8 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
         rules = [{'action':'subagent','resource':'*','effect':'deny'},
                  {'action':'large_file_summary','resource':'*','effect':'allow' if delegate else 'deny'},
                  {'action':'large_file_allow_direct','resource':'*','effect':'deny' if readonly else 'allow'},
-                 {'action':'task_dispatch','resource':'*','effect':'allow' if delegate else 'deny'}]
+                 {'action':'task_dispatch','resource':'*','effect':'allow' if delegate else 'deny'},
+                 {'action':'task_dispatch_cancel','resource':'*','effect':'allow' if delegate else 'deny'}]
         if delegate:
             children = [child for child in ROLES if child != 'router' and (role == 'router' or child != 'coordinator')]
             rules += [{'action':'subagent','resource':child_id,'effect':'allow'}
@@ -270,7 +274,7 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
         identity_guidance = ('\nUse visible harness-* IDs for new handoffs. When continuing an existing worker, '
                              'pass its exact stored agent ID and sessionID; never rename or adopt it.')
         definition = {'description':f'harness {role.replace("-", " ")}', 'mode':'primary' if role == 'router' else 'all',
-            'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance+(INTENT_FIRST_GUIDANCE if delegate else ''), 'permissions':rules}
+            'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance+(INTENT_FIRST_GUIDANCE+CANCEL_GUIDANCE if delegate else ''), 'permissions':rules}
         if 'builder' in role:
             definition['system'] += BUILDER_FILE_WRITE_GUIDANCE
         if readonly:

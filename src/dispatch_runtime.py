@@ -120,7 +120,7 @@ def _completed_context_observation(raw: str, message_id: object) -> tuple[object
 _NATIVE_TOOL_NAMES = {
     "read", "write", "edit", "patch", "apply_patch", "shell", "bash",
     "glob", "grep", "list", "question", "plan_enter", "plan_exit",
-    "task_dispatch", "task_dispatch_collect", "task_dispatch_status",
+    "task_dispatch", "task_dispatch_cancel", "task_dispatch_collect", "task_dispatch_status",
     "task_intent", "task_outcome", "task_artifact", "webfetch",
 }
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")

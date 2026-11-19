@@ -52,6 +52,21 @@ class ConfigureTests(unittest.TestCase):
         for role in ('harness-builder','harness-verifier','harness-scout'):
             self.assertNotIn('Before the first task_dispatch/subagent handoff', p['agents'][role]['system'])
 
+    def test_only_delegating_roles_may_cancel_their_children(self):
+        p=profile({k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
+        def effect(agent):
+            rules=[r for r in p['agents'][agent]['permissions'] if r['action'] in ('task_dispatch_cancel','task_*')]
+            return rules[-1]['effect'] if rules else None
+        for role in ('harness-router','router','harness-coordinator','coordinator'):
+            self.assertEqual(effect(role),'allow')
+            self.assertIn('task_dispatch_cancel', p['agents'][role]['system'])
+        for role in ('harness-builder','harness-verifier','harness-scout','harness-reviewer','builder'):
+            self.assertEqual(effect(role),'deny')
+            self.assertNotIn('task_dispatch_cancel', p['agents'][role]['system'])
+        for builtin in ('build','plan','general','explore'):
+            self.assertEqual(effect(builtin),'deny')
+        self.assertNotIn('task_dispatch_cancel', {r['action'] for r in p['permissions'] if r['effect']=='allow'})
+
     def test_task_fit_policy_validation(self):
         models={k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')}
         def policy(rule):
