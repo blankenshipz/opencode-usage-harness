@@ -604,6 +604,32 @@ def terminal_receipt(session_id: str, marker: str, prompt_hash: str, *, db_path:
         return receipt
 
 
+FINAL_TEXT_LIMIT = 64000
+
+
+def final_text(session_id: str, assistant_id: str, *, db_path: str | Path | None = None, limit: int = FINAL_TEXT_LIMIT) -> dict[str, object] | None:
+    """Return the bounded visible text of one exact completed child answer.
+
+    Callers first bind ``assistant_id`` through ``completion_receipt``; this
+    only reads that row and never returns reasoning, tool input or tool output.
+    """
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT data FROM session_message WHERE session_id=? AND id=? AND type='assistant'",
+            (session_id, assistant_id),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        item = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    content = item.get("content") if isinstance(item, dict) else None
+    if not isinstance(content, list) or item.get("finish") != "stop":
+        return None
+    text = "".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text" and isinstance(x.get("text"), str))
+    return {"assistantID": assistant_id, "text": text[:limit], "truncated": len(text) > limit, "length": len(text)}
+
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
@@ -615,6 +641,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if len(args) == 4 and args[0] == "--terminal-receipt":
         print(json.dumps(terminal_receipt(args[1], args[2], args[3])))
+        return 0
+    if len(args) == 3 and args[0] == "--final-text":
+        print(json.dumps(final_text(args[1], args[2])))
         return 0
     print(json.dumps(sessions()))
     return 0

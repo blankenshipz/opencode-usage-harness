@@ -66,6 +66,14 @@ def validate_routing_policy(routing_policy):
             validate_task_fit(candidate)
 
 
+# Delegating roles must register shared intent before their first handoff;
+# a rejected handoff forces the model to regenerate its whole prompt.
+INTENT_FIRST_GUIDANCE = ("\nBefore the first task_dispatch/subagent handoff of a taskId: call task_intent "
+    "{taskId, action:'get'} for sourceMessageIDs, then task_intent {taskId, action:'set', expectedRevision:0, "
+    "intent:{outcome, target, nonGoals, authorizedEffects, assumptions, checks:[{id, description, mode}], sourceMessageIDs}}. "
+    "Pass its current.revision as intentRevision and the chosen check ids as checkIds in that handoff; "
+    "a handoff without them is rejected and its whole prompt must be re-sent.")
+
 NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','deep-debugger','deep-debugger-high','architect','reviewer','verifier','maximum','maximum-max')
 ROLES = {
     'router': ('STRONG', True, True),
@@ -173,7 +181,7 @@ def profile(models, package_root=ROOT, routing_policy=None):
         identity_guidance = ('\nUse visible harness-* IDs for new handoffs. When continuing an existing worker, '
                              'pass its exact stored agent ID and sessionID; never rename or adopt it.')
         definition = {'description':f'harness {role.replace("-", " ")}', 'mode':'primary' if role == 'router' else 'all',
-            'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance, 'permissions':rules}
+            'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance+(INTENT_FIRST_GUIDANCE if delegate else ''), 'permissions':rules}
         if role == 'verifier':
             definition['system'] += '\nExecute the assigned checks and report commands, exit codes and findings. Do not implement production repairs. Create verification scripts and fixtures only in the explicitly assigned .artifacts directory; reserve that directory in writePaths before writing. Never use artifact paths or symlinks to evade a production edit denial. Shell execution can write artifacts; retain declared workspace ownership and all native approvals. This role is not a read-only sandbox.'
         agents[visible_role(role)] = definition

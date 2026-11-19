@@ -10,7 +10,7 @@ import { realpath } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import crypto from 'node:crypto';
-import { createRegistry, runtimeSessions, runtimeIntentSources, runtimeCompletionReceipt, runtimeTerminalReceipt, lineage, descendant, overlaps } from './dispatch-registry.mjs';
+import { createRegistry, runtimeSessions, runtimeIntentSources, runtimeCompletionReceipt, runtimeTerminalReceipt, runtimeFinalText, lineage, descendant, overlaps } from './dispatch-registry.mjs';
 import { authorizeExternalWrites } from './external-write-grant.mjs';
 import { reserveWriterLease, finishWriterLease, writerPathsOverlap } from './global-write-lease.mjs';
 import { intentSchema, getIntent, setIntent, bindIntent, renderIntent, renderIntentReference } from './task-intent.mjs';
@@ -114,11 +114,20 @@ function recovery(sessions, workerID, callerID, records) {
     advice: direct ? 'Continue this direct child and ask it to coordinate the authorized follow-up after its active writers finish. Preserve ownership IDs when supplied.' : 'The owner is outside this child tree. Wait and recheck status; do not attempt cross-parent adoption.' };
 }
 
+// The shared intent must exist before a new handoff. State it in the schema and
+// in every rejection with the exact corrective call, because a rejected handoff
+// forces the model to regenerate its whole (often large) prompt.
+export const INTENT_FIRST_HELP = "Before the first handoff of a taskId, call task_intent({taskId, action:'set', expectedRevision:0, intent:{outcome, target, nonGoals:[], authorizedEffects:[], assumptions:[], checks:[{id:'tests', description:'...', mode:'local'}], sourceMessageIDs:['<latest root user msg_ id from task_intent get>']}}), then pass intentRevision:<current.revision> and checkIds:['tests'] in the handoff.";
+const INTENT_REVISION_HELP = `Required for every new handoff (omit only when continuing a legacy child that has no intent). ${INTENT_FIRST_HELP}`;
+export function missingIntentError(taskId) {
+  const id = JSON.stringify(typeof taskId === 'string' ? taskId : '<taskId>');
+  return new Error(`task-intent: register the user outcome with task_intent before a new handoff; no work was admitted. Next call: task_intent({taskId:${id}, action:'get'}) to read sourceMessageIDs, then task_intent({taskId:${id}, action:'set', expectedRevision:0, intent:{outcome:'...', target:'...', nonGoals:[], authorizedEffects:['...'], assumptions:[], checks:[{id:'tests', description:'...', mode:'local'}], sourceMessageIDs:['msg_...']}}). Then retry this handoff unchanged except intentRevision:<current.revision> and checkIds:['tests'].`);
+}
 const schema = { type: 'object', additionalProperties: false, properties: {
   taskId: { type: 'string', minLength: 1, maxLength: 160 }, workKey: { type: 'string', minLength: 1, maxLength: 160 },
   operation: { type: 'string', enum: operations },
-  intentRevision: {type:'integer',minimum:1}, checkIds:{type:'array',minItems:1,maxItems:12,uniqueItems:true,items:{type:'string'}},
-  agent: { type: 'string', minLength: 1 }, description: { type: 'string', minLength: 1 }, prompt: { type: 'string', minLength: 1 },
+  intentRevision: {type:'integer',minimum:1,description:INTENT_REVISION_HELP}, checkIds:{type:'array',minItems:1,maxItems:12,uniqueItems:true,items:{type:'string'},description:'Required with intentRevision for a new handoff: 1-12 check ids from the current task_intent checks that this worker must satisfy.'},
+  agent: { type: 'string', minLength: 1 }, description: { type: 'string', minLength: 1 },
   requiredCapabilities: { type: 'array', uniqueItems: true, items: { type: 'string', enum: ['shell','edit','delegate'] } },
   writePaths: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1 } },
   publication: { type: 'object', additionalProperties: false, properties: { revision: { type: 'string', minLength: 40, maxLength: 64 }, checkout: { type: 'string', minLength: 1, maxLength: 500 } }, required: ['revision','checkout'] },
@@ -132,6 +141,9 @@ const schema = { type: 'object', additionalProperties: false, properties: {
     inputs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 160 } },
     authorization: { type: 'string', minLength: 1, maxLength: 240 }, explanation: { type: 'string', minLength: 1, maxLength: 240 }, reference: { type: 'string', minLength: 1, maxLength: 240 },
   }, required: ['kind','scope','inputs','authorization','explanation','reference'] },
+  // Keep the large free-text prompt last so short identity/intent fields are
+  // generated (and corrected) before a long assignment body.
+  prompt: { type: 'string', minLength: 1, description: 'Worker assignment text. Write it after intentRevision/checkIds are known; a rejected handoff must be re-sent in full.' },
 }, required: ['taskId','workKey','operation','agent','description','prompt','requiredCapabilities'] };
 // Mirrors the stock OpenCode subagent input (see core/tool/plugin/subagent.ts).
 // Keep it separate from the harness schema so built-in callers retain their
@@ -142,6 +154,46 @@ const nativeSubagentSchema = { type:'object', additionalProperties:false, proper
   model:{type:'string',minLength:1,description:'Set only when the user explicitly requests a model or variant. Discover its exact provider/model#variant ID.'}, sessionID:{type:'string',minLength:1}, background:{type:'boolean'},
 }, required:['agent','description','prompt'] };
 const guidance = 'Keep taskId/workKey stable. Use sessionID to steer or resume the existing child; inspect task_dispatch_status summary:true at continuation boundaries and after a failure. If nextDispatch.workReview.requiredWhenIdle is true, include workReview {hypothesis,evidenceReference} before the next idle admission; this reassessment needs no human approval. Set refreshIntent only to resend the full shared intent after child context compaction or loss. Never launch a replacement while its descendants remain active. A new implement assignment with omitted writePaths owns the workspace; an explicit same-child continuation with omitted writePaths retains its admitted paths. Deploy requires exclusive workspace ownership. Publish requires explicit scoped paths and an exact frozen revision.';
+// OpenCode records a tool's terminal event with metadata validated as strict
+// JSON (Schema.Json). A nested `undefined` (for example routing.modelOverride),
+// NaN or a class instance makes that durable publish fail after core has marked
+// the call settled: the tool part stays "running" and the parent model receives
+// no result. Every harness dispatch result therefore carries plain JSON only.
+export function jsonMetadata(value) {
+  if (value === undefined || value === null) return undefined;
+  try {
+    const plain = JSON.parse(JSON.stringify(value));
+    return plain && typeof plain === 'object' && !Array.isArray(plain) ? plain : undefined;
+  } catch { return undefined; }
+}
+export const HANDOFF_RESULT_LIMIT = 16000;
+export function boundedReport(value, limit = HANDOFF_RESULT_LIMIT) {
+  const text = typeof value === 'string' ? value : '';
+  if (text.length <= limit) return { text, truncated:false, length:text.length };
+  return { text:`${text.slice(0, limit)}\n[harness: final report truncated at ${limit} of ${text.length} characters]`, truncated:true, length:text.length };
+}
+// Native results always carry output.status; harness-only states (compacting,
+// awaiting_continuation) are not task completion and map to running.
+const nativeStatus = result => (result?.output?.status ?? result?.metadata?.status) === 'completed' ? 'completed' : 'running';
+const nativeReport = result => {
+  if (typeof result?.output?.output === 'string') return result.output.output;
+  if (typeof result?.content === 'string') return result.content.replace(/^<subagent [^>]*>\n?/, '').replace(/\n?<\/subagent>$/, '');
+  if (Array.isArray(result?.content)) return result.content.filter(item => item?.type === 'text').map(item => item.text).join('\n');
+  return '';
+};
+const collectArguments = ({ taskId, workKey, sessionID, generation }) => ({ taskId, workKey, sessionID, generation });
+// The native subagent tool declares {sessionID,status,output}; core rejects a
+// result without it. Harness-only returns (compaction, retained child) are
+// normalized here so they still settle.
+export function settleSubagentResult(result) {
+  const metadata = jsonMetadata(result?.metadata);
+  const text = typeof result?.content === 'string' ? result.content : nativeReport(result);
+  const sessionID = result?.output?.sessionID ?? metadata?.sessionID;
+  const settled = { ...result, content: text || 'task-dispatch: no textual result', metadata };
+  if (metadata === undefined) delete settled.metadata;
+  if (typeof sessionID === 'string' && sessionID) settled.output = { sessionID, status: nativeStatus({ output:result?.output, metadata }), output: typeof result?.output?.output === 'string' ? result.output.output : text };
+  return settled;
+}
 const sameChecks = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every(id => right.includes(id));
 // A corrected outcome may need a new assignment, but it may never silently
 // widen or replace an already admitted child's ownership.  This is deliberately
@@ -302,7 +354,7 @@ export function taskWorkStatus(state,rootID,taskId) {
   const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
-export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -417,6 +469,17 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
+      // Fail a new handoff without shared intent before any agent, quota,
+      // publication or ownership work. Admission rechecks this under its lock.
+      if (input.sessionID === undefined && (input.intentRevision === undefined || input.checkIds === undefined) &&
+          !(input.taskId === 'large-file-summary' && input.operation === 'inspect')) {
+        await registry(workspace, async state => {
+          const rootID = lineage(await loadSessions(), context.sessionID);
+          const current = getIntent(state, rootID, input.taskId);
+          if (current) bindIntent(state, { rootID, taskId:input.taskId, intentRevision:input.intentRevision, checkIds:input.checkIds });
+          else if (!state.records.some(r => r.key === `${rootID}\0${input.taskId}\0${input.workKey}`)) throw missingIntentError(input.taskId);
+        });
+      }
       if (input.operation === 'publish') {
         if (!Array.isArray(input.writePaths) || input.writePaths.length === 0) throw new Error('task-dispatch: publish requires explicit non-empty writePaths for every admission');
         if (!input.publication || typeof input.publication !== 'object' || Array.isArray(input.publication) || Object.keys(input.publication).length !== 2 || typeof input.publication.revision !== 'string' || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(input.publication.revision)) throw new Error('task-dispatch: publish requires publication.revision as a full frozen commit OID');
@@ -537,7 +600,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         const intent = getIntent(state,rootID,input.taskId);
         const summaryOnly = input.taskId === 'large-file-summary' && input.operation === 'inspect' && role === 'scout' && input.requiredCapabilities.length === 0;
         if (intent) bindIntent(state,{rootID,taskId:input.taskId,intentRevision:input.intentRevision,checkIds:input.checkIds});
-        else if (!summaryOnly && !record && !input.sessionID) throw new Error('task-intent: register the user outcome with task_intent before a new handoff; then pass intentRevision and checkIds');
+        else if (!summaryOnly && !record && !input.sessionID) throw missingIntentError(input.taskId);
         const requested = input.sessionID ?? record?.childID;
         const staleRebind = Boolean(intent && record && requested && record.intentRevision !== intent.revision);
         if (requested) {
@@ -774,8 +837,23 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           await update({childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null,...(admission.restoreBinding ?? {})});
           return {...result,content:`task-dispatch: native ${denied} recorded. ${denialAdvice(denied)}`,metadata:{...(result?.metadata??{}),denial:{category:denied}}};
         }
-        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null},true);
-        return {...result, metadata:{...(result.metadata ?? {}),routing:admission.routing,...(admission.contextAdvice?{contextAdvice:admission.contextAdvice}:{}),...(admission.convergence?{convergence:admission.convergence}:{})}};
+        // A foreground return is the child's final report. Retain a bounded copy
+        // with the exact generation so a lost tool result can be collected later.
+        const status=nativeStatus(result), background=status==='running';
+        const report=background?undefined:boundedReport(nativeReport(result));
+        const identity={taskId:input.taskId,workKey:input.workKey,sessionID:observed,agent:input.agent,generation:admission.generation};
+        const collect=collectArguments(identity);
+        const foregroundResult=report&&observed?{generation:admission.generation,sessionID:observed,status,output:report.text,truncated:report.truncated,length:report.length,completedAt:now()}:undefined;
+        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null,foregroundResult},true);
+        const body=background
+          ? (nativeReport(result) || `The subagent is working in the background (sessionID: ${observed}).`)
+          : `<subagent sessionID="${observed}" state="${status}" agent="${input.agent}" generation="${admission.generation}">\n${report.text}\n</subagent>`;
+        const note=background
+          ? `Harness handoff admitted in background: ${JSON.stringify({...identity,status,mode:'background'})}. Continue non-overlapping work; after the completion notice call task_dispatch_collect(${JSON.stringify(collect)}).`
+          : `Harness handoff completed in foreground: ${JSON.stringify({...identity,status,mode:'foreground',truncated:report.truncated})}. The child's final report is above; re-read it with task_dispatch_collect(${JSON.stringify(collect)}).`;
+        return {...result, content:`${body}\n\n${note}`,
+          ...(observed?{output:{sessionID:observed,status,output:background?(typeof result?.output?.output==='string'?result.output.output:body):report.text}}:{}),
+          metadata:jsonMetadata({...(result?.metadata ?? {}),...identity,status,mode:background?'background':'foreground',collect,routing:admission.routing,...(admission.contextAdvice?{contextAdvice:admission.contextAdvice}:{}),...(admission.convergence?{convergence:admission.convergence}:{})})};
       } catch(error) {
         const denied = admissionDenial(error);
         await update(denied ? {childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null,...(admission.restoreBinding ?? {})} : {childID:observed,state:observed?'paused':'not_started',inFlight:null,...(admission.restoreBinding ?? {})});
@@ -789,27 +867,47 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       // Built-in agents use the stock subagent schema.  Harness roles enter
       // through task_dispatch (or a harness-shaped call) and retain the full
       // durable ownership contract.
-      tool.description+=`\nHarness callers use task_dispatch for ownership and capability checks. ${guidance}`;
-      tool.input={type:'object',additionalProperties:false,properties:{...stockInput.properties,...schema.properties},required:stockInput.required ?? ['agent','description','prompt']};
+      tool.description+=`\nHarness callers use task_dispatch for ownership and capability checks. ${INTENT_FIRST_HELP} ${guidance}`;
+      const {prompt:harnessPrompt,...harnessFields}=schema.properties,{prompt:_stockPrompt,...stockFields}=stockInput.properties ?? {};
+      tool.input={type:'object',additionalProperties:false,properties:{...stockFields,...harnessFields,prompt:harnessPrompt},required:stockInput.required ?? ['agent','description','prompt']};
       tool.execute=async(input,context)=>{
         if (isNativeAgent(context?.agent) && !isHarnessDispatchInput(input)) {
           await guardNativeDispatch({ registry, workspace, loadSessions, context, input, lineage });
           return rawExecute(input,context);
         }
-        return dispatch(input,context);
+        return settleSubagentResult(await dispatch(input,context));
       };
     });
     editor.add({name:'task_dispatch_template',description:'Read the compact integration-assignment template; guidance only, no dispatch or authorization.',input:{type:'object',additionalProperties:false,properties:{kind:{type:'string',enum:['integration']}},required:['kind']},execute:async input=>{
       if (input.kind!=='integration') throw new Error('task-dispatch: unsupported assignment template; kind must be integration');
       return {content:JSON.stringify(integrationAssignmentTemplate())};
     }});
-    editor.add({name:'task_dispatch',description:`Capability-checked durable handoff. For a cross-component assignment, read task_dispatch_template({kind:'integration'}) once at its planning boundary. ${guidance}`,input:schema,execute:async(input,context)=>{const {output,...rendered}=await dispatch(input,context);return rendered;}});
+    editor.add({name:'task_dispatch',description:`Capability-checked durable handoff. ${INTENT_FIRST_HELP} For a cross-component assignment, read task_dispatch_template({kind:'integration'}) once at its planning boundary. ${guidance}`,input:schema,execute:async(input,context)=>{const {output,metadata:raw,...rendered}=await dispatch(input,context),metadata=jsonMetadata(raw);return metadata?{...rendered,metadata}:rendered;}});
     editor.add({name:'task_dispatch_reconcile_terminal',description:'Recorded parent only: explicitly settle an exact stopped background generation after supersession or failure. Read-only native evidence plus exact ownership release; no inference, retry, new permission or current-task success. For successful current-intent results use task_dispatch_collect.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1},workKey:{type:'string',minLength:1},sessionID:{type:'string',minLength:1},generation:{type:'integer',minimum:1}},required:['taskId','workKey','sessionID','generation']},execute:settleTerminal});
-    editor.add({name:'task_dispatch_collect',description:'Collect an exact terminal receipt for one admitted background generation without inference. Legacy or unbound generations are not collectable.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1},workKey:{type:'string',minLength:1},sessionID:{type:'string',minLength:1},generation:{type:'integer',minimum:1}},required:['taskId','workKey','sessionID','generation']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
+    // A foreground handoff returns its report inline. Retain an exact,
+    // bounded copy so the parent can recover it when that result was lost.
+    const collectForeground=async({record,binding,child,input,save})=>{
+      const respond=(result,receipt)=>({content:JSON.stringify({sessionID:input.sessionID,generation:input.generation,mode:'foreground',status:result.status,truncated:result.truncated,output:result.output,...(receipt?{receipt}:{})}),
+        metadata:{sessionID:input.sessionID,generation:input.generation,mode:'foreground',status:result.status}});
+      const retained=record.foregroundResult;
+      if (retained?.generation===input.generation && retained.sessionID===input.sessionID) return respond(retained);
+      if (record.inFlight || child?.active) throw new Error(`task-dispatch: foreground generation ${input.generation} is still running; its final report is returned by the original task_dispatch/subagent call. Wait for that call; do not relaunch, steer or poll the child.`);
+      const receipt=await loadCompletionReceipt({sessionID:input.sessionID,marker:binding.marker,promptHash:`${binding.promptHash},${binding.prefixedPromptHash}`});
+      if (!receipt?.assistantID) throw new Error(`task-dispatch: no exact terminal receipt exists for foreground generation ${input.generation}; the child has not finished this assignment with a final answer. Inspect task_dispatch_status; continue the same child with sessionID only if work remains.`);
+      const final=await loadFinalText({sessionID:input.sessionID,assistantID:receipt.assistantID});
+      if (typeof final?.text!=='string') throw new Error(`task-dispatch: the terminal answer for foreground generation ${input.generation} is unavailable; inspect the child session directly`);
+      const report=boundedReport(final.text);
+      const identity={promptID:receipt.promptID,assistantID:receipt.assistantID,idleID:receipt.idleID,...(receipt.completedAt?{completedAt:receipt.completedAt}:{})};
+      record.foregroundResult={generation:input.generation,sessionID:input.sessionID,status:'completed',output:report.text,truncated:report.truncated||final.truncated===true,length:Math.max(report.length,final.length??0),completedAt:receipt.completedAt??now(),receipt:identity};
+      record.updatedAt=Date.now();await save();
+      return respond(record.foregroundResult,identity);
+    };
+    editor.add({name:'task_dispatch_collect',description:'Collect one admitted generation without inference: a background generation returns its exact terminal receipt; a foreground generation returns its bounded final report (also when the original handoff result was lost). Legacy or unbound generations are not collectable.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1},workKey:{type:'string',minLength:1},sessionID:{type:'string',minLength:1},generation:{type:'integer',minimum:1}},required:['taskId','workKey','sessionID','generation']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID),key=`${rootID}\0${input.taskId}\0${input.workKey}`,record=state.records.find(r=>r.key===key),child=sessions.find(s=>s.id===input.sessionID);
       if (!record || record.parentID!==context.sessionID || record.childID!==input.sessionID || record.admissionGeneration!==input.generation) throw new Error('task-dispatch: collection must name the recorded parent, task, work key, child, and generation exactly');
       const binding=record.completionBinding,current=getIntent(state,rootID,input.taskId);
-      if (!binding?.background || binding.generation!==input.generation) throw new Error('task-dispatch: this generation has no collectable background completion binding');
+      if (!binding || binding.generation!==input.generation) throw new Error(`task-dispatch: generation ${input.generation} has no completion binding (it never reached native delivery or predates result binding); inspect task_dispatch_status and do not rerun completed work`);
+      if (!binding.background) return collectForeground({record,binding,child,input,save});
       if (record.state==='completed' && record.completionReceipt?.generation===input.generation) return {content:JSON.stringify({sessionID:input.sessionID,generation:input.generation,status:'completed',receipt:record.completionReceipt})};
       if (!collectionEligibility({record,child,sessions,rootID,current,callerID:context.sessionID}).eligible) throw new Error('task-dispatch: generation is not at a collectable terminal boundary');
       const receipt=await loadCompletionReceipt({sessionID:input.sessionID,marker:binding.marker,promptHash:`${binding.promptHash},${binding.prefixedPromptHash}`});
@@ -817,7 +915,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       record.state='completed';record.completionReceipt={generation:input.generation,marker:binding.marker,promptHash:binding.promptHash,...receipt};record.updatedAt=Date.now();collectHandoffTiming(record,record.completionReceipt,now());await save();
       return {content:JSON.stringify({sessionID:input.sessionID,generation:input.generation,status:'completed',receipt:record.completionReceipt})};
     })});
-    editor.add({name:'task_intent',description:'Read or revise the shared user outcome for this root task. Get returns valid root user-message IDs. Only the root goal owner may set; use expectedRevision to avoid overwriting corrections. Never store secret values.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1,maxLength:128},action:{type:'string',enum:['get','set']},expectedRevision:{type:'integer',minimum:0},intent:intentSchema},required:['taskId','action']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
+    editor.add({name:'task_intent',description:'Read or revise the shared user outcome for this root task. Root callers must set it before the first task_dispatch/subagent handoff of a taskId; the handoff then passes intentRevision (current.revision) and checkIds. Get returns valid root user-message IDs. Only the root goal owner may set; use expectedRevision to avoid overwriting corrections. Never store secret values.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1,maxLength:128},action:{type:'string',enum:['get','set']},expectedRevision:{type:'integer',minimum:0},intent:intentSchema},required:['taskId','action']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
       string(input.taskId,'taskId');
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID);
       if (!sessions.some(s=>s.id===context.sessionID)) throw new Error('task-intent: current session metadata unavailable');
@@ -846,7 +944,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         }
         if (delivered) await save();
       } catch { /* status remains read-safe; the durable receipt stays pending for a later explicit retry */ }
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),terminalBlocked=terminalSettlementEligibility(r,native,sessions,context.sessionID),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,...workerObservation(r,native,current,state.records,now()),key:undefined,handoffTimings:undefined,timing:handoffTimingStatus(r),nextDispatch:{workReview:dispatchReviewRequirement(r,taskWorkStatus(state,rootID,r.taskId),now())},recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,terminalReconciliation:r.completionBinding?.background?{action:'task_dispatch_reconcile_terminal',eligibleForInspection:!terminalBlocked,blockedReason:terminalBlocked,responsibleParentID:r.parentID,generation:r.admissionGeneration,...(r.terminalSettlement?.generation===r.admissionGeneration?{outcome:r.terminalSettlement.receipt.outcome,acceptedForCurrentIntent:false}: {})}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind,catalog:contextCatalog}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native,contextCatalog)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),terminalBlocked=terminalSettlementEligibility(r,native,sessions,context.sessionID),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,...workerObservation(r,native,current,state.records,now()),key:undefined,foregroundResult:undefined,handoffTimings:undefined,timing:handoffTimingStatus(r),nextDispatch:{workReview:dispatchReviewRequirement(r,taskWorkStatus(state,rootID,r.taskId),now())},recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:r.completionBinding?.generation===r.admissionGeneration&&r.childID?{action:'task_dispatch_collect',mode:'foreground',eligibleForInspection:!r.inFlight&&native?.active!==true,resultRetained:r.foregroundResult?.generation===r.admissionGeneration,responsibleParentID:r.parentID,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,terminalReconciliation:r.completionBinding?.background?{action:'task_dispatch_reconcile_terminal',eligibleForInspection:!terminalBlocked,blockedReason:terminalBlocked,responsibleParentID:r.parentID,generation:r.admissionGeneration,...(r.terminalSettlement?.generation===r.admissionGeneration?{outcome:r.terminalSettlement.receipt.outcome,acceptedForCurrentIntent:false}: {})}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind,catalog:contextCatalog}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native,contextCatalog)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — handoff results reach the parent
+
+- Fix lost handoff results: harness dispatch metadata (for example `routing.modelOverride: undefined`) failed OpenCode's strict JSON tool-event validation after the call was marked settled, so foreground reports never reached the parent and background calls stayed "running" until marked interrupted. Dispatch results now carry plain JSON metadata, and harness-only subagent results always include the declared `{sessionID,status,output}`.
+- Foreground handoffs return the child's bounded final report (16,000 characters) with status, session, agent and generation, and retain it so `task_dispatch_collect` can re-read it. A lost foreground result is recovered only from the exact native terminal receipt. Background handoffs return the child session, agent, generation and exact collect arguments immediately.
+- State the intent-first requirement in tool descriptions, schema field help and delegating-role instructions. Reject a handoff without shared intent before agent, quota or ownership work, and name the exact `task_intent` call and the `intentRevision`/`checkIds` to pass. The handoff prompt is now the last schema field.
+
 ## Unreleased — model-aware compaction advice
 
 - Derive advisory context pressure from the actual model/variant input budget, reserving maximum output space, instead of treating every model as high pressure at 120,000 tokens.

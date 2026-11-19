@@ -113,10 +113,13 @@ export function setIntent(state, { rootID, taskId, intent, expectedRevision, act
 export function bindIntent(state, { rootID, taskId, intentRevision, checkIds }) {
   const entry = getIntent(state, rootID, taskId);
   if (!entry) throw new Error('task-intent: intent is not registered');
-  if (!Number.isSafeInteger(intentRevision) || intentRevision !== entry.revision) throw new Error('task-intent: stale intent revision');
-  if (!Array.isArray(checkIds) || checkIds.length < 1 || new Set(checkIds).size !== checkIds.length) throw new Error('task-intent: invalid checkIds');
-  const known = new Set(entry.intent.checks.map(check => check.id));
-  if (checkIds.some(checkID => typeof checkID !== 'string' || !known.has(checkID))) throw new Error('task-intent: unknown check id');
+  const knownIDs = entry.intent.checks.map(check => check.id);
+  const correction = `pass intentRevision:${entry.revision} and checkIds from ${JSON.stringify(knownIDs)}`;
+  if (intentRevision === undefined) throw new Error(`task-intent: missing intentRevision; ${correction}`);
+  if (!Number.isSafeInteger(intentRevision) || intentRevision !== entry.revision) throw new Error(`task-intent: stale intent revision; ${correction}`);
+  if (!Array.isArray(checkIds) || checkIds.length < 1 || new Set(checkIds).size !== checkIds.length) throw new Error(`task-intent: invalid checkIds; ${correction}`);
+  const known = new Set(knownIDs);
+  if (checkIds.some(checkID => typeof checkID !== 'string' || !known.has(checkID))) throw new Error(`task-intent: unknown check id; ${correction}`);
   return clone(entry);
 }
 

@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { installTaskDispatch, hasCapability, resolvePublicationScope, dispatchReviewRequirement } from '../plugins/v2/task-dispatch.mjs';
+import { installTaskDispatch, hasCapability, resolvePublicationScope, dispatchReviewRequirement, jsonMetadata, settleSubagentResult, HANDOFF_RESULT_LIMIT } from '../plugins/v2/task-dispatch.mjs';
 import { createV2TaskOutcomes } from '../plugins/v2/task-outcomes.mjs';
 import { setIntent } from '../plugins/v2/task-intent.mjs';
 import { createRegistry } from '../plugins/v2/dispatch-registry.mjs';
@@ -53,6 +53,12 @@ test('status neither reconciles nor delivers or exposes another root recovery',a
  assert.equal(JSON.stringify(status).includes('other-child'),false);
  await h.registry('/project',async state=>{const other=state.records.find(r=>r.key==='other');assert.equal(other.state,'compacting');assert.equal(other.compactionOutcome,undefined);assert.equal(state.quotaRecoveryOutbox[0].deliveredAt,undefined);});
 });
+// Harness handoff content is the bounded child report (foreground wrapper or
+// native background text) followed by one identity/collect line.
+const reportOf = result => {
+ const [body] = result.content.split('\n\nHarness handoff '); assert.match(result.content, /\n\nHarness handoff (completed in foreground|admitted in background): \{/);
+ return body.replace(/^<subagent [^>]*>\n/, '').replace(/\n<\/subagent>$/, '');
+};
 async function harness(t, custom, nativeInput, dispatchOptions={}) {
  const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'dispatch-test-'));t.after(()=>fsp.rm(dir,{recursive:true,force:true}));
  const sessions=[{id:'root',agent:'router',directory:'/project',active:true}];const calls=[];const tools=new Map();
@@ -101,7 +107,7 @@ test('capability mismatch is a structured preflight failure with no quota, nativ
  assert.equal(quotaReads,0);assert.equal(h.calls.length,0);
  await h.registry('/project',async state=>assert.equal(JSON.stringify(state),before));
  const accepted=await h.call({...base,routing:{complexity:'routine',risk:'normal'},model:'anthropic/fixture-opus#high'});
- assert.equal(accepted.content,'OK');assert.equal(quotaReads,1);assert.equal(h.calls.length,1);assert.equal(h.calls[0].model,'anthropic/fixture-opus#high');
+ assert.equal(reportOf(accepted),'OK');assert.equal(quotaReads,1);assert.equal(h.calls.length,1);assert.equal(h.calls[0].model,'anthropic/fixture-opus#high');
 });
 test('capability mismatch cannot reclassify or recover an existing native denial',async t=>{
  let attempts=0;const h=await harness(t,async(input,context,sessions)=>{
@@ -173,7 +179,7 @@ test('same denied work suppresses prompt and model changes until declared recove
  await assert.rejects(h.call({...base,recovery,prompt:'again'}),/remains denied \(provider_refusal\)/);assert.equal(attempts,2);
  await assert.rejects(h.call({...base,recovery:{...recovery,explanation:'Same referenced evidence, paraphrased explanation'}}),/remains denied \(provider_refusal\)/);assert.equal(attempts,2);
  const providerRecovery={...recovery,kind:'authorization_changed',authorization:'The provider authorization was refreshed',reference:'provider-change-43'};
- const accepted=await h.call({...base,recovery:providerRecovery});assert.equal(accepted.content,'accepted');assert.equal(attempts,3);
+ const accepted=await h.call({...base,recovery:providerRecovery});assert.equal(reportOf(accepted),'accepted');assert.equal(attempts,3);
 });
 test('denial receipts survive reload and unrelated work remains eligible',async t=>{
  const h=await harness(t,async(input)=>{if(input.description==='Fix backend')throw new Error('Subagent denied: builder');return {content:'other',metadata:{sessionID:'ses_other',status:'completed'},output:{sessionID:'ses_other',status:'completed'}};});
@@ -181,7 +187,7 @@ test('denial receipts survive reload and unrelated work remains eligible',async 
  const recreated=new Map([['subagent',{...h.rawNative}]]);
  await installTaskDispatch({...h.ctx,tool:{transform:async fn=>fn({get:n=>recreated.get(n),update:(n,fn)=>fn(recreated.get(n)),add:t=>recreated.set(t.name,t)})}},{registry:createRegistry(h.dir),globalRegistry:createRegistry(path.join(h.dir,'global-writers')),loadRoutingPolicy:()=>undefined,loadSessions:async()=>h.sessions,loadSources:async()=>['msg_user','msg_correction']});
  await assert.rejects(recreated.get('task_dispatch').execute({...base,prompt:'changed after reload'},{sessionID:'root',agent:'router',progress:async()=>{}}),/remains denied/);
- const other=await h.call({...base,workKey:'unrelated',description:'Independent task',writePaths:['mobile']});assert.equal(other.content,'other');
+ const other=await h.call({...base,workKey:'unrelated',description:'Independent task',writePaths:['mobile']});assert.equal(reportOf(other),'other');
 });
 test('only the anchored native failed-run policy code is a provider refusal',async t=>{
  let calls=0;const h=await harness(t,async()=>{
@@ -201,7 +207,7 @@ test('same work resumes child after transient failure and preserves selected rol
  });
  await assert.rejects(h.call(base),/quota telemetry unavailable/);
  await h.registry('/project',async state=>{assert.equal(state.records[0].intentRevision,1);assert.equal(state.records[0].deliveredIntentRevision,undefined);});
- const result=await h.call({...base,model:'openai/gpt-6-sol#medium'});assert.equal(result.content,'recovered');assert.equal(result.output,undefined);assert.equal(h.calls[1].sessionID,'ses_paused');assert.equal(h.calls[1].model,'openai/gpt-6-sol#medium');
+ const result=await h.call({...base,model:'openai/gpt-6-sol#medium'});assert.equal(reportOf(result),'recovered');assert.equal(result.output,undefined);assert.equal(h.calls[1].sessionID,'ses_paused');assert.equal(h.calls[1].model,'openai/gpt-6-sol#medium');
  assert.match(h.calls[0].prompt,/Shared user intent/);assert.match(h.calls[1].prompt,/Shared user intent/);assert.equal(h.calls[1].prompt.includes('compact continuation'),false);
  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);assert.equal(status.owners.length,1);assert.equal(status.owners[0].state,'completed');
 });
@@ -256,7 +262,7 @@ test('publish coordinates explicit narrow frozen scopes without becoming deploy'
  const publish={...base,workKey:'publish-release',operation:'publish',requiredCapabilities:['shell'],writePaths:['artifacts/release.json'],publication:{revision,checkout:'.worktrees/pub'}};
  const {background,...defaulted}=publish;
  const result=await h.call(defaulted);
- assert.equal(result.content,'OK');assert.equal(h.calls.at(-1).background,true);
+ assert.equal(reportOf(result),'OK');assert.equal(h.calls.at(-1).background,true);
  assert.match(h.calls.at(-1).prompt,new RegExp(`frozen commit ${revision}`));assert.match(h.calls.at(-1).prompt,/never HEAD/);assert.match(h.calls.at(-1).prompt,/non-force push/);
  await h.registry('/project',async state=>{
   const record=state.records.find(item=>item.workKey==='publish-release');
@@ -319,7 +325,7 @@ test('same-child continuations retain narrow paths for explicit and implicit ope
  await h.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['backend']));
  h.sessions.find(session=>session.id===child).active=false;
  const retained=await h.call({...base,operation:'verify',requiredCapabilities:['shell'],background:true,writePaths:undefined});
- assert.equal(retained.content,'OK');assert.equal(h.calls.at(-1).sessionID,child);
+ assert.equal(reportOf(retained),'OK');assert.equal(h.calls.at(-1).sessionID,child);
  await assert.rejects(h.call({...base,sessionID:child,operation:'verify',requiredCapabilities:['shell'],background:true,writePaths:[]}),/requires explicit non-empty writePaths/);
 });
 test('an edit-capable inspect continuation cannot widen an empty read-only scope by omission',async t=>{
@@ -510,7 +516,7 @@ test('convergence advises without blocking, preserves result, ignores polling an
  await h.call({...base,sessionID:'ses_1'});
  const third=await h.call({...base,sessionID:'ses_1'});
  assert.equal(third.metadata.convergence.admissionsWithoutReceiptChange,3);
- assert.equal(third.content,'OK');
+ assert.equal(reportOf(third),'OK');
  assert.match(h.calls.at(-1).prompt,/Convergence advisory/);
  for(let i=0;i<4;i++) await h.call({taskId:'release'},'task_dispatch_status');
  let status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
@@ -775,7 +781,7 @@ test('background collection rejects foreign parent, active descendants, and lega
  const collect={taskId:'release',workKey:'backend',sessionID:id,generation:1};
  await assert.rejects(h.call(collect,'task_dispatch_collect',id),/parent, task, work key, child, and generation exactly/);
  h.sessions.push({id:'descendant',parentID:id,agent:'builder',directory:'/project',active:true});await assert.rejects(h.call(collect,'task_dispatch_collect'),/collectable terminal boundary/);h.sessions.pop();
- await h.registry('/project',async(state,save)=>{delete state.records[0].completionBinding;await save();});await assert.rejects(h.call(collect,'task_dispatch_collect'),/no collectable background completion binding/);
+ await h.registry('/project',async(state,save)=>{delete state.records[0].completionBinding;await save();});await assert.rejects(h.call(collect,'task_dispatch_collect'),/has no completion binding/);
 });
 test('collected background receipts survive plugin recreation and stale native evidence blocks review',async t=>{
  let receipt={promptID:'prompt',assistantID:'answer',assistantSeq:2,idleID:'idle',idleSeq:3};
@@ -817,7 +823,7 @@ test('verify requires shell, preserves explicit model and reserves writes despit
  assert.equal(h.calls.length,0);
  await assert.rejects(h.call({...base,agent:'harness-verifier',operation:'inspect',requiredCapabilities:[],writePaths:[]}),/verifier requires operation verify/);
  const result=await h.call({...base,agent:'harness-verifier',operation:'verify',requiredCapabilities:[],prompt:'Run the checks',writePaths:[],model:'anthropic/fixture-opus#high'});
- assert.equal(result.content,'OK');assert.equal(h.calls[0].model,'anthropic/fixture-opus#high');
+ assert.equal(reportOf(result),'OK');assert.equal(h.calls[0].model,'anthropic/fixture-opus#high');
  await h.registry('/project',async state=>assert.deepEqual(state.records[0].writePaths,['.']));
 });
 test('scoped edit eligibility supports verifier artifact continuations without granting workspace access',async t=>{
@@ -1094,3 +1100,101 @@ test('review after successful compaction binds the retained implementation gener
  await assert.rejects(h.call({...review,workKey:'failed-compaction'}),/no completed admitted implementation generation/);
  assert.equal(h.calls.length,2);
 });
+
+// OpenCode records tool metadata through Schema.Json; nested undefined, NaN or
+// non-plain values make that durable publish fail and strand the tool call.
+const assertStrictJson = (value, at='metadata') => {
+ if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
+ if (typeof value === 'number') { assert.ok(Number.isFinite(value), `${at} is not finite`); return; }
+ if (Array.isArray(value)) { value.forEach((item,i)=>assertStrictJson(item,`${at}[${i}]`)); return; }
+ assert.equal(Object.getPrototypeOf(value), Object.prototype, `${at} is not a plain object`);
+ for (const [key,item] of Object.entries(value)) { assert.notEqual(item, undefined, `${at}.${key} is undefined`); assertStrictJson(item,`${at}.${key}`); }
+};
+const foregroundNative = report => (input,context,sessions,calls) => {
+ const id=input.sessionID??`ses_${calls.length}`;
+ if(!sessions.some(s=>s.id===id)) sessions.push({id,parentID:context.sessionID,agent:input.agent,directory:'/project',active:false});
+ return {output:{sessionID:id,status:'completed',output:report},content:`<subagent sessionID="${id}" state="completed">\n${report}\n</subagent>`,metadata:{sessionID:id,status:'completed'}};
+};
+test('tool metadata is reduced to strict JSON and harness-only subagent results still settle',()=>{
+ assert.deepEqual(jsonMetadata({routing:{selected:'a/b#c',modelOverride:undefined,pace:NaN},list:[undefined]}),{routing:{selected:'a/b#c',pace:null},list:[null]});
+ assert.equal(jsonMetadata(undefined),undefined);const cyclic={};cyclic.self=cyclic;assert.equal(jsonMetadata(cyclic),undefined);
+ const compacted=settleSubagentResult({content:'Exact native compaction completed',metadata:{sessionID:'ses_1',status:'awaiting_continuation',compactionID:'msg_c',wait:undefined}});
+ assert.deepEqual(compacted.output,{sessionID:'ses_1',status:'running',output:'Exact native compaction completed'});assertStrictJson(compacted.metadata);
+ const retained=settleSubagentResult({content:'Existing child',metadata:{sessionID:'ses_2',status:'running'},output:{sessionID:'ses_2',status:'running',output:'Existing worker retained'}});
+ assert.deepEqual(retained.output,{sessionID:'ses_2',status:'running',output:'Existing worker retained'});
+});
+test('foreground handoff returns the bounded final report and identity with strict JSON metadata',async t=>{
+ const report='R'.repeat(HANDOFF_RESULT_LIMIT)+'TAIL-NOT-SHOWN'.repeat(300);
+ const h=await harness(t,foregroundNative(report),undefined,{loadCompletionReceipt:async()=>{throw new Error('retained result must not reread native state');}});
+ for (const tool of ['task_dispatch','subagent']) {
+  const workKey=`backend-${tool}`, result=await h.call({...base,workKey,writePaths:[`backend-${tool}`]},tool), child=result.metadata.sessionID;
+  assertStrictJson(result.metadata);
+  assert.equal(JSON.stringify(result.metadata).includes('modelOverride'),false);
+  assert.deepEqual({sessionID:result.metadata.sessionID,agent:result.metadata.agent,generation:result.metadata.generation,mode:result.metadata.mode,status:result.metadata.status},{sessionID:child,agent:'builder',generation:1,mode:'foreground',status:'completed'});
+  assert.deepEqual(result.metadata.collect,{taskId:'release',workKey,sessionID:child,generation:1});
+  const shown=reportOf(result);assert.ok(shown.startsWith('R'.repeat(HANDOFF_RESULT_LIMIT)));assert.match(shown,new RegExp(`truncated at ${HANDOFF_RESULT_LIMIT} of ${report.length} characters`));assert.equal(shown.includes('TAIL-NOT-SHOWN'),false);
+  assert.match(result.content,new RegExp(`task_dispatch_collect\\(\\{"taskId":"release","workKey":"${workKey}","sessionID":"${child}","generation":1\\}\\)`));
+  if (tool==='subagent') assert.deepEqual(result.output,{sessionID:child,status:'completed',output:shown}); else assert.equal(result.output,undefined);
+  const collected=await h.call({taskId:'release',workKey,sessionID:child,generation:1},'task_dispatch_collect');
+  const body=JSON.parse(collected.content);assert.deepEqual({mode:body.mode,status:body.status,truncated:body.truncated,output:body.output},{mode:'foreground',status:'completed',truncated:true,output:shown});
+  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content).owners.find(owner=>owner.workKey===workKey);
+  assert.equal(status.foregroundResult,undefined);assert.deepEqual({mode:status.collection.mode,resultRetained:status.collection.resultRetained,eligible:status.collection.eligibleForInspection,generation:status.collection.generation},{mode:'foreground',resultRetained:true,eligible:true,generation:1});
+ }
+});
+test('a lost foreground result is collected from the exact native terminal receipt only',async t=>{
+ const reads=[];let receipt={promptID:'msg_prompt',assistantID:'msg_answer',assistantSeq:4,idleID:'msg_idle',idleSeq:5,completedAt:77};
+ const h=await harness(t,foregroundNative('lost in transit'),undefined,{loadCompletionReceipt:async args=>{reads.push(['receipt',args]);return receipt;},loadFinalText:async args=>{reads.push(['text',args]);return {assistantID:args.assistantID,text:'Full pytest passed; ruff only E902.',truncated:false,length:35};}});
+ const first=await h.call({...base,agent:'builder'});const child=first.metadata.sessionID,collect={taskId:'release',workKey:'backend',sessionID:child,generation:1};
+ const binding=await h.registry('/project',async(state,save)=>{const record=state.records.find(r=>r.workKey==='backend');delete record.foregroundResult;await save();return record.completionBinding;});
+ h.sessions.find(s=>s.id===child).active=true;
+ await assert.rejects(h.call(collect,'task_dispatch_collect'),/foreground generation 1 is still running; its final report is returned by the original task_dispatch\/subagent call/);
+ h.sessions.find(s=>s.id===child).active=false;receipt=null;
+ await assert.rejects(h.call(collect,'task_dispatch_collect'),/no exact terminal receipt exists for foreground generation 1/);
+ receipt={promptID:'msg_prompt',assistantID:'msg_answer',assistantSeq:4,idleID:'msg_idle',idleSeq:5,completedAt:77};reads.length=0;
+ const body=JSON.parse((await h.call(collect,'task_dispatch_collect')).content);
+ assert.deepEqual({mode:body.mode,status:body.status,output:body.output,assistantID:body.receipt.assistantID},{mode:'foreground',status:'completed',output:'Full pytest passed; ruff only E902.',assistantID:'msg_answer'});
+ assert.deepEqual(reads,[['receipt',{sessionID:child,marker:binding.marker,promptHash:`${binding.promptHash},${binding.prefixedPromptHash}`}],['text',{sessionID:child,assistantID:'msg_answer'}]]);
+ reads.length=0;assert.equal(JSON.parse((await h.call(collect,'task_dispatch_collect')).content).output,'Full pytest passed; ruff only E902.');assert.deepEqual(reads,[]);
+ await assert.rejects(h.call({...collect,generation:2},'task_dispatch_collect'),/collection must name the recorded parent/);
+ await assert.rejects(h.call(collect,'task_dispatch_collect','intruder'),/./);
+});
+test('background handoff immediately returns child session, agent, generation and collect arguments',async t=>{
+ const h=await harness(t);
+ const result=await h.call({...base,background:true},'subagent');
+ assertStrictJson(result.metadata);
+ assert.deepEqual(result.output,{sessionID:'ses_1',status:'running',output:'OK'});
+ assert.deepEqual({sessionID:result.metadata.sessionID,agent:result.metadata.agent,generation:result.metadata.generation,mode:result.metadata.mode,status:result.metadata.status},{sessionID:'ses_1',agent:'builder',generation:1,mode:'background',status:'running'});
+ assert.deepEqual(result.metadata.collect,{taskId:'release',workKey:'backend',sessionID:'ses_1',generation:1});
+ assert.match(result.content,/Harness handoff admitted in background: \{"taskId":"release","workKey":"backend","sessionID":"ses_1","agent":"builder","generation":1,"status":"running","mode":"background"\}/);
+ assert.match(result.content,/task_dispatch_collect\(\{"taskId":"release","workKey":"backend","sessionID":"ses_1","generation":1\}\)/);
+ const viaDispatch=await h.call({...base,workKey:'mobile',writePaths:['mobile'],background:true});
+ assertStrictJson(viaDispatch.metadata);assert.equal(viaDispatch.output,undefined);assert.equal(viaDispatch.metadata.generation,1);assert.equal(viaDispatch.metadata.sessionID,'ses_2');
+});
+test('a handoff without shared intent fails before agent, quota or native work and names the corrective call',async t=>{
+ const h=await harness(t);let listed=0;const list=h.ctx.agent.list;h.ctx.agent.list=async()=>{listed++;return list();};
+ const {intentRevision,checkIds,...unbound}=base;
+ const missing=await h.call({...unbound,taskId:'unregistered'}).catch(error=>error);
+ assert.match(missing.message,/register the user outcome with task_intent before a new handoff; no work was admitted/);
+ assert.match(missing.message,/task_intent\(\{taskId:"unregistered", action:'get'\}\)/);
+ assert.match(missing.message,/task_intent\(\{taskId:"unregistered", action:'set', expectedRevision:0, intent:\{outcome:/);
+ assert.match(missing.message,/intentRevision:<current\.revision> and checkIds:\['tests'\]/);
+ await assert.rejects(h.call(unbound),/missing intentRevision; pass intentRevision:1 and checkIds from \["backend"\]/);
+ assert.equal(listed,0);assert.equal(h.calls.length,0);
+ // Complete-but-wrong intent fields are rejected at admission with the same correction.
+ await assert.rejects(h.call({...base,checkIds:['typo']}),/unknown check id; pass intentRevision:1 and checkIds from \["backend"\]/);
+ assert.equal(h.calls.length,0);
+ await h.registry('/project',async state=>assert.equal(state.records.length,0));
+ const summary=await h.call({...unbound,taskId:'large-file-summary',workKey:'summary-a',operation:'inspect',agent:'scout',requiredCapabilities:[],writePaths:undefined});
+ assert.equal(h.calls.length,1);assert.ok(summary.content);
+});
+test('tool contracts state the intent-first requirement and generate the prompt last',async t=>{
+ const h=await harness(t);
+ for (const name of ['task_dispatch','subagent']) assert.match(h.tools.get(name).description,/Before the first handoff of a taskId, call task_intent\(\{taskId, action:'set', expectedRevision:0/);
+ assert.match(h.tools.get('task_intent').description,/must set it before the first task_dispatch\/subagent handoff/);
+ for (const input of [h.tools.get('task_dispatch').input,h.tools.get('subagent').input]) {
+  assert.equal(Object.keys(input.properties).at(-1),'prompt');
+  assert.ok(Object.keys(input.properties).indexOf('intentRevision')<Object.keys(input.properties).indexOf('prompt'));
+  assert.match(input.properties.intentRevision.description,/Required for every new handoff/);assert.match(input.properties.checkIds.description,/task_intent checks/);
+ }
+});
+

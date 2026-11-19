@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.dispatch_runtime import completion_receipt, intent_sources, sessions
+from src.dispatch_runtime import completion_receipt, final_text, intent_sources, main, sessions
 from src.paths import opencode_db, ownership_dir, quota_cache_path, state_dir
 
 
@@ -322,6 +322,29 @@ class DispatchRuntimeTest(unittest.TestCase):
         self.assertIsNone(completion_receipt("child",marker,digest,db_path=make(good,duplicate=True)))
         self.assertIsNone(completion_receipt("child",marker,digest,db_path=make(good,("later-tool","child","assistant",4,json.dumps({"finish":"tool-calls","time":{"completed":4},"content":[]})))))
         self.assertIsNone(completion_receipt("child",marker,digest,db_path=make({"finish":"stop","content":[{"type":"text","text":"done"}]})))
+
+
+    def test_final_text_returns_only_bounded_visible_text_of_exact_completed_answer(self):
+        db = self.fixture()
+        answer = {"finish": "stop", "time": {"completed": 5}, "content": [
+            {"type": "reasoning", "text": "private reasoning"},
+            {"type": "text", "text": "Full pytest: 564 passed. "},
+            {"type": "tool", "name": "shell", "state": {"input": {"command": "SECRET=1"}}},
+            {"type": "text", "text": "Ruff: E902 only."},
+        ]}
+        with sqlite3.connect(db) as connection:
+            connection.execute("insert into session_message values ('answer', 'child', 'assistant', 3, ?)", (json.dumps(answer),))
+            connection.execute("insert into session_message values ('partial', 'child', 'assistant', 4, ?)", (json.dumps({"finish": "tool-calls", "content": [{"type": "text", "text": "x"}]}),))
+            connection.execute("insert into session_message values ('foreign', 'other', 'assistant', 5, ?)", (json.dumps(answer),))
+        self.assertEqual(final_text("child", "answer", db_path=db), {"assistantID": "answer", "text": "Full pytest: 564 passed. Ruff: E902 only.", "truncated": False, "length": 41})
+        bounded = final_text("child", "answer", db_path=db, limit=10)
+        self.assertEqual((bounded["text"], bounded["truncated"], bounded["length"]), ("Full pytes", True, 41))
+        self.assertIsNone(final_text("child", "partial", db_path=db))
+        self.assertIsNone(final_text("child", "foreign", db_path=db))
+        self.assertIsNone(final_text("child", "missing", db_path=db))
+        with patch.dict(os.environ, {"HARNESS_OPENCODE_DB": str(db)}), patch("builtins.print") as printed:
+            self.assertEqual(main(["--final-text", "child", "answer"]), 0)
+        self.assertEqual(json.loads(printed.call_args.args[0])["text"], "Full pytest: 564 passed. Ruff: E902 only.")
 
 
 if __name__ == "__main__":

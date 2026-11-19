@@ -42,6 +42,16 @@ class ConfigureTests(unittest.TestCase):
         self.assertIn(('subagent', 'builder'), router_children)
         self.assertIn(('subagent', 'harness-builder'), router_children)
 
+    def test_delegating_roles_register_intent_before_first_handoff(self):
+        p=profile({k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
+        for role in ('harness-router','router','harness-coordinator','coordinator'):
+            system=p['agents'][role]['system']
+            self.assertIn("Before the first task_dispatch/subagent handoff of a taskId: call task_intent", system)
+            self.assertIn("action:'set', expectedRevision:0", system)
+            self.assertIn('as intentRevision and the chosen check ids as checkIds', system)
+        for role in ('harness-builder','harness-verifier','harness-scout'):
+            self.assertNotIn('Before the first task_dispatch/subagent handoff', p['agents'][role]['system'])
+
     def test_task_fit_policy_validation(self):
         models={k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')}
         def policy(rule):
