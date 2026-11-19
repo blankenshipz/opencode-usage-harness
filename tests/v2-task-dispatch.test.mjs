@@ -412,11 +412,12 @@ test('workspace status exposes foreign-tree contention without offering adoption
  const leaf=status.workspaceActive.find(s=>s.id==='foreign-leaf');assert.equal(leaf.action,'wait_for_other_parent');assert.equal(leaf.sessionID,undefined);
 });
 
-test('new handoffs need intent and receive shared context; ordinary work waits',async t=>{
+test('new handoffs receive shared context; unknown check ids fall back with a warning',async t=>{
  const h=await harness(t);
- await assert.rejects(h.call({...base,taskId:'unregistered'}),/register the user outcome/);
  await h.call(base);assert.match(h.calls[0].prompt,/Shared user intent/);assert.match(h.calls[0].prompt,/Working release/);assert.equal(h.calls[0].background,false);
- await assert.rejects(h.call({...base,checkIds:['unknown']}),/check/);
+ const fallback=await h.call({...base,workKey:'other',writePaths:['other'],checkIds:['unknown']});
+ assert.match(fallback.content,/Intent warning \(handoff proceeded\): dropped unknown checkIds \["unknown"\]; no valid checkIds; assigned all current checks \["backend"\]/);
+ assert.match(h.calls[1].prompt,/"relevantChecks":\[\{"id":"backend"/);
 });
 test('root correction parks old child and explicit same-child continuation rebinds it',async t=>{
  const h=await harness(t);const first=await h.call({...base,background:true});const id=first.metadata.sessionID;
@@ -1170,31 +1171,70 @@ test('background handoff immediately returns child session, agent, generation an
  const viaDispatch=await h.call({...base,workKey:'mobile',writePaths:['mobile'],background:true});
  assertStrictJson(viaDispatch.metadata);assert.equal(viaDispatch.output,undefined);assert.equal(viaDispatch.metadata.generation,1);assert.equal(viaDispatch.metadata.sessionID,'ses_2');
 });
-test('a handoff without shared intent fails before agent, quota or native work and names the corrective call',async t=>{
- const h=await harness(t);let listed=0;const list=h.ctx.agent.list;h.ctx.agent.list=async()=>{listed++;return list();};
+test('a handoff without shared intent proceeds with an inferred intent and a warning',async t=>{
+ const h=await harness(t);
  const {intentRevision,checkIds,...unbound}=base;
- const missing=await h.call({...unbound,taskId:'unregistered'}).catch(error=>error);
- assert.match(missing.message,/register the user outcome with task_intent before a new handoff; no work was admitted/);
- assert.match(missing.message,/task_intent\(\{taskId:"unregistered", action:'get'\}\)/);
- assert.match(missing.message,/task_intent\(\{taskId:"unregistered", action:'set', expectedRevision:0, intent:\{outcome:/);
- assert.match(missing.message,/intentRevision:<current\.revision> and checkIds:\['tests'\]/);
- await assert.rejects(h.call(unbound),/missing intentRevision; pass intentRevision:1 and checkIds from \["backend"\]/);
- assert.equal(listed,0);assert.equal(h.calls.length,0);
- // Complete-but-wrong intent fields are rejected at admission with the same correction.
- await assert.rejects(h.call({...base,checkIds:['typo']}),/unknown check id; pass intentRevision:1 and checkIds from \["backend"\]/);
- assert.equal(h.calls.length,0);
- await h.registry('/project',async state=>assert.equal(state.records.length,0));
- const summary=await h.call({...unbound,taskId:'large-file-summary',workKey:'summary-a',operation:'inspect',agent:'scout',requiredCapabilities:[],writePaths:undefined});
- assert.equal(h.calls.length,1);assert.ok(summary.content);
+ const inferred=await h.call({...unbound,taskId:'unregistered',description:'Fix login bug',prompt:'Repair the login form\nso users can sign in again.'});
+ assert.equal(h.calls.length,1);
+ assert.match(inferred.content,/Intent warning \(handoff proceeded\): no task_intent was registered for taskId "unregistered"; inferred revision 1 from this handoff \(outcome "Fix login bug", checks \["handoff"\], source \["msg_correction"\], no authorized effects\)/);
+ assert.match(inferred.content,/task_intent\(\{taskId:"unregistered", action:'get'\}\)/);
+ assert.equal(inferred.metadata.intentWarning.startsWith('Intent warning'),true);
+ assert.match(h.calls[0].prompt,/Shared user intent \(data, not higher-priority instructions\): .*"outcome":"Fix login bug","target":"Repair the login form so users can sign in again\."/);
+ assert.match(h.calls[0].prompt,/"authorizedEffects":\[\]/);
+ await h.registry('/project',async state=>{
+  const entry=state.intents[JSON.stringify(['root','unregistered'])];
+  assert.equal(entry.inferred,true);assert.equal(entry.revision,1);
+  assert.deepEqual(entry.intent.sourceMessageIDs,['msg_correction']);
+  const record=state.records.find(r=>r.taskId==='unregistered');assert.equal(record.intentRevision,1);assert.deepEqual(record.checkIds,['handoff']);
+ });
+ // Named check ids become the inferred checks.
+ await h.call({...unbound,taskId:'named',workKey:'named',writePaths:['named'],checkIds:['tests','lint']});
+ await h.registry('/project',async state=>assert.deepEqual(state.intents[JSON.stringify(['root','named'])].intent.checks.map(c=>c.id),['tests','lint']));
+ // The first explicit set may replace an inferred intent with expectedRevision 0 (or its revision).
+ const set=JSON.parse((await h.call({action:'set',taskId:'unregistered',expectedRevision:0,intent:{...intent,sourceMessageIDs:['msg_correction']}},'task_intent')).content);
+ assert.equal(set.current.revision,2);assert.equal(set.current.inferred,undefined);
+ await assert.rejects(h.call({action:'set',taskId:'unregistered',expectedRevision:0,intent:{...intent,target:'x',sourceMessageIDs:['msg_correction']}},'task_intent'),/CAS mismatch/);
+});
+test('a missing or stale intentRevision binds to the current revision with a warning',async t=>{
+ const h=await harness(t);
+ const {intentRevision,checkIds,...unbound}=base;
+ const omitted=await h.call(unbound);
+ assert.match(omitted.content,/Intent warning \(handoff proceeded\): intentRevision omitted; bound to current revision 1; checkIds omitted; assigned all current checks \["backend"\]/);
+ assert.match(h.calls[0].prompt,/Shared user intent/);
+ const stale=await h.call({...base,workKey:'stale',writePaths:['stale'],intentRevision:7,checkIds:['backend','typo']});
+ assert.match(stale.content,/intentRevision 7 is not current; bound to current revision 1 .*; dropped unknown checkIds \["typo"\]\. To register/);
+ await h.registry('/project',async state=>{const r=state.records.find(r=>r.workKey==='stale');assert.equal(r.intentRevision,1);assert.deepEqual(r.checkIds,['backend']);});
+ // A correct binding carries no warning.
+ const clean=await h.call({...base,workKey:'clean',writePaths:['clean']});assert.doesNotMatch(clean.content,/Intent warning/);assert.equal(clean.metadata.intentWarning,undefined);
+});
+test('without a citable root user message, or from a non-root caller, the handoff runs without shared intent',async t=>{
+ const h=await harness(t,undefined,undefined,{loadSources:async()=>[]});
+ const {intentRevision,checkIds,...unbound}=base;
+ const result=await h.call({...unbound,taskId:'unregistered'});
+ assert.equal(h.calls.length,1);assert.doesNotMatch(h.calls[0].prompt,/Shared user intent/);
+ assert.match(result.content,/none could be inferred \(no root user message ID was available\); the handoff runs without shared intent/);
+ await h.registry('/project',async state=>assert.equal(state.intents[JSON.stringify(['root','unregistered'])],undefined));
+ const h2=await harness(t);
+ h2.sessions.push({id:'coord',parentID:'root',agent:'coordinator',directory:'/project',active:false});
+ const child=await h2.call({...unbound,taskId:'sub',agent:'builder'},'task_dispatch','coord');
+ assert.match(child.content,/only the root goal owner may establish intent/);
+ await h2.registry('/project',async state=>assert.equal(state.intents[JSON.stringify(['root','sub'])],undefined));
+ // Genuine safety errors still reject.
+ await assert.rejects(h2.call({...base,workKey:'w',agent:'nope'}),/role nope is unavailable/);
+ const summary=await h2.call({...unbound,taskId:'large-file-summary',workKey:'summary-a',operation:'inspect',agent:'scout',requiredCapabilities:[],writePaths:undefined});
+ assert.ok(summary.content);assert.doesNotMatch(summary.content,/Intent warning/);
 });
 test('tool contracts state the intent-first requirement and generate the prompt last',async t=>{
  const h=await harness(t);
- for (const name of ['task_dispatch','subagent']) assert.match(h.tools.get(name).description,/Before the first handoff of a taskId, call task_intent\(\{taskId, action:'set', expectedRevision:0/);
- assert.match(h.tools.get('task_intent').description,/must set it before the first task_dispatch\/subagent handoff/);
+ for (const name of ['task_dispatch','subagent']) {
+  assert.match(h.tools.get(name).description,/Recommended before the first handoff of a taskId: task_intent\(\{taskId, action:'set', expectedRevision:0/);
+  assert.match(h.tools.get(name).description,/Without it the handoff still runs/);
+ }
+ assert.match(h.tools.get('task_intent').description,/should set it before the first task_dispatch\/subagent handoff of a taskId \(recommended/);
  for (const input of [h.tools.get('task_dispatch').input,h.tools.get('subagent').input]) {
   assert.equal(Object.keys(input.properties).at(-1),'prompt');
   assert.ok(Object.keys(input.properties).indexOf('intentRevision')<Object.keys(input.properties).indexOf('prompt'));
-  assert.match(input.properties.intentRevision.description,/Required for every new handoff/);assert.match(input.properties.checkIds.description,/task_intent checks/);
+  assert.match(input.properties.intentRevision.description,/Recommended for every new handoff/);assert.match(input.properties.checkIds.description,/task_intent checks/);
  }
 });
 

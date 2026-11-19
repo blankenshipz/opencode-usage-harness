@@ -103,8 +103,13 @@ export function setIntent(state, { rootID, taskId, intent, expectedRevision, act
   const key = JSON.stringify([normalizedRootID, normalizedTaskId]);
   const current = intents[key];
   const currentRevision = current?.revision ?? 0;
-  if (expectedRevision !== currentRevision) throw new Error('task-intent: CAS mismatch');
-  if (current && JSON.stringify(current.intent) === JSON.stringify(normalizedIntent)) return clone(current);
+  // An intent inferred from a handoff may be replaced by the first explicit set
+  // (expectedRevision 0, as the guidance shows) as well as by its own revision.
+  if (expectedRevision !== currentRevision && !(current?.inferred === true && expectedRevision === 0)) throw new Error('task-intent: CAS mismatch');
+  if (current && JSON.stringify(current.intent) === JSON.stringify(normalizedIntent)) {
+    delete current.inferred; // an explicit set confirms an inferred intent unchanged
+    return clone(current);
+  }
   const entry = { rootID: normalizedRootID, taskId: normalizedTaskId, revision: currentRevision + 1, intent: normalizedIntent, updatedBy: actor, updatedAt: Date.now() };
   intents[key] = entry;
   return clone(entry);
@@ -121,6 +126,52 @@ export function bindIntent(state, { rootID, taskId, intentRevision, checkIds }) 
   const known = new Set(knownIDs);
   if (checkIds.some(checkID => typeof checkID !== 'string' || !known.has(checkID))) throw new Error(`task-intent: unknown check id; ${correction}`);
   return clone(entry);
+}
+
+const oneLine = (value, max) => {
+  const flat = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+  return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat;
+};
+const validCheckID = value => typeof value === 'string' && value.length > 0 && value.length <= 128 && !/\s/.test(value);
+export const DEFAULT_INFERRED_CHECK = Object.freeze({ id: 'handoff', description: 'The assigned work is done as described in the handoff brief, with evidence reported to the parent.', mode: 'local' });
+
+// Builds a conservative intent from a handoff when none was registered: no
+// authorized effects, no non-goals, assumptions marking it as inferred. Returns
+// undefined when no root user message can be cited (an intent needs one).
+export function inferIntent({ description, prompt, checkIds, sourceMessageIDs }) {
+  const latest = Array.isArray(sourceMessageIDs) ? sourceMessageIDs.filter(item => typeof item === 'string' && /^msg_\S+$/.test(item) && item.length <= 128).at(-1) : undefined;
+  // Keep both short: the worker receives the full prompt beside the rendered intent.
+  const brief = oneLine(prompt, 300), title = oneLine(description, 300);
+  if (!latest || (!brief && !title)) return undefined;
+  const ids = Array.isArray(checkIds) ? [...new Set(checkIds.filter(validCheckID))].slice(0, 12) : [];
+  return normalizeIntent({
+    outcome: title || brief,
+    target: brief || title,
+    nonGoals: [], authorizedEffects: [],
+    assumptions: ['Inferred from the first handoff brief because no task_intent was registered; the root goal owner should confirm or correct it with task_intent set.'],
+    checks: ids.length ? ids.map(checkID => ({ id: checkID, description: `Check "${checkID}" named by the handoff (inferred; refine with task_intent).`, mode: 'local' })) : [{ ...DEFAULT_INFERRED_CHECK }],
+    sourceMessageIDs: [latest],
+  });
+}
+
+// Normalizes a handoff's intent binding instead of rejecting it: a missing,
+// invalid or stale revision binds to the current revision, unknown check ids are
+// dropped, and no valid ids select every current check. Returns the binding plus
+// human-readable notes describing each correction.
+export function resolveIntentBinding(entry, { intentRevision, checkIds }) {
+  if (!entry || !Array.isArray(entry.intent?.checks)) throw new Error('task-intent: intent is not registered');
+  const known = entry.intent.checks.map(check => check.id), notes = [];
+  if (intentRevision === undefined) notes.push(`intentRevision omitted; bound to current revision ${entry.revision}`);
+  else if (intentRevision !== entry.revision) notes.push(`intentRevision ${JSON.stringify(intentRevision)} is not current; bound to current revision ${entry.revision} (re-read task_intent get if the user corrected the outcome)`);
+  const requested = Array.isArray(checkIds) ? [...new Set(checkIds.filter(item => typeof item === 'string'))] : [];
+  const unknown = Array.isArray(checkIds) ? checkIds.filter(item => !known.includes(item)) : [];
+  let selected = requested.filter(item => known.includes(item));
+  if (unknown.length) notes.push(`dropped unknown checkIds ${JSON.stringify(unknown)}`);
+  if (!selected.length) {
+    selected = [...known];
+    notes.push(`${checkIds === undefined ? 'checkIds omitted' : 'no valid checkIds'}; assigned all current checks ${JSON.stringify(known)}`);
+  }
+  return { intentRevision: entry.revision, checkIds: selected, notes };
 }
 
 export function renderIntent(entry, checkIds) {

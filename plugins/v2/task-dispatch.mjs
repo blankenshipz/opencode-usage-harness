@@ -13,7 +13,7 @@ import crypto from 'node:crypto';
 import { createRegistry, runtimeSessions, runtimeIntentSources, runtimeCompletionReceipt, runtimeTerminalReceipt, runtimeFinalText, runtimeDeliveryEvidence, lineage, descendant, overlaps } from './dispatch-registry.mjs';
 import { authorizeExternalWrites } from './external-write-grant.mjs';
 import { reserveWriterLease, finishWriterLease, writerPathsOverlap } from './global-write-lease.mjs';
-import { intentSchema, getIntent, setIntent, bindIntent, renderIntent, renderIntentReference } from './task-intent.mjs';
+import { intentSchema, getIntent, setIntent, inferIntent, resolveIntentBinding, renderIntent, renderIntentReference } from './task-intent.mjs';
 import { packageRoot, statePath } from './paths.mjs';
 import { createWorkerProgress } from './worker-progress.mjs';
 import { admissionDenial, denialAdvice, receipt, suppression } from './denial-recovery.mjs';
@@ -117,19 +117,20 @@ function recovery(sessions, workerID, callerID, records) {
     advice: direct ? 'Continue this direct child and ask it to coordinate the authorized follow-up after its active writers finish. Preserve ownership IDs when supplied.' : 'The owner is outside this child tree. Wait and recheck status; do not attempt cross-parent adoption.' };
 }
 
-// The shared intent must exist before a new handoff. State it in the schema and
-// in every rejection with the exact corrective call, because a rejected handoff
+// Registering the shared intent first is recommended, not required: a handoff
+// without it (or with a stale revision or unknown check ids) still proceeds with
+// an inferred or corrected binding and a warning, because a rejected handoff
 // forces the model to regenerate its whole (often large) prompt.
-export const INTENT_FIRST_HELP = "Before the first handoff of a taskId, call task_intent({taskId, action:'set', expectedRevision:0, intent:{outcome, target, nonGoals:[], authorizedEffects:[], assumptions:[], checks:[{id:'tests', description:'...', mode:'local'}], sourceMessageIDs:['<latest root user msg_ id from task_intent get>']}}), then pass intentRevision:<current.revision> and checkIds:['tests'] in the handoff.";
-const INTENT_REVISION_HELP = `Required for every new handoff (omit only when continuing a legacy child that has no intent). ${INTENT_FIRST_HELP}`;
-export function missingIntentError(taskId) {
+export const INTENT_FIRST_HELP = "Recommended before the first handoff of a taskId: task_intent({taskId, action:'set', expectedRevision:0, intent:{outcome, target, nonGoals:[], authorizedEffects:[], assumptions:[], checks:[{id:'tests', description:'...', mode:'local'}], sourceMessageIDs:['<latest root user msg_ id from task_intent get>']}}), then pass intentRevision:<current.revision> and checkIds:['tests'] in the handoff. Without it the handoff still runs: the harness infers an intent from description/prompt (or binds the current revision and checks) and returns a warning.";
+const INTENT_REVISION_HELP = `Recommended for every new handoff; a missing or stale value binds to the current revision with a warning. ${INTENT_FIRST_HELP}`;
+export function intentWarning(taskId, notes) {
   const id = JSON.stringify(typeof taskId === 'string' ? taskId : '<taskId>');
-  return new Error(`task-intent: register the user outcome with task_intent before a new handoff; no work was admitted. Next call: task_intent({taskId:${id}, action:'get'}) to read sourceMessageIDs, then task_intent({taskId:${id}, action:'set', expectedRevision:0, intent:{outcome:'...', target:'...', nonGoals:[], authorizedEffects:['...'], assumptions:[], checks:[{id:'tests', description:'...', mode:'local'}], sourceMessageIDs:['msg_...']}}). Then retry this handoff unchanged except intentRevision:<current.revision> and checkIds:['tests'].`);
+  return `Intent warning (handoff proceeded): ${notes.join('; ')}. To register or correct it: task_intent({taskId:${id}, action:'get'}), then task_intent({taskId:${id}, action:'set', expectedRevision:<current.revision or 0>, intent:{...}}) and pass intentRevision/checkIds on later handoffs.`;
 }
 const schema = { type: 'object', additionalProperties: false, properties: {
   taskId: { type: 'string', minLength: 1, maxLength: 160 }, workKey: { type: 'string', minLength: 1, maxLength: 160 },
   operation: { type: 'string', enum: operations },
-  intentRevision: {type:'integer',minimum:1,description:INTENT_REVISION_HELP}, checkIds:{type:'array',minItems:1,maxItems:12,uniqueItems:true,items:{type:'string'},description:'Required with intentRevision for a new handoff: 1-12 check ids from the current task_intent checks that this worker must satisfy.'},
+  intentRevision: {type:'integer',minimum:1,description:INTENT_REVISION_HELP}, checkIds:{type:'array',minItems:1,maxItems:12,uniqueItems:true,items:{type:'string'},description:'Recommended with intentRevision: 1-12 check ids from the current task_intent checks that this worker must satisfy. Unknown ids are dropped; none selects every current check.'},
   agent: { type: 'string', minLength: 1 }, description: { type: 'string', minLength: 1 },
   requiredCapabilities: { type: 'array', uniqueItems: true, items: { type: 'string', enum: ['shell','edit','delegate'] } },
   writePaths: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1 } },
@@ -146,7 +147,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   }, required: ['kind','scope','inputs','authorization','explanation','reference'] },
   // Keep the large free-text prompt last so short identity/intent fields are
   // generated (and corrected) before a long assignment body.
-  prompt: { type: 'string', minLength: 1, description: 'Worker assignment text. Write it after intentRevision/checkIds are known; a rejected handoff must be re-sent in full.' },
+  prompt: { type: 'string', minLength: 1, description: 'Worker assignment text. Write it after the short identity/intent fields; a rejected handoff must be re-sent in full.' },
 }, required: ['taskId','workKey','operation','agent','description','prompt','requiredCapabilities'] };
 // Mirrors the stock OpenCode subagent input (see core/tool/plugin/subagent.ts).
 // Keep it separate from the harness schema so built-in callers retain their
@@ -481,7 +482,15 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     // pinned-runtime fallback mirrors its supported stock contract.
     stockInput = structuredClone(native.input?.type === 'object' && native.input?.properties ? native.input : nativeSubagentSchema);
     stockDescription = native.description ?? stockDescription;
+    // Intent corrections never block a handoff; they are reported with its result.
     const dispatch = async (input, context) => {
+      const intentNotes = [];
+      const result = await admitAndRun(input, context, intentNotes);
+      if (!intentNotes.length) return result;
+      const warning = intentWarning(input.taskId, [...new Set(intentNotes)]);
+      return { ...result, content: `${typeof result?.content === 'string' && result.content ? `${result.content}\n\n` : ''}${warning}`, metadata: { ...(result?.metadata ?? {}), intentWarning: warning } };
+    };
+    const admitAndRun = async (input, context, intentNotes) => {
       const checkpoint = normalizeCheckpoint(input.checkpoint);
       const review = input.workReview === undefined ? undefined : normalizeReviewAcknowledgement(input.workReview);
       if (input.compact !== undefined && typeof input.compact !== 'boolean') throw new Error('task-dispatch: invalid compact');
@@ -489,17 +498,6 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
-      // Fail a new handoff without shared intent before any agent, quota,
-      // publication or ownership work. Admission rechecks this under its lock.
-      if (input.sessionID === undefined && (input.intentRevision === undefined || input.checkIds === undefined) &&
-          !(input.taskId === 'large-file-summary' && input.operation === 'inspect')) {
-        await registry(workspace, async state => {
-          const rootID = lineage(await loadSessions(), context.sessionID);
-          const current = getIntent(state, rootID, input.taskId);
-          if (current) bindIntent(state, { rootID, taskId:input.taskId, intentRevision:input.intentRevision, checkIds:input.checkIds });
-          else if (!state.records.some(r => r.key === `${rootID}\0${input.taskId}\0${input.workKey}`)) throw missingIntentError(input.taskId);
-        });
-      }
       if (input.operation === 'publish') {
         if (!Array.isArray(input.writePaths) || input.writePaths.length === 0) throw new Error('task-dispatch: publish requires explicit non-empty writePaths for every admission');
         if (!input.publication || typeof input.publication !== 'object' || Array.isArray(input.publication) || Object.keys(input.publication).length !== 2 || typeof input.publication.revision !== 'string' || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(input.publication.revision)) throw new Error('task-dispatch: publish requires publication.revision as a full frozen commit OID');
@@ -617,10 +615,26 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
             record.inFlight=null;record.state='paused';await save();
           }
         }
-        const intent = getIntent(state,rootID,input.taskId);
+        let intent = getIntent(state,rootID,input.taskId), inferredNow = false;
         const summaryOnly = input.taskId === 'large-file-summary' && input.operation === 'inspect' && role === 'scout' && input.requiredCapabilities.length === 0;
-        if (intent) bindIntent(state,{rootID,taskId:input.taskId,intentRevision:input.intentRevision,checkIds:input.checkIds});
-        else if (!summaryOnly && !record && !input.sessionID) throw missingIntentError(input.taskId);
+        if (!intent && !summaryOnly && !record && !input.sessionID) {
+          // Only the root goal owner may establish intent; it must cite a root user message.
+          let sources = [];
+          if (context.sessionID === rootID) { try { sources = await loadSources(rootID); } catch { sources = []; } }
+          const inferred = inferIntent({ description:input.description, prompt:input.prompt, checkIds:input.checkIds, sourceMessageIDs:sources });
+          if (inferred) {
+            setIntent(state,{rootID,taskId:input.taskId,intent:inferred,expectedRevision:0,actorSessionID:context.sessionID});
+            state.intents[JSON.stringify([rootID,input.taskId])].inferred = true;
+            intent = getIntent(state,rootID,input.taskId); inferredNow = true;
+            intentNotes.push(`no task_intent was registered for taskId ${JSON.stringify(input.taskId)}; inferred revision ${intent.revision} from this handoff (outcome ${JSON.stringify(intent.intent.outcome.slice(0,120))}, checks ${JSON.stringify(intent.intent.checks.map(check=>check.id))}, source ${JSON.stringify(intent.intent.sourceMessageIDs)}, no authorized effects)`);
+          } else intentNotes.push(`no task_intent was registered for taskId ${JSON.stringify(input.taskId)} and none could be inferred (${context.sessionID === rootID ? 'no root user message ID was available' : 'only the root goal owner may establish intent'}); the handoff runs without shared intent`);
+        }
+        if (intent) {
+          // A missing/stale revision or unknown check ids are corrected, not rejected.
+          const binding = resolveIntentBinding(intent,{intentRevision:inferredNow ? intent.revision : input.intentRevision,checkIds:input.checkIds});
+          if (!inferredNow) intentNotes.push(...binding.notes);
+          input.intentRevision = binding.intentRevision; input.checkIds = binding.checkIds;
+        }
         const requested = input.sessionID ?? record?.childID;
         const staleRebind = Boolean(intent && record && requested && record.intentRevision !== intent.revision);
         if (requested) {
@@ -949,7 +963,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       record.state='completed';record.completionReceipt={generation:input.generation,marker:binding.marker,promptHash:binding.promptHash,...receipt};record.updatedAt=Date.now();collectHandoffTiming(record,record.completionReceipt,now());await save();
       return {content:JSON.stringify({sessionID:input.sessionID,generation:input.generation,status:'completed',receipt:record.completionReceipt})};
     })});
-    editor.add({name:'task_intent',description:'Read or revise the shared user outcome for this root task. Root callers must set it before the first task_dispatch/subagent handoff of a taskId; the handoff then passes intentRevision (current.revision) and checkIds. Get returns valid root user-message IDs. Only the root goal owner may set; use expectedRevision to avoid overwriting corrections. Never store secret values.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1,maxLength:128},action:{type:'string',enum:['get','set']},expectedRevision:{type:'integer',minimum:0},intent:intentSchema},required:['taskId','action']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
+    editor.add({name:'task_intent',description:'Read or revise the shared user outcome for this root task. Root callers should set it before the first task_dispatch/subagent handoff of a taskId (recommended; otherwise the handoff infers one, marked inferred:true, which a set with expectedRevision 0 or its revision replaces); the handoff then passes intentRevision (current.revision) and checkIds. Get returns valid root user-message IDs. Only the root goal owner may set; use expectedRevision to avoid overwriting corrections. Never store secret values.',input:{type:'object',additionalProperties:false,properties:{taskId:{type:'string',minLength:1,maxLength:128},action:{type:'string',enum:['get','set']},expectedRevision:{type:'integer',minimum:0},intent:intentSchema},required:['taskId','action']},execute:async(input,context)=>registry(workspace,async(state,save)=>{
       string(input.taskId,'taskId');
       const sessions=await loadSessions(),rootID=lineage(sessions,context.sessionID);
       if (!sessions.some(s=>s.id===context.sessionID)) throw new Error('task-intent: current session metadata unavailable');

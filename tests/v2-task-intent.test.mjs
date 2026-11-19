@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { bindIntent, getIntent, intentSchema, renderIntent, renderIntentReference, setIntent } from '../plugins/v2/task-intent.mjs';
+import { bindIntent, getIntent, inferIntent, intentSchema, renderIntent, renderIntentReference, resolveIntentBinding, setIntent } from '../plugins/v2/task-intent.mjs';
 
 const makeIntent = () => ({ outcome: 'Ship the bounded change', target: 'plugins/v2/task-intent.mjs', nonGoals: [], authorizedEffects: ['edit the assigned files'], assumptions: ['dispatch registry provides serialization'], checks: [{ id: 'unit', description: 'Run the focused unit test', mode: 'local' }, { id: 'review', description: 'Review the resulting diff', mode: 'synthetic' }], sourceMessageIDs: ['msg_root_1'] });
 
@@ -77,4 +77,43 @@ test('renderIntentReference keeps a compact continuation bounded to durable iden
   const reference = JSON.parse(rendered.slice(rendered.indexOf('{'), rendered.indexOf('}.') + 1));
   assert.deepEqual(reference, { taskId: 'task', revision: 1, checkIds: ['unit'] });
   assert.throws(() => renderIntentReference(entry, ['missing']), /unknown/);
+});
+
+test('inferIntent builds a conservative intent from a handoff brief, or none without a source', () => {
+  const inferred = inferIntent({ description: '  Fix   login ', prompt: 'Repair the form\nquickly', checkIds: ['tests', 'bad id', 'tests'], sourceMessageIDs: ['msg_a', 'nope', 'msg_b'] });
+  assert.equal(inferred.outcome, 'Fix login');
+  assert.equal(inferred.target, 'Repair the form quickly');
+  assert.deepEqual(inferred.authorizedEffects, []);
+  assert.deepEqual(inferred.checks.map(check => check.id), ['tests']);
+  assert.deepEqual(inferred.sourceMessageIDs, ['msg_b']);
+  assert.match(inferred.assumptions[0], /Inferred from the first handoff brief/);
+  assert.deepEqual(inferIntent({ description: 'x', prompt: 'y', sourceMessageIDs: ['msg_a'] }).checks.map(check => check.id), ['handoff']);
+  assert.equal(inferIntent({ description: 'x', prompt: 'y', sourceMessageIDs: [] }), undefined);
+  assert.equal(inferIntent({ description: '', prompt: ' ', sourceMessageIDs: ['msg_a'] }), undefined);
+  assert.ok(inferIntent({ description: 'd'.repeat(5000), prompt: 'p'.repeat(5000), sourceMessageIDs: ['msg_a'] }).target.length <= 300);
+});
+
+test('resolveIntentBinding corrects stale revisions and unknown checks instead of throwing', () => {
+  const state = {};
+  setIntent(state, { rootID: 'root', taskId: 'task', intent: makeIntent(), expectedRevision: 0, actorSessionID: 'root' });
+  const entry = getIntent(state, 'root', 'task');
+  assert.deepEqual(resolveIntentBinding(entry, { intentRevision: 1, checkIds: ['unit'] }), { intentRevision: 1, checkIds: ['unit'], notes: [] });
+  const stale = resolveIntentBinding(entry, { intentRevision: 9, checkIds: ['unit', 'typo'] });
+  assert.deepEqual([stale.intentRevision, stale.checkIds], [1, ['unit']]);
+  assert.match(stale.notes.join(' '), /intentRevision 9 is not current.*dropped unknown checkIds \["typo"\]/);
+  const omitted = resolveIntentBinding(entry, {});
+  assert.deepEqual(omitted.checkIds, ['unit', 'review']);
+  assert.match(omitted.notes.join(' '), /intentRevision omitted.*checkIds omitted/);
+  assert.deepEqual(resolveIntentBinding(entry, { intentRevision: 1, checkIds: ['typo'] }).checkIds, ['unit', 'review']);
+  assert.throws(() => resolveIntentBinding(null, {}), /not registered/);
+});
+
+test('an inferred intent can be replaced by the first explicit set with expectedRevision 0', () => {
+  const state = {};
+  setIntent(state, { rootID: 'root', taskId: 'task', intent: makeIntent(), expectedRevision: 0, actorSessionID: 'root' });
+  assert.throws(() => setIntent(state, { rootID: 'root', taskId: 'task', intent: { ...makeIntent(), target: 'other' }, expectedRevision: 0, actorSessionID: 'root' }), /CAS mismatch/);
+  state.intents[JSON.stringify(['root', 'task'])].inferred = true;
+  const replaced = setIntent(state, { rootID: 'root', taskId: 'task', intent: { ...makeIntent(), target: 'other' }, expectedRevision: 0, actorSessionID: 'root' });
+  assert.equal(replaced.revision, 2);
+  assert.equal(replaced.inferred, undefined);
 });

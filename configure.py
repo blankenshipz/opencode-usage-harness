@@ -69,11 +69,12 @@ def validate_routing_policy(routing_policy):
 
 # Delegating roles must register shared intent before their first handoff;
 # a rejected handoff forces the model to regenerate its whole prompt.
-INTENT_FIRST_GUIDANCE = ("\nBefore the first task_dispatch/subagent handoff of a taskId: call task_intent "
+INTENT_FIRST_GUIDANCE = ("\nRecommended before the first task_dispatch/subagent handoff of a taskId: call task_intent "
     "{taskId, action:'get'} for sourceMessageIDs, then task_intent {taskId, action:'set', expectedRevision:0, "
     "intent:{outcome, target, nonGoals, authorizedEffects, assumptions, checks:[{id, description, mode}], sourceMessageIDs}}. "
-    "Pass its current.revision as intentRevision and the chosen check ids as checkIds in that handoff; "
-    "a handoff without them is rejected and its whole prompt must be re-sent.")
+    "Pass its current.revision as intentRevision and the chosen check ids as checkIds in that handoff. "
+    "A handoff without them still runs: the harness infers an intent from the brief (or binds the current revision "
+    "and checks) and returns a warning; correct it with task_intent set.")
 # Delegating roles can stop only children they dispatched themselves.
 CANCEL_GUIDANCE = ("\nTo stop a child you dispatched (e.g. after a rule change), call task_dispatch_cancel "
     "{taskId, workKey, reason}; it interrupts it and releases its locks.")
