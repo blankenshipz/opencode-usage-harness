@@ -111,8 +111,11 @@ export function createDispatchCanceller({ registry, globalRegistry, workspace, c
       if (globalState.leases !== undefined && !Array.isArray(globalState.leases)) throw new Error('task-dispatch: global lease state is unavailable');
       const canonical = await canonicalWorkspace();
       const subtree = new Set(plan.subtree);
-      const cascaded = state.records.filter(r => r !== record && r.childID && subtree.has(r.childID) && r.state !== 'cancelled');
-      const releasedLeases = (globalState.leases ?? []).filter(l => (l.workspace === canonical && l.key === record.key) || (l.childID && subtree.has(l.childID)));
+      // Include admissions a subtree session started whose child identity is not yet known.
+      const cascaded = state.records.filter(r => r !== record && r.state !== 'cancelled' &&
+        ((r.childID && subtree.has(r.childID)) || (!r.childID && r.inFlight && subtree.has(r.parentID))));
+      const releasedLeases = (globalState.leases ?? []).filter(l => (l.workspace === canonical && l.key === record.key) ||
+        (l.childID && subtree.has(l.childID)) || (!l.childID && l.parentID && subtree.has(l.parentID)));
       const at = now();
       const releasedLocks = [
         ...(record.writePaths?.length ? [{ kind:'workspace-ownership', sessionID:record.childID, workKey:record.workKey, paths:record.writePaths }] : []),

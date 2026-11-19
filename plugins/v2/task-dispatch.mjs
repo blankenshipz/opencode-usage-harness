@@ -26,6 +26,7 @@ import { rootProgressStatus, rootProgressReminder } from './root-progress.mjs';
 import { createTerminalSettler, terminalSettlementEligibility } from './terminal-settlement.mjs';
 import { createDispatchCanceller, cancelInputSchema } from './task-dispatch-cancel.mjs';
 import { createResultDelivery } from './result-delivery.mjs';
+import { createStaleReconciler } from './dispatch-reconcile.mjs';
 
 const readContextCatalog = async ctx => {
   try { return (await ctx.model?.list())?.data; } catch { return undefined; }
@@ -364,10 +365,16 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     canonicalWorkspace:()=>canonicalWriterPath(workspace), loadSessions, loadTerminalReceipt, now });
   const cancelChild = createDispatchCanceller({ registry, globalRegistry, workspace,
     canonicalWorkspace:()=>canonicalWriterPath(workspace), loadSessions, ctx, now });
+  // Cancelled, interrupted or orphaned children must not leave `running` rows
+  // or writer leases that reject the next lane.
+  const reconciler = createStaleReconciler({ registry, globalRegistry, workspace,
+    canonicalWorkspace:()=>canonicalWriterPath(workspace), loadSessions, loadTerminalReceipt, now });
   // Every admitted generation's result must reach its parent even when the
   // handoff call is aborted or its returned result is not recorded.
   const resultDelivery = createResultDelivery({ registry, workspace, ctx, loadEvidence:loadDeliveryEvidence, loadFinalText, now,
+    onTerminalFailure:(key,generation)=>reconciler.settleGeneration(key,generation),
     ...(deliverySchedule ? { schedule:deliverySchedule } : {}) });
+  try { await reconciler.reconcile(); } catch { /* never block plugin start; the next start retries */ }
   try { await resultDelivery.resume(); } catch { /* pending deliveries are re-armed at the next plugin start */ }
   const quotaNotifier = async notice => {
     if (typeof ctx.session?.synthetic !== 'function') throw new Error('task-dispatch: synthetic notification unavailable');
@@ -981,7 +988,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       return {content:JSON.stringify(input.summary===true?summarizeTaskDispatchStatus(status):status)};
     })});
   });
-  return { resultDelivery, dispose: () => { workerProgress.dispose(); resultDelivery.dispose(); }, outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
+  return { resultDelivery, reconciler, dispose: () => { workerProgress.dispose(); resultDelivery.dispose(); }, outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
     const sessions=await loadSessions(),rootID=lineage(sessions,call.sessionID),current=getIntent(state,rootID,args.taskId);
     if (!current) return run(null);
     if (args.intentRevision!==current.revision) throw new Error('task-intent: outcome requires the current intentRevision; stale results cannot complete a corrected objective');

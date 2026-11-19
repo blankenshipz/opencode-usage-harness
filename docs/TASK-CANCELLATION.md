@@ -71,3 +71,34 @@ hook that needs those locks.
   call returns, and the cancellation stays on the record.
 - `task_dispatch_status` shows `recordedState:'cancelled'` with `cancellation`
   for each owner, and a top-level `cancelledChildren` list.
+- Cancelling a coordinator also cancels admissions that any session in its
+  subtree started but whose child identity is not yet known (`inFlight`, no
+  `sessionID`), and it releases their global writer leases.
+
+## Interrupted children and restarts
+
+Some children stop without a cancel: a native session interrupt or abort, a
+failed background child, or a service restart while a handoff was in flight.
+The harness settles these ownership rows itself, so no stale `running` row or
+lease rejects the next lane:
+
+- When a background generation reaches an exact native terminal outcome of
+  `failed` or `interrupted`, the result-delivery watcher sets the row to that
+  state. It clears the row's admission marker and removes the generation's
+  global writer leases.
+- At plugin start, every `starting`/`running` row and every in-flight admission
+  is checked against native state. A row is settled to `interrupted` or
+  `failed`, with a `reconciliation {reason, previousState, nativeOutcome,
+  ownerPid, releasedLeases}` record, when one of these holds:
+  - its child's exact native outcome is `failed` or `interrupted`;
+  - its child session no longer exists;
+  - its admission was owned by a server process that has exited, and its
+    child is idle.
+- Nothing is settled while the admission's owning process is alive, while the
+  child or any descendant is active, or while an unreported native child of the
+  same parent and role is active. An idle child whose outcome is `succeeded` is
+  never marked failed. A background result stays collectable, and a foreground
+  result is delivered by the result-delivery watcher.
+- Unlike a cancel, the settled row keeps its admitted `writePaths` for an
+  explicit same-child continuation. An idle child's scope never blocks
+  admission.

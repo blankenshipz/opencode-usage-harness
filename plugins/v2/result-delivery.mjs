@@ -71,7 +71,7 @@ export function deliveryDecision({ delivery, evidence, now, graceMs = RESULT_DEL
     resume: !(evidence.parentIdleOutcome === 'interrupted' && evidence.parentActive === false) };
 }
 
-export function createResultDelivery({ registry, workspace, ctx, loadEvidence, loadFinalText, now = Date.now,
+export function createResultDelivery({ registry, workspace, ctx, loadEvidence, loadFinalText, onTerminalFailure, now = Date.now,
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; }, cancel = clearTimeout,
   graceMs = RESULT_DELIVERY_GRACE_MS, maxAgeMs = RESULT_DELIVERY_MAX_AGE_MS }) {
   const timers = new Map(), running = new Map();
@@ -100,6 +100,9 @@ export function createResultDelivery({ registry, workspace, ctx, loadEvidence, l
     const decision = deliveryDecision({ delivery, evidence, now:now(), graceMs });
     if (decision.action === 'wait') return 'pending';
     const terminal = evidence.terminal;
+    // A failed or interrupted child no longer holds its ownership row or writer leases.
+    if (terminal.outcome !== 'succeeded' && typeof onTerminalFailure === 'function')
+      await Promise.resolve().then(() => onTerminalFailure(key, generation, terminal.outcome)).catch(() => {});
     if (decision.action === 'final') return finish(key, generation, { status:decision.status, via:decision.via, outcome:terminal.outcome });
     if (typeof ctx?.session?.synthetic !== 'function') return 'pending';
     let report = '', truncated = false, length = 0;
