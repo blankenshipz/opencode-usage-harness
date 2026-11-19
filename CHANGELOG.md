@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — reliable handoff result delivery
+
+- Every admitted handoff generation records a durable `resultDelivery` binding (parent message and tool-call IDs, completion marker). After the handoff call returns, throws or is interrupted, a watcher waits for the child's exact native terminal outcome. It then checks read-only evidence through the new `dispatch_runtime.py --delivery-evidence` reader: whether the parent's foreground tool part completed, or whether a native subagent notice for the child is in the parent's transcript or inbox.
+- If neither arrived, it sends one synthetic `<subagent …>` message to the parent with the child's final report and real outcome (`succeeded`, `failed` or `interrupted`) after a 15 s grace period. This covers an aborted, timed-out or interrupted foreground wait, a returned result that core never recorded (the part stays `running` and is later shown as `Tool execution interrupted`), and a missing background completion notice. The message ID is derived from the child and generation and the binding records the delivery, so a result is never delivered twice. Pending deliveries are re-armed when the plugin starts.
+- A foreground child that succeeded after its parent's wait was aborted is recorded as `completed` with its report retained (`outcomeCorrection` keeps the previous state), so `task_dispatch_collect` returns it. A parent the user interrupted gets the notice queued without being restarted. Cancelled children get no notice. `task_dispatch_status` shows each owner's `resultDelivery` status.
+
 ## Unreleased — parent cancellation of dispatched children
 
 - Add `task_dispatch_cancel {taskId, workKey and/or sessionID, reason}` for delegating roles (router, coordinator). Only the recorded dispatcher of a child can cancel it. Grandchildren are refused unless the caller dispatched them. Other task trees never match.

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.dispatch_runtime import sessions, terminal_receipt
+from src.dispatch_runtime import delivery_evidence, sessions, terminal_receipt
 
 
 class TerminalRuntimeTest(unittest.TestCase):
@@ -131,6 +131,42 @@ class TerminalRuntimeTest(unittest.TestCase):
         with sqlite3.connect(db) as c:
             c.execute("insert into session_message values ('reasoning','root','assistant',3,?)", (json.dumps({"time": {"completed": 99}, "content": [{"type": "reasoning", "text": "private"}]}),))
         self.assertEqual(sessions(db_path=db)[0]["lastVisibleTextAt"], 77)
+
+
+    def test_delivery_evidence_reports_terminal_parent_tool_and_child_notices_without_text(self):
+        db, prompt = self.make_db([
+            ("answer", "assistant", {"finish": "stop", "time": {"completed": 2}, "content": [{"type": "text", "text": "SECRET result"}]}),
+            ("idle", "idle", {"outcome": "succeeded", "time": {"created": 3}}),
+        ], idle_outcome="succeeded")
+        digest = hashlib.sha256(prompt.encode()).hexdigest()
+        tool = {"type": "tool", "id": "toolu_1", "name": "subagent", "state": {"status": "running", "input": {"prompt": "PRIVATE"}}}
+        notice = lambda child, created, **extra: json.dumps({"text": "SECRET", "time": {"created": created}, "metadata": {"source": "subagent", "childID": child, "state": "completed", **extra}})
+        with sqlite3.connect(db) as c:
+            c.execute("insert into session_v2 values ('parent',null,'router','dir',null,1,'interrupted',null)")
+            c.execute("insert into session_message values ('msg_call','parent','assistant',1,?)", (json.dumps({"content": [{"type": "text", "text": "x"}, tool]}),))
+            c.execute("insert into session_message values ('old','parent','synthetic',2,?)", (notice("root", 5),))
+            c.execute("insert into session_message values ('other','parent','synthetic',3,?)", (notice("someone-else", 50),))
+            c.execute("insert into session_message values ('native','parent','synthetic',4,?)", (notice("root", 60),))
+            c.execute("insert into session_inbox values ('queued','parent','synthetic',?,'queued',1,70)", (json.dumps({"text": "SECRET", "metadata": {"source": "subagent", "childID": "root", "state": "completed", "harness": "result_delivery", "generation": 2}}),))
+        request = {"childID": "root", "parentID": "parent", "marker": "marker", "promptHash": digest, "messageID": "msg_call", "callID": "toolu_1", "since": 10}
+        result = delivery_evidence(request, db_path=db)
+        self.assertEqual(result["terminal"]["outcome"], "succeeded")
+        self.assertEqual(result["tool"], {"status": "streaming"})
+        self.assertFalse(result["parentActive"])
+        self.assertEqual(result["parentIdleOutcome"], "interrupted")
+        self.assertEqual(result["notices"], [
+            {"harness": False, "state": "completed", "created": 60, "id": "native", "where": "message"},
+            {"harness": True, "state": "completed", "generation": 2, "created": 70, "id": "queued", "where": "inbox"},
+        ])
+        self.assertNotIn("SECRET", json.dumps(result))
+        self.assertNotIn("PRIVATE", json.dumps(result))
+        with sqlite3.connect(db) as c:
+            tool["state"] = {"status": "error", "error": {"type": "aborted", "message": "Tool execution interrupted"}}
+            c.execute("update session_message set data=? where id='msg_call'", (json.dumps({"content": [tool]}),))
+        self.assertEqual(delivery_evidence(request, db_path=db)["tool"], {"status": "error", "errorType": "aborted"})
+        self.assertIsNone(delivery_evidence({**request, "callID": "missing"}, db_path=db)["tool"])
+        with self.assertRaises(ValueError):
+            delivery_evidence({**request, "marker": ""}, db_path=db)
 
 
 if __name__ == "__main__":

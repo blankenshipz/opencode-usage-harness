@@ -604,6 +604,95 @@ def terminal_receipt(session_id: str, marker: str, prompt_hash: str, *, db_path:
         return receipt
 
 
+def _subagent_notice(item: object, child_id: str) -> dict[str, object] | None:
+    """Return a bounded native/harness subagent-result notice for one child."""
+    if not isinstance(item, dict):
+        return None
+    metadata = item.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("source") != "subagent" or metadata.get("childID") != child_id:
+        return None
+    notice: dict[str, object] = {"harness": metadata.get("harness") == "result_delivery"}
+    if isinstance(metadata.get("state"), str) and metadata["state"] in ("completed", "error", "cancelled", "running"):
+        notice["state"] = metadata["state"]
+    if isinstance(metadata.get("generation"), int) and not isinstance(metadata.get("generation"), bool):
+        notice["generation"] = metadata["generation"]
+    timing = item.get("time")
+    created = timing.get("created") if isinstance(timing, dict) else None
+    if _native_timestamp(created):
+        notice["created"] = created
+    return notice
+
+
+def delivery_evidence(request: dict[str, object], *, db_path: str | Path | None = None) -> dict[str, object]:
+    """Read-only evidence of whether one child's result reached its parent.
+
+    Returns the child's exact terminal receipt (or None), the parent's tool
+    part status for the handoff call, subagent-result notices for this child
+    in the parent's transcript or pending inbox, and the parent's idle state.
+    Never returns report text, tool input or tool output.
+    """
+    child_id, parent_id = request.get("childID"), request.get("parentID")
+    marker, prompt_hash = request.get("marker"), request.get("promptHash")
+    message_id, call_id, since = request.get("messageID"), request.get("callID"), request.get("since")
+    if not all(isinstance(value, str) and value for value in (child_id, parent_id, marker, prompt_hash)):
+        raise ValueError("delivery evidence requires childID, parentID, marker and promptHash")
+    since = since if _native_timestamp(since) else 0
+    result: dict[str, object] = {"terminal": terminal_receipt(child_id, marker, prompt_hash, db_path=db_path), "tool": None, "notices": []}
+    with _connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("pragma table_info(session_v2)")}
+        if "time_suspended" in columns:
+            idle = ",idle_outcome" if "idle_outcome" in columns else ",null"
+            row = connection.execute("SELECT time_suspended" + idle + " FROM session_v2 WHERE id=?", (parent_id,)).fetchone()
+            if row is not None:
+                result["parentActive"] = row[0] is not None
+                if row[1] in ("succeeded", "failed", "interrupted"):
+                    result["parentIdleOutcome"] = row[1]
+        if isinstance(message_id, str) and message_id and isinstance(call_id, str) and call_id:
+            row = connection.execute(
+                "SELECT data FROM session_message WHERE session_id=? AND id=? AND type='assistant'", (parent_id, message_id)
+            ).fetchone()
+            if row is not None:
+                try:
+                    content = json.loads(row[0]).get("content")
+                except (TypeError, json.JSONDecodeError, AttributeError):
+                    content = None
+                for part in content if isinstance(content, list) else []:
+                    if isinstance(part, dict) and part.get("type") == "tool" and part.get("id") == call_id:
+                        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                        tool: dict[str, object] = {"status": _tool_status(state.get("status"))}
+                        error = state.get("error")
+                        if isinstance(error, dict) and isinstance(error.get("type"), str) and _SAFE_ID.fullmatch(error["type"]):
+                            tool["errorType"] = error["type"]
+                        result["tool"] = tool
+                        break
+        notices = []
+        for kind, query in (
+            ("message", "SELECT id,data,null FROM session_message WHERE session_id=? AND type='synthetic'"),
+            ("inbox", "SELECT id,payload,time_created FROM session_inbox WHERE session_id=? AND type='synthetic'"),
+        ):
+            try:
+                rows = list(connection.execute(query, (parent_id,)))
+            except sqlite3.OperationalError:
+                continue
+            for ident, raw, created in rows:
+                try:
+                    item = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                notice = _subagent_notice(item, child_id)
+                if notice is None:
+                    continue
+                if "created" not in notice and _native_timestamp(created):
+                    notice["created"] = created
+                if notice.get("created", 0) < since:
+                    continue
+                notice["id"] = _safe_activity_id(ident)
+                notice["where"] = kind
+                notices.append(notice)
+        result["notices"] = notices[:16]
+    return result
+
+
 FINAL_TEXT_LIMIT = 64000
 
 
@@ -641,6 +730,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if len(args) == 4 and args[0] == "--terminal-receipt":
         print(json.dumps(terminal_receipt(args[1], args[2], args[3])))
+        return 0
+    if len(args) == 2 and args[0] == "--delivery-evidence":
+        print(json.dumps(delivery_evidence(json.loads(args[1]))))
         return 0
     if len(args) == 3 and args[0] == "--final-text":
         print(json.dumps(final_text(args[1], args[2])))

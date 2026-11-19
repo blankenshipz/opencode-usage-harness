@@ -27,6 +27,7 @@ export const runtimeIntentSources = rootID => runtimeRead(['--intent-sources', r
 export const runtimeCompletionReceipt = ({ sessionID, marker, promptHash }) => runtimeRead(['--completion-receipt', sessionID, marker, promptHash]);
 export const runtimeFinalText = ({ sessionID, assistantID }) => runtimeRead(['--final-text', sessionID, assistantID]);
 export const runtimeTerminalReceipt = ({ sessionID, marker, promptHash }) => runtimeRead(['--terminal-receipt', sessionID, marker, promptHash]);
+export const runtimeDeliveryEvidence = request => runtimeRead(['--delivery-evidence', JSON.stringify(request)]);
 async function acquireLock(file, legacy) {
   const handle = await fs.open(file, 'a+', 0o600);
   try {

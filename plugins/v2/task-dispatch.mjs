@@ -10,7 +10,7 @@ import { realpath } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import crypto from 'node:crypto';
-import { createRegistry, runtimeSessions, runtimeIntentSources, runtimeCompletionReceipt, runtimeTerminalReceipt, runtimeFinalText, lineage, descendant, overlaps } from './dispatch-registry.mjs';
+import { createRegistry, runtimeSessions, runtimeIntentSources, runtimeCompletionReceipt, runtimeTerminalReceipt, runtimeFinalText, runtimeDeliveryEvidence, lineage, descendant, overlaps } from './dispatch-registry.mjs';
 import { authorizeExternalWrites } from './external-write-grant.mjs';
 import { reserveWriterLease, finishWriterLease, writerPathsOverlap } from './global-write-lease.mjs';
 import { intentSchema, getIntent, setIntent, bindIntent, renderIntent, renderIntentReference } from './task-intent.mjs';
@@ -25,6 +25,7 @@ import { integrationAssignmentTemplate } from './integration-assignment.mjs';
 import { rootProgressStatus, rootProgressReminder } from './root-progress.mjs';
 import { createTerminalSettler, terminalSettlementEligibility } from './terminal-settlement.mjs';
 import { createDispatchCanceller, cancelInputSchema } from './task-dispatch-cancel.mjs';
+import { createResultDelivery } from './result-delivery.mjs';
 
 const readContextCatalog = async ctx => {
   try { return (await ctx.model?.list())?.data; } catch { return undefined; }
@@ -355,7 +356,7 @@ export function taskWorkStatus(state,rootID,taskId) {
   const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
-export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, loadDeliveryEvidence = runtimeDeliveryEvidence, deliverySchedule, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -363,6 +364,11 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     canonicalWorkspace:()=>canonicalWriterPath(workspace), loadSessions, loadTerminalReceipt, now });
   const cancelChild = createDispatchCanceller({ registry, globalRegistry, workspace,
     canonicalWorkspace:()=>canonicalWriterPath(workspace), loadSessions, ctx, now });
+  // Every admitted generation's result must reach its parent even when the
+  // handoff call is aborted or its returned result is not recorded.
+  const resultDelivery = createResultDelivery({ registry, workspace, ctx, loadEvidence:loadDeliveryEvidence, loadFinalText, now,
+    ...(deliverySchedule ? { schedule:deliverySchedule } : {}) });
+  try { await resultDelivery.resume(); } catch { /* pending deliveries are re-armed at the next plugin start */ }
   const quotaNotifier = async notice => {
     if (typeof ctx.session?.synthetic !== 'function') throw new Error('task-dispatch: synthetic notification unavailable');
     await ctx.session.synthetic(quotaRecoverySyntheticInput(notice));
@@ -792,7 +798,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         await save();
       }));
       let observed = admission.childID;
-      let compactionID;
+      let compactionID, pendingDelivery;
       const visible = workerProgress.attach(context.progress ?? (async () => {}));
       try {
         if (input.compact) {
@@ -832,7 +838,10 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         const promptHash=crypto.createHash('sha256').update(boundedHandoff).digest('hex');
         const prefixedPromptHash=crypto.createHash('sha256').update(`You are a subagent spawned by another session.\n${boundedHandoff}`).digest('hex');
         const completionBinding={generation:admission.generation,marker,promptHash,prefixedPromptHash,background:backgroundDispatch(input)};
-        await update({completionBinding,completionReceipt:undefined});
+        pendingDelivery={generation:admission.generation,status:'pending',mode:completionBinding.background?'background':'foreground',parentID:context.sessionID,
+          ...(typeof context.messageID==='string'?{messageID:context.messageID}:{}),...(typeof context.id==='string'?{callID:context.id}:{}),since:now(),
+          marker,promptHash:`${promptHash},${prefixedPromptHash}`,agent:input.agent,description:input.description,taskId:input.taskId,workKey:input.workKey};
+        await update({completionBinding,completionReceipt:undefined,resultDelivery:pendingDelivery});
         const result = await rawExecute({ agent:input.agent,description:input.description,prompt:boundedHandoff,...(admission.childID?{sessionID:admission.childID}:{}),...(admission.routing.selected?{model:admission.routing.selected}:{}),background:backgroundDispatch(input) }, {
           ...context, progress: async progress => {
             if(progress.sessionID) { observed=progress.sessionID;await update({childID:observed,state:'running'}); }
@@ -844,7 +853,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         // retries deliberately resend the full intent rather than treating a progress event as an acknowledgement.
         const denied = admissionDenial(result);
         if (denied) {
-          await update({childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null,...(admission.restoreBinding ?? {})});
+          await update({childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null,resultDelivery:{...pendingDelivery,status:'not_applicable'},...(admission.restoreBinding ?? {})});
+          pendingDelivery=undefined;
           return {...result,content:`task-dispatch: native ${denied} recorded. ${denialAdvice(denied)}`,metadata:{...(result?.metadata??{}),denial:{category:denied}}};
         }
         // A foreground return is the child's final report. Retain a bounded copy
@@ -854,7 +864,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         const identity={taskId:input.taskId,workKey:input.workKey,sessionID:observed,agent:input.agent,generation:admission.generation};
         const collect=collectArguments(identity);
         const foregroundResult=report&&observed?{generation:admission.generation,sessionID:observed,status,output:report.text,truncated:report.truncated,length:report.length,completedAt:now()}:undefined;
-        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null,foregroundResult},true);
+        await update({childID:observed,state:result?.metadata?.status ?? result?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null,foregroundResult,resultDelivery:{...pendingDelivery,mode:background?'background':'foreground',toolReturned:true,returnedAt:now()}},true);
         const body=background
           ? (nativeReport(result) || `The subagent is working in the background (sessionID: ${observed}).`)
           : `<subagent sessionID="${observed}" state="${status}" agent="${input.agent}" generation="${admission.generation}">\n${report.text}\n</subagent>`;
@@ -866,11 +876,17 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           metadata:jsonMetadata({...(result?.metadata ?? {}),...identity,status,mode:background?'background':'foreground',collect,routing:admission.routing,...(admission.contextAdvice?{contextAdvice:admission.contextAdvice}:{}),...(admission.convergence?{convergence:admission.convergence}:{})})};
       } catch(error) {
         const denied = admissionDenial(error);
-        await update(denied ? {childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null,...(admission.restoreBinding ?? {})} : {childID:observed,state:observed?'paused':'not_started',inFlight:null,...(admission.restoreBinding ?? {})});
+        // An aborted or interrupted wait still owes the parent the child's real outcome.
+        const delivery = pendingDelivery && (denied || !observed ? {...pendingDelivery,status:'not_applicable'} : {...pendingDelivery,toolReturned:false,returnedAt:now()});
+        if (delivery?.status==='not_applicable') pendingDelivery=undefined;
+        await update({...(denied ? {childID:observed,state:'denied',denial:receipt(denied,input),inFlight:null,...(admission.restoreBinding ?? {})} : {childID:observed,state:observed?'paused':'not_started',inFlight:null,...(admission.restoreBinding ?? {})}),...(delivery?{resultDelivery:delivery}:{})});
         try { await queueQuotaRecovery({error,parentID:context.sessionID,childID:observed,generation:admission.generation,requestKind:input.compact?'compaction':'dispatch',compactionID}); } catch { /* recovery reporting cannot replace the native admission failure */ }
         // Preserve original permission/guard error; never retry, change provider, or replace the child here.
         throw error;
-      } finally { visible.close(); }
+      } finally {
+        visible.close();
+        if (pendingDelivery) resultDelivery.track(admission.key,admission.generation);
+      }
     };
     if (typeof editor.update !== 'function') throw new Error('task-dispatch: native tool transformation unavailable');
     editor.update('subagent',tool=>{
@@ -955,7 +971,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         }
         if (delivered) await save();
       } catch { /* status remains read-safe; the durable receipt stays pending for a later explicit retry */ }
-      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),terminalBlocked=terminalSettlementEligibility(r,native,sessions,context.sessionID),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,...workerObservation(r,native,current,state.records,now()),key:undefined,foregroundResult:undefined,handoffTimings:undefined,timing:handoffTimingStatus(r),nextDispatch:{workReview:dispatchReviewRequirement(r,taskWorkStatus(state,rootID,r.taskId),now())},recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:r.completionBinding?.generation===r.admissionGeneration&&r.childID?{action:'task_dispatch_collect',mode:'foreground',eligibleForInspection:!r.inFlight&&native?.active!==true,resultRetained:r.foregroundResult?.generation===r.admissionGeneration,responsibleParentID:r.parentID,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,terminalReconciliation:r.completionBinding?.background?{action:'task_dispatch_reconcile_terminal',eligibleForInspection:!terminalBlocked,blockedReason:terminalBlocked,responsibleParentID:r.parentID,generation:r.admissionGeneration,...(r.terminalSettlement?.generation===r.admissionGeneration?{outcome:r.terminalSettlement.receipt.outcome,acceptedForCurrentIntent:false}: {})}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind,catalog:contextCatalog}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native,contextCatalog)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
+      const owners=state.records.filter(r=>r.rootID===rootID&&(!input.taskId||r.taskId===input.taskId)).map(r=>{const native=sessions.find(s=>s.id===r.childID),current=getIntent(state,rootID,r.taskId),rebind=rebindRecovery(r,current),terminalBlocked=terminalSettlementEligibility(r,native,sessions,context.sessionID),eligibility=collectionEligibility({record:r,child:native,sessions,rootID,current,callerID:context.sessionID}),awaiting=r.state==='running'&&native?.active===false,terminalEvidenceVerified=r.state==='completed'&&r.completionReceipt?.generation===r.admissionGeneration&&r.completionBinding?.background&&r.completionBinding.generation===r.admissionGeneration;return {...r,...workerObservation(r,native,current,state.records,now()),key:undefined,foregroundResult:undefined,handoffTimings:undefined,resultDelivery:r.resultDelivery?Object.fromEntries(['generation','status','mode','via','outcome','reason','deliveredAt'].filter(k=>r.resultDelivery[k]!==undefined).map(k=>[k,r.resultDelivery[k]])):undefined,timing:handoffTimingStatus(r),nextDispatch:{workReview:dispatchReviewRequirement(r,taskWorkStatus(state,rootID,r.taskId),now())},recordedState:r.state,effectiveState:awaiting?'awaiting_result_collection':r.state,collection:r.completionBinding?.background?{action:'task_dispatch_collect',eligibleForInspection:eligibility.eligible,blockedReason:eligibility.eligible?undefined:eligibility.blockedReason,responsibleParentID:r.parentID,terminalEvidenceVerified,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:r.completionBinding?.generation===r.admissionGeneration&&r.childID?{action:'task_dispatch_collect',mode:'foreground',eligibleForInspection:!r.inFlight&&native?.active!==true,resultRetained:r.foregroundResult?.generation===r.admissionGeneration,responsibleParentID:r.parentID,taskId:r.taskId,workKey:r.workKey,sessionID:r.childID,generation:r.admissionGeneration}:undefined,terminalReconciliation:r.completionBinding?.background?{action:'task_dispatch_reconcile_terminal',eligibleForInspection:!terminalBlocked,blockedReason:terminalBlocked,responsibleParentID:r.parentID,generation:r.admissionGeneration,...(r.terminalSettlement?.generation===r.admissionGeneration?{outcome:r.terminalSettlement.receipt.outcome,acceptedForCurrentIntent:false}: {})}:undefined,nativeExecution:{active:native?.active??null,lastIdleOutcome:native?.lastIdleOutcome},context:contextMaintenance(r,native,{callerID:context.sessionID,activeDescendants:sessions.filter(s=>s.active&&s.id!==r.childID&&descendant(sessions,s.id,r.childID)).map(s=>s.id),compactionAvailable:typeof ctx.session?.compact==='function',needsRebind:!!rebind,catalog:contextCatalog}),workCheckpoint:checkpointStatus(r,now(),{knownContext:observedContext(native,contextCatalog)}),verificationAttempt:r.attemptIntentRevision===current?.revision?attemptStatus(r,now()):undefined,convergence:convergenceAdvice(r),inFlight:!!r.inFlight,denial:r.denial?{category:r.denial.category,action:denialAdvice(r.denial.category)}:undefined,needsRebind:!!rebind,rebind,continuationOwner:['awaiting_continuation','awaiting_recovery'].includes(r.state)?{...(r.continuationOwner ?? {parentID:r.parentID,childID:r.childID}),action:r.state==='awaiting_recovery'?'recover_same_child':'resume_same_child'}:undefined,activeDescendants:sessions.filter(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID))).map(s=>s.id)};});
       const legacy=sessions.filter(s=>s.active&&lineage(sessions,s.id)===rootID&&!state.records.some(r=>r.childID===s.id)).map(({id,parentID,agent})=>({id,parentID,agent}));
       const workspaceBlockers=sessions.filter(s=>s.active&&s.directory===workspace&&s.id!==context.sessionID&&agentsForStatus(s));
       function agentsForStatus(s) { return canonicalHarnessRole(s.agent) !== 'router' && !descendant(sessions,context.sessionID,s.id); }
@@ -965,7 +981,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       return {content:JSON.stringify(input.summary===true?summarizeTaskDispatchStatus(status):status)};
     })});
   });
-  return { dispose: () => workerProgress.dispose(), outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
+  return { resultDelivery, dispose: () => { workerProgress.dispose(); resultDelivery.dispose(); }, outcome: async (args,call,run) => !ctx.location?.directory ? run(null) : registry(workspace,async(state,save)=>{
     const sessions=await loadSessions(),rootID=lineage(sessions,call.sessionID),current=getIntent(state,rootID,args.taskId);
     if (!current) return run(null);
     if (args.intentRevision!==current.revision) throw new Error('task-intent: outcome requires the current intentRevision; stale results cannot complete a corrected objective');
