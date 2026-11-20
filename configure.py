@@ -75,13 +75,19 @@ INTENT_FIRST_GUIDANCE = ("\nRecommended before the first task_dispatch/subagent 
     "Pass its current.revision as intentRevision and the chosen check ids as checkIds in that handoff. "
     "A handoff without them still runs: the harness infers an intent from the brief (or binds the current revision "
     "and checks) and returns a warning; correct it with task_intent set.")
+# Route trivial work to the FAST role; otherwise routers send it to builder.
+ROLE_CHOICE_GUIDANCE = ("\nPick the smallest capable role: harness-quick-builder for routine normal-risk mechanical edits "
+    "with a known change (renames, version bumps, config/doc/copy tweaks, small single-file fixes; "
+    "routing taskType 'mechanical', complexity 'routine'), harness-builder for standard implementation, "
+    "harness-deep-debugger/harness-verifier for complex debugging and verification.")
 # Delegating roles can stop only children they dispatched themselves.
 CANCEL_GUIDANCE = ("\nTo stop a child you dispatched (e.g. after a rule change), call task_dispatch_cancel "
     "{taskId, workKey, reason}; it interrupts it and releases its locks.")
 
 NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','deep-debugger','deep-debugger-high','architect','reviewer','verifier','maximum','maximum-max')
 ROLES = {
-    'router': ('STRONG', True, True),
+    # Dispatch/polling only: Sonnet-tier. Deep work stays on STRONG roles.
+    'router': ('BALANCED', True, True),
     'coordinator': ('BALANCED', True, True),
     'scout': ('FAST', False, True),
     'quick-builder': ('FAST', False, False),
@@ -328,7 +334,7 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
         identity_guidance = ('\nUse visible harness-* IDs for new handoffs. When continuing an existing worker, '
                              'pass its exact stored agent ID and sessionID; never rename or adopt it.')
         definition = {'description':f'harness {role.replace("-", " ")}', 'mode':'primary' if role == 'router' else 'all',
-            'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance+(INTENT_FIRST_GUIDANCE+CANCEL_GUIDANCE if delegate else ''), 'permissions':rules}
+            'model':models[tier], 'system':prompts['common']+'\n'+prompts['routing' if delegate else 'leaf']+identity_guidance+(INTENT_FIRST_GUIDANCE+CANCEL_GUIDANCE+ROLE_CHOICE_GUIDANCE if delegate else ''), 'permissions':rules}
         if 'builder' in role:
             definition['system'] += BUILDER_FILE_WRITE_GUIDANCE
         if readonly:

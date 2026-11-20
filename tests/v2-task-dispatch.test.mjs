@@ -560,7 +560,7 @@ test('context checkpoint is cooperative, durable and excludes unrelated or legac
  const context=()=>({sessionID:id,system:[],messages:[{role:'user',content:[{type:'text',text:'go'}]}]});
  for(let n=0;n<29;n++){const e=context();await h.hooks.get('context')(e);assert.equal(e.system.length,0);assert.equal(e.messages.length,1);}
  const e=context();await h.hooks.get('context')(e);assert.deepEqual(e.system,[]);
- assert.equal(e.messages.at(-1).role,'system');assert.match(e.messages.at(-1).content[0].text,/Progress checkpoint due/);
+ assert.equal(e.messages.at(-1).role,'user');assert.match(e.messages.at(-1).content[0].text,/Progress checkpoint due/);
  assert.equal(h.calls.length,1);assert.equal(h.sessions.find(s=>s.id===id).active,true);
  const unrelated={sessionID:'root',system:[],messages:[]};await h.hooks.get('context')(unrelated);assert.deepEqual([unrelated.system,unrelated.messages],[[],[]]);
  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
@@ -771,10 +771,12 @@ test('root progress advice uses native visible text and never changes execution 
  const at=2*ROOT_PROGRESS_MS;const h=await harness(t,undefined,undefined,{now:()=>at});
  Object.assign(h.sessions[0],{executionStartedAt:1,lastVisibleTextAt:1});
  let before;await h.registry('/project',async state=>{before=JSON.stringify(state);});
+ const persisted=[];h.ctx.session.synthetic=async input=>persisted.push(input);
  const event={sessionID:'root',agent:'router',system:[],messages:[],tools:{}};
  await h.hooks.get('context')(event);assert.deepEqual(event.system,[]);
- assert.deepEqual(event.messages,[{role:'system',content:[{type:'text',text:rootProgressReminder}]}]);
- await h.hooks.get('context')(event);assert.equal(event.messages.length,1);
+ assert.deepEqual(event.messages,[]); // persisted only: admitted at the next step boundary, no transient tail
+ assert.deepEqual(persisted.map(p=>[p.sessionID,p.text,p.resume]),[['root',rootProgressReminder,false]]);
+ await h.hooks.get('context')(event);assert.equal(event.messages.length,0);assert.equal(persisted.length,1);
  h.sessions[0].lastVisibleTextAt=at-100;
  const recent={sessionID:'root',agent:'router',system:[],messages:[],tools:{}};await h.hooks.get('context')(recent);assert.deepEqual([recent.system,recent.messages],[[],[]]);
  const native={sessionID:'root',agent:'build',system:[],messages:[],tools:{}};await h.hooks.get('context')(native);assert.deepEqual([native.system,native.messages],[[],[]]);
@@ -1242,3 +1244,33 @@ test('tool contracts state the intent-first requirement and generate the prompt 
  }
 });
 
+
+test('timed reminders are persisted once and never become a transient tail that steals the cache breakpoint',async()=>{
+ const {deliverTimedReminder,reminderRecentlyDelivered,REMINDER_WINDOW}=await import('../plugins/v2/task-dispatch.mjs');
+ const persisted=[];const ctx={session:{synthetic:async input=>{persisted.push(input);}}};
+ const history=[{role:'user',content:[{type:'text',text:'go'}]},{role:'assistant',content:[{type:'text',text:'ok'}]},{role:'tool',content:[{type:'tool-result',id:'1'}]}];
+ const step1={sessionID:'s1',messages:[...history]};
+ // Persist only: the current request is untouched (no transient tail to carry the breakpoint).
+ assert.equal(await deliverTimedReminder(ctx,step1,'REMIND',{now:1000}),true);
+ assert.deepEqual(step1.messages,history);
+ assert.equal(persisted.length,1);assert.equal(persisted[0].resume,false);assert.equal(persisted[0].sessionID,'s1');
+ // Before the runtime admits it (next step boundary), it is not persisted again.
+ const pending={sessionID:'s1',messages:[...history,{role:'assistant',content:[{type:'text',text:'a'}]}]};
+ assert.equal(await deliverTimedReminder(ctx,pending,'REMIND',{now:2000}),false);assert.equal(persisted.length,1);
+ // Admitted after this step's assistant/tool messages, with string content (runtime lowering): the previous
+ // request is a strict prefix of the next one and the reminder is not re-added.
+ const step2={sessionID:'s1',messages:[...pending.messages,{role:'user',content:'REMIND'},{role:'assistant',content:[{type:'text',text:'next'}]}]};
+ assert.equal(await deliverTimedReminder(ctx,step2,'REMIND',{now:3000}),false);
+ assert.deepEqual(step2.messages.slice(0,pending.messages.length),pending.messages);
+ assert.ok(step2.messages.every(m=>m.role!=='system'));assert.equal(persisted.length,1);
+ // Wrapped and string forms count; it is re-delivered only once it leaves the window and the memory expired.
+ assert.equal(reminderRecentlyDelivered([{role:'user',content:[{type:'text',text:'<system-reminder>REMIND</system-reminder>'}]}],'REMIND'),true);
+ assert.equal(reminderRecentlyDelivered([{role:'user',content:'<system-reminder>REMIND</system-reminder>'}],'REMIND'),true);
+ const old={sessionID:'s1',messages:[{role:'user',content:'REMIND'},...Array.from({length:REMINDER_WINDOW},()=>({role:'assistant',content:[{type:'text',text:'x'}]}))]};
+ assert.equal(await deliverTimedReminder(ctx,old,'REMIND',{now:5000}),false);
+ assert.equal(await deliverTimedReminder(ctx,old,'REMIND',{now:1000+16*60_000}),true);assert.equal(persisted.length,2);
+ // Persistence unavailable or failing never blocks the step; the reminder rides this request as a user message.
+ const failing={session:{synthetic:async()=>{throw new Error('down');}}};const e={sessionID:'s2',messages:[]};
+ assert.equal(await deliverTimedReminder(failing,e,'R2'),true);assert.deepEqual(e.messages,[{role:'user',content:[{type:'text',text:'R2'}]}]);
+ const none={sessionID:'s3',messages:[]};assert.equal(await deliverTimedReminder({},none,'R3'),true);assert.equal(none.messages.at(-1).role,'user');
+});

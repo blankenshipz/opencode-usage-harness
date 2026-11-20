@@ -217,12 +217,19 @@ export function selectDispatchModel({input,agent,agents,record,child,quota,hasAc
   const fitContext=!override && taskFitContext({input,policy:quota?.routingPolicy});
   if (fitContext?.strict && !fitContext.supportedPreferred.includes(configured)) throw taskFitError();
   const role=canonicalHarnessRole(input.agent);
-  if (!override && input.routing?.complexity==='routine' && input.routing?.risk==='normal' && pace==='ahead' && ['builder','deep-debugger'].includes(role)) {
+  const routineNormal=!override && input.routing?.complexity==='routine' && input.routing?.risk==='normal';
+  // Routine normal-risk mechanical builder work is quick-builder work whatever
+  // the pace: routers often hand it to harness-builder, leaving FAST idle.
+  const mechanical=routineNormal && role==='builder' && input.routing?.taskType==='mechanical';
+  if (routineNormal && (mechanical || (pace==='ahead' && ['builder','deep-debugger'].includes(role)))) {
     const fast=modelReference(agents.find(a=>harnessRoleIDs('quick-builder').includes(a.id??a.name))?.model);
     // Never cross providers as a pacing fallback. The worker retains its role,
     // permissions, ownership and required capabilities; only inference changes.
     if (fast && configured && fast.split('/')[0]===configured.split('/')[0]
-      && (!fitContext?.strict || fitContext.supportedPreferred.includes(fast))) {selected=fast;source='pace_routine';}
+      && (!fitContext?.strict || fitContext.supportedPreferred.includes(fast))
+      // The any-pace mechanical demotion must not turn an exhausted FAST scope into a dispatch error.
+      && !(mechanical && pace!=='ahead' && quota?.routingPolicy?.version===1 && quota.routingPolicy.enabled===true
+        && scopedQuotaUnavailable(fast,quota,Number.isFinite(quota.routingPolicy.reservePercent) ? quota.routingPolicy.reservePercent : 2))) {selected=fast;source=pace==='ahead'?'pace_routine':'routine_mechanical';}
   }
   if (!override && input.routing && quota?.routingPolicy?.version===1 && quota.routingPolicy.enabled===true
     && scopedQuotaUnavailable(selected,quota,Number.isFinite(quota.routingPolicy.reservePercent) ? quota.routingPolicy.reservePercent : 2)) throw scopeQuotaError();

@@ -43,6 +43,18 @@ class ConfigureTests(unittest.TestCase):
         self.assertIn(('subagent', 'builder'), router_children)
         self.assertIn(('subagent', 'harness-builder'), router_children)
 
+    def test_router_dispatches_on_balanced_and_deep_roles_stay_strong(self):
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        p=profile({k:f'anthropic/{k.lower()}#medium' for k in tiers})
+        a=p['agents']
+        for role in ('router','harness-router','coordinator','builder'):
+            self.assertEqual(a[role]['model'], 'anthropic/balanced#medium', role)
+        for role in ('deep-debugger','verifier','reviewer','architect'):
+            self.assertEqual(a[f'harness-{role}']['model'], 'anthropic/strong#medium', role)
+        self.assertEqual(a['harness-quick-builder']['model'], 'anthropic/fast#medium')
+        self.assertIn('harness-quick-builder for routine normal-risk mechanical', a['harness-router']['system'])
+        self.assertNotIn('harness-quick-builder for routine', a['harness-builder']['system'])
+
     def test_delegating_roles_are_advised_to_register_intent_before_first_handoff(self):
         p=profile({k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
         for role in ('harness-router','router','harness-coordinator','coordinator'):

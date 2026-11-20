@@ -36,3 +36,13 @@ location or the user's normal `.config/gh`. It never reads or copies credential
 files and never forwards `GH_TOKEN`, `GITHUB_TOKEN` or inference API keys.
 Check `gh auth status` in the resulting runtime environment. This is authentication
 visibility, not authorization to create repositories, commit, push or publish.
+
+### Commit identity for harness agents
+
+Agents run with no global git identity in the isolated environment, so they may
+invent one (commits authored "Claude Code"). Set the operator's identity for
+agent commits in the launcher environment (`GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/
+`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`; these override `git -c user.*`) and,
+so it takes effect without a service restart, in each project's `.git/config`
+(`git config user.name ...; git config user.email ...`). An explicit
+`git commit --author` still wins. Existing history is not rewritten.

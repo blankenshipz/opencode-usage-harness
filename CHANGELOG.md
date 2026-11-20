@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — router on Sonnet, Haiku quick-builder for mechanical work, agent commit identity
+
+- `harness-router` uses the balanced tier (Sonnet) instead of strong (Opus); deep-debugger, verifier, reviewer and architect stay strong. Router/coordinator prompts name `harness-quick-builder` for routine, normal-risk mechanical edits.
+- `dispatch-routing.mjs`: a builder dispatch with taskType `mechanical`, complexity `routine`, risk `normal` goes to the quick-builder model at any quota pace (source `routine_mechanical`), unless a model is explicit/remembered, quick-builder is on another provider, or strict task-fit excludes it. Pace demotion, routing-policy candidates, scoped-quota checks and continuation affinity are unchanged.
+- Takes effect after `configure.py --replace` regenerates the profile (router model and prompt guidance); the mechanical demotion is skipped when routing policy v1 is enabled and the FAST scope is exhausted, so the configured builder model is used instead of a scope error.
+- docs/SETUP.md: set the operator's git identity for agent commits (GIT_AUTHOR_*/GIT_COMMITTER_* in the launcher env plus per-project `.git/config`).
+
+## Unreleased — timed reminders persisted, not a transient cache-breaking tail
+
+- Root-progress and work-checkpoint reminders are now persisted once as a synthetic user message (persist only; it is admitted at the next step boundary, so no transient tail; a not-yet-admitted copy is not re-persisted for 15 min; dedupe matches string or part content; transient user-message fallback only when persistence is unavailable/fails) (`deliverTimedReminder`, like native Plan-mode reminders) and appended to the current request at the same position. They were a transient tail `role:'system'` message (r6, 34a572c); the runtime's auto cache policy puts its only message breakpoint on the last message, so the reminder carried it, the next step's prefix diverged there, and every step while a reminder was due rewrote the whole history and read only the tools+system prefix (r12: builder q0hYa8 22:47:29-22:48:55, read 10,836 / write 30-38k per step, back to read 49k once the reminder cleared). A reminder already in the last 30 messages is not repeated. Persistence failures never block the step.
+- 1h cache TTL not enabled: the OpenCode 2.0.30 context hook cannot set the request cache policy or TTL (requests use the 5-minute auto policy), per-part hints need the runtime's CacheHint class, and the top-level `cache_control` passthrough would add a fifth breakpoint. 1h writes also cost 2x base input vs 1.25x for 5m.
+
 ## Unreleased — per-project full-auto permission profile
 
 - Approved 2026-11-19 for wncscanner ("basically full auto approve on most actions"). `configure.py --full-auto-project DIR` (repeatable; `--no-full-auto-project DIR` removes) persists `full_auto_projects` (`[{directory, data_dirs}]`) in `configure-choices.json`. The generated profile does not change; `plugins/v2/full-auto.mjs` reads the list at runtime (mtime-cached, so edits hot-reload). Other projects keep the normal policy.

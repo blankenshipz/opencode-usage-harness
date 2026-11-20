@@ -29,14 +29,46 @@ import { createResultDelivery } from './result-delivery.mjs';
 import { createStaleReconciler } from './dispatch-reconcile.mjs';
 import { midRunCompactionEnabled, midRunCompactionDecision, settleMidRunCompaction, admitMidRunCompaction, recordAdmitted, recordAdmissionFailure, recordBaseline, buildContinuation, activeContinuation, midRunCompactionStatus, pendingCompactionPreservation, BRIEF_LIMIT } from './mid-run-compaction.mjs';
 
-// Append volatile per-request text after the last message so the system block
-// and earlier history stay byte-stable. Reuses the runtime's message class when
-// one is present (plain objects are accepted by the request lowering too).
-export function appendTailUpdate(event, text) {
-  if (!Array.isArray(event?.messages)) return false;
+// Timed reminders (root progress, work checkpoint) are persisted once into the
+// session history as a synthetic user message, the way native Plan-mode
+// reminders are, and appended to the current request at the same position.
+// They must not ride as a transient tail message: the runtime's auto cache
+// policy puts its only message breakpoint on the LAST message, so a transient
+// tail reminder carried that breakpoint, the next step's prefix no longer
+// matched it, and every step re-wrote the whole history while reading only the
+// tools+system prefix (r12: builder q0hYa8 22:47-22:48, read 10,836 / write
+// 30-38k per step). A persisted reminder is part of the stable prefix.
+export const REMINDER_WINDOW = 30;
+const PERSIST_MEMORY_MS = 15 * 60_000;
+const persistedAt = new Map();
+const partText = part => typeof part === 'string' ? part : (part?.type === 'text' && typeof part.text === 'string' ? part.text : '');
+// The runtime may lower a persisted synthetic with string content or text parts.
+const mentions = (message, text) => message?.role === 'user' && (typeof message.content === 'string'
+  ? message.content.includes(text)
+  : Array.isArray(message.content) && message.content.some(part => partText(part).includes(text)));
+export function reminderRecentlyDelivered(messages, text, window = REMINDER_WINDOW) {
+  return Array.isArray(messages) && messages.slice(-window).some(message => mentions(message, text));
+}
+// Persist only: the synthetic is admitted at the next step boundary, so the
+// reminder arrives one step later at a stable position. No transient copy is
+// pushed then (it would carry the tail breakpoint and miss once more). A copy
+// persisted but not yet visible in history is not persisted again for 15 min.
+// Only when persistence is unavailable or fails does the reminder ride as a
+// transient user message, so it is never lost.
+export async function deliverTimedReminder(ctx, event, text, { now = Date.now() } = {}) {
+  if (!Array.isArray(event?.messages) || reminderRecentlyDelivered(event.messages, text)) return false;
+  const key = `${event.sessionID}\u0000${text}`;
+  for (const [k, at] of persistedAt) if (now - at > PERSIST_MEMORY_MS) persistedAt.delete(k);
+  if (persistedAt.has(key)) return false;
+  if (typeof ctx?.session?.synthetic === 'function') {
+    try {
+      await ctx.session.synthetic({ sessionID: event.sessionID, text, resume: false, metadata: { type: 'harness_timed_reminder' } });
+      persistedAt.set(key, now);
+      return true;
+    } catch { /* fall through: deliver transiently, never block a model step */ }
+  }
+  const input = { role: 'user', content: [{ type: 'text', text }] };
   const last = event.messages.at(-1);
-  if (last?.role === 'system' && Array.isArray(last.content) && last.content.some(p => p?.text === text)) return false;
-  const input = { role: 'system', content: [{ type: 'text', text }] };
   const Message = last && last.constructor !== Object ? last.constructor : undefined;
   let message = input;
   if (Message) try { message = new Message(input); } catch { message = input; }
@@ -465,9 +497,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
   // manufacture a request just to observe elapsed time.
   // Timed reminders come and go, so they never enter event.system: the system
   // block precedes every message and changing it rewrites the whole cached
-  // history. They ride as a system-role update after the last message instead
-  // (the Anthropic adapter folds it into the current user turn), like native
-  // Plan-mode reminders. The mid-run continuation stays in system: it changes
+  // history. They are persisted once as a synthetic user message (see
+  // deliverTimedReminder) so they join the stable cached prefix. The mid-run continuation stays in system: it changes
   // only at a completed compaction, where history is rewritten anyway.
   if (ctx.session?.hook) await ctx.session.hook('context', async event => {
     const tail = [];
@@ -486,7 +517,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       return { status, key: owner.key };
     });
     if (checkpoint?.status?.due) tail.push(checkpointReminder);
-    for (const text of tail) appendTailUpdate(event, text);
+    for (const text of tail) await deliverTimedReminder(ctx, event, text);
     // Mid-run compaction is optional maintenance: any failure leaves the step untouched.
     let continuation;
     if (checkpoint?.key) try { continuation = await midRunCompaction(event.sessionID, checkpoint.key); } catch { /* never block a model step */ }
