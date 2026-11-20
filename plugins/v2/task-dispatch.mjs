@@ -154,7 +154,7 @@ export async function resolvePublicationScope({ workspace, checkout }) {
   } catch { throw new Error('task-dispatch: publish Git scope is unavailable or outside the workspace'); }
 }
 const operations = ['inspect', 'verify', 'implement', 'deploy', 'publish', 'coordinate'];
-const routingKeys = new Set(['complexity','risk','taskType','reviewOf','reviewOfChildID','reviewIndependence']);
+const routingKeys = new Set(['complexity','risk','taskType','reviewOf','reviewOfChildID','reviewIndependence','priority']);
 const capabilityMismatch = (agent, missing) => Object.assign(
   new Error(`task-dispatch: TASK_DISPATCH_CAPABILITY_MISMATCH: ${agent} cannot perform ${missing.join(', ')}; assignment validation failure; not native permission denial. No child was launched and no native execution, permission, or provider admission was attempted for this dispatch. Correct a new, unadmitted assignment by selecting an eligible role within the authorized scope; preserve any explicitly requested model. This does not clear previous denials; do not drop required capabilities, loosen permissions, or replace/resume an existing child under another role.`),
   { code: 'TASK_DISPATCH_CAPABILITY_MISMATCH', category: 'assignment_validation' },
@@ -191,7 +191,7 @@ const schema = { type: 'object', additionalProperties: false, properties: {
   checkpoint: checkpointSchema,
   compact: {type:'boolean'}, resetModel: {type:'boolean'}, continuationEffort:{type:'string',enum:['reassess']},
   workReview: {type:'object',additionalProperties:false,properties:{hypothesis:{type:'string',minLength:1,maxLength:500},evidenceReference:{type:'string',minLength:1,maxLength:500}},required:['hypothesis','evidenceReference']},
-  routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']},taskType:{type:'string',enum:TASK_TYPES},reviewOf:{type:'string',minLength:3,maxLength:240},reviewOfChildID:{type:'string',minLength:1,maxLength:240},reviewIndependence:{type:'string',enum:['preferred','required']}},required:['complexity','risk']},
+  routing: {type:'object',additionalProperties:false,properties:{complexity:{type:'string',enum:['routine','standard','complex']},risk:{type:'string',enum:['normal','high']},taskType:{type:'string',enum:TASK_TYPES},reviewOf:{type:'string',minLength:3,maxLength:240},reviewOfChildID:{type:'string',minLength:1,maxLength:240},reviewIndependence:{type:'string',enum:['preferred','required']},priority:{type:'string',enum:['user','background'],description:'user: directly requested by the user (exempt from the weekly budget brake)'}},required:['complexity','risk']},
   recovery: { type: 'object', additionalProperties: false, properties: {
     kind: { type: 'string', enum: ['scope_changed','inputs_changed','authorization_changed'] }, scope: { type: 'string', minLength: 1, maxLength: 160 },
     inputs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 160 } },
@@ -520,6 +520,20 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
   // only at a completed compaction, where history is rewritten anyway.
   const routerCompactor = createRouterCompactor({ compact: typeof ctx.session?.compact === 'function' ? input => ctx.session.compact(input) : undefined,
     loadSessions, newID: () => 'msg_' + crypto.randomUUID().replaceAll('-', '') });
+  // r26 item 5: also compact a due root router right when it goes idle, while its prompt cache
+  // is still warm, so the next wake (often >5 min later) does not rewrite a 100-200k context.
+  if (typeof ctx.event?.subscribe === 'function' && typeof ctx.session?.compact === 'function') {
+    const idleController = new AbortController();
+    void (async () => { try { for await (const event of ctx.event.subscribe({ signal: idleController.signal })) {
+      if (!['session.idle', 'session.execution.succeeded'].includes(event?.type)) continue;
+      const sessionID = event.data?.sessionID ?? event.data?.id;
+      if (typeof sessionID !== 'string') continue;
+      try {
+        const self = (await loadSessions()).find(s => s.id === sessionID);
+        if (self && !self.parentID && ['router','coordinator'].includes(canonicalHarnessRole(self.agent))) await routerCompactor(sessionID);
+      } catch { /* best effort */ }
+    } } catch { /* subscription closed */ } })();
+  }
   if (ctx.session?.hook) await ctx.session.hook('context', async event => {
     const tail = [];
     const checkpoint = await registry(workspace, async (state, save) => {
@@ -616,7 +630,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       const checkpoint = normalizeCheckpoint(input.checkpoint);
       const review = input.workReview === undefined ? undefined : normalizeReviewAcknowledgement(input.workReview);
       if (input.compact !== undefined && typeof input.compact !== 'boolean') throw new Error('task-dispatch: invalid compact');
-      if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk) || Object.keys(input.routing).some(key=>!routingKeys.has(key)) || (input.routing.taskType !== undefined && !TASK_TYPES.includes(input.routing.taskType)) || (input.routing.reviewOf !== undefined && !modelReference(input.routing.reviewOf)) || (input.routing.reviewOfChildID !== undefined && (typeof input.routing.reviewOfChildID!=='string' || !input.routing.reviewOfChildID.trim() || input.routing.reviewOfChildID.length>240 || /[\r\n\0]/.test(input.routing.reviewOfChildID))) || (input.routing.reviewIndependence !== undefined && !['preferred','required'].includes(input.routing.reviewIndependence)))) throw new Error('task-dispatch: invalid routing assessment');
+      if (input.routing && (!['routine','standard','complex'].includes(input.routing.complexity) || !['normal','high'].includes(input.routing.risk) || Object.keys(input.routing).some(key=>!routingKeys.has(key)) || (input.routing.taskType !== undefined && !TASK_TYPES.includes(input.routing.taskType)) || (input.routing.reviewOf !== undefined && !modelReference(input.routing.reviewOf)) || (input.routing.reviewOfChildID !== undefined && (typeof input.routing.reviewOfChildID!=='string' || !input.routing.reviewOfChildID.trim() || input.routing.reviewOfChildID.length>240 || /[\r\n\0]/.test(input.routing.reviewOfChildID))) || (input.routing.reviewIndependence !== undefined && !['preferred','required'].includes(input.routing.reviewIndependence)) || (input.routing.priority !== undefined && !['user','background'].includes(input.routing.priority)))) throw new Error('task-dispatch: invalid routing assessment');
       if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('task-dispatch: invalid background');
       string(input.taskId,'taskId'); string(input.workKey,'workKey');
       if (!operations.includes(input.operation) || !Array.isArray(input.requiredCapabilities) || input.requiredCapabilities.some(c => !['shell','edit','delegate'].includes(c))) throw new Error('task-dispatch: operation and requiredCapabilities are required');
@@ -872,7 +886,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         if (routedInput.routing?.reviewProvenance) routing.reviewProvenance=routedInput.routing.reviewProvenance;
         if (routedInput.routing?.reviewIndependence) routing.reviewIndependence=routedInput.routing.reviewIndependence;
         // r20 item 4: while quota pace is ahead, cap concurrently active new children per root.
-        const throttled=dispatchThrottle({pace:routing.pace,newChild:!requested,compact:!!input.compact,review:routedInput.routing?.reviewIndependence==='required',rootID,records:state.records.filter(r=>r.key!==key),sessions,callerID:context.sessionID});
+        const throttled=dispatchThrottle({pace:routing.pace,newChild:!requested,compact:!!input.compact,review:routedInput.routing?.reviewIndependence==='required',rootID,records:state.records.filter(r=>r.key!==key),sessions,callerID:context.sessionID,quota,provider:String(routing.selected??'').split('/')[0]||undefined,agent:input.agent??input.subagent_type,priority:input.routing?.priority});
         if (throttled) throw Object.assign(new Error(throttled.message),{code:'QUOTA_PACE_THROTTLED'});
         let retainedCompactionEvidence;
         if (input.compact) {

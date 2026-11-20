@@ -48,3 +48,19 @@ test('an ask answered while match() awaits never releases; session end forgets a
   let done = false; w.promise.then(() => { done = true; }); await new Promise(r => setImmediate(r)); assert.equal(done, false); w.cancel();
   m.asked({ id: 'per_b', sessionID: 'gone', since: 0 }); m.forgetSession('gone'); assert.equal(m.pending().length, 0);
 });
+
+test('r26: ask summary is redacted and pending asks are published', async () => {
+  const { askSummary, createParkMonitor: make, PARK_AFTER_MS: P } = await import('../plugins/v2/park-yield.mjs');
+  const s = askSummary({ permission: 'bash', patterns: ['curl -H authorization: abcdef https://x', 'token=supersecret'] });
+  assert.ok(!s.includes('abcdef') && !s.includes('supersecret'), s);
+  assert.match(s, /^bash: curl/);
+  assert.ok(askSummary({ permission: 'read', patterns: ['x'.repeat(400)] }).length <= 160);
+  let at = 0; const published = [];
+  const m = make({ now: () => at, publish: a => published.push(a) });
+  m.asked({ id: 'per_1', sessionID: 'c', action: 'bash', summary: 'bash: ls /opt' });
+  assert.equal(published.at(-1)[0].summary, 'bash: ls /opt');
+  at = P; const ev = await m.tick();
+  assert.equal(ev.find(e => e.outcome === 'parked').summary, 'bash: ls /opt');
+  assert.equal(published.at(-1)[0].parked, true);
+  m.replied('per_1'); assert.deepEqual(published.at(-1), []);
+});

@@ -18,7 +18,8 @@
 import crypto from 'node:crypto';
 
 import { holdWake, ROUTER_WAKE_HOLD_MS } from './router-maintenance.mjs';
-import { harnessTerminalReceipt, sessionEndOutcome, appendOutcome as defaultAppendOutcome } from './session-end-receipts.mjs';
+import { getIntent } from './task-intent.mjs';
+import { harnessTerminalReceipt, sessionEndOutcome, verifySessionEnd, appendOutcome as defaultAppendOutcome } from './session-end-receipts.mjs';
 export const RESULT_DELIVERY_GRACE_MS = 15000;
 export const RESULT_DELIVERY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const RESULT_DELIVERY_REPORT_LIMIT = 16000;
@@ -81,7 +82,7 @@ export function createResultDelivery({ registry, workspace, ctx, loadEvidence, l
   const timers = new Map(), running = new Map();
   let disposed = false;
   const finish = async (key, generation, patch, extra, terminal) => {
-    let ended;
+    let ended, verify;
     const status = await registry(workspace, async (state, save) => {
       const record = state.records.find(r => r.key === key);
       const delivery = record?.resultDelivery;
@@ -90,10 +91,20 @@ export function createResultDelivery({ registry, workspace, ctx, loadEvidence, l
       extra?.(record);
       // r20 item 7: the harness itself writes the terminal receipt and a session-end outcome.
       const receipt = harnessTerminalReceipt({ record, terminal, now:now() });
-      if (receipt && record.harnessTerminalReceipt?.generation !== generation) { record.harnessTerminalReceipt = receipt; ended = sessionEndOutcome({ record, receipt }); }
+      if (receipt && record.harnessTerminalReceipt?.generation !== generation) {
+        record.harnessTerminalReceipt = receipt; ended = sessionEndOutcome({ record, receipt });
+        // r26 item 3: rerun declared check argv outside the lock (below).
+        let intent; try { intent = getIntent(state, record.rootID, record.taskId)?.intent; } catch { intent = undefined; }
+        const selected = new Set(record.checkIds ?? []);
+        if (receipt.outcome === 'succeeded' && intent) verify = { record:structuredClone(record), receipt, intent:{ ...intent, checks:(intent.checks ?? []).filter(c => !selected.size || selected.has(c.id)) } };
+      }
       record.updatedAt = Date.now(); await save();
       return patch.status;
     });
+    if (ended && verify) {
+      const verification = await verifySessionEnd({ record:verify.record, intent:verify.intent, directory:workspace }).catch(() => undefined);
+      if (verification) ended = sessionEndOutcome({ record:verify.record, receipt:verify.receipt, verification });
+    }
     if (ended) await Promise.resolve().then(() => appendOutcome(ended)).catch(() => {});
     return status;
   };
