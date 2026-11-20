@@ -80,6 +80,12 @@ ROLE_CHOICE_GUIDANCE = ("\nPick the smallest capable role: harness-quick-builder
     "with a known change (renames, version bumps, config/doc/copy tweaks, small single-file fixes; "
     "routing taskType 'mechanical', complexity 'routine'), harness-builder for standard implementation, "
     "harness-deep-debugger/harness-verifier for complex debugging and verification.")
+REVIEW_VERDICT_GUIDANCE = ('\nEvery independent review ends with the review_verdict tool: after your final assessment call it once with '
+    'verdict (pass | needs_fixes | fail) and reviewedHead (the current HEAD sha you reviewed; the tool rejects a stale one). '
+    'It records the exact working tree you reviewed; pushes to main require a pass for that tree. Re-review and call again after any change. '
+    'Use pass only if no blocking findings remain; a prose verdict alone is not recorded.')
+ROUTER_REVIEW_GUIDANCE = ('\nWhen dispatching a review or verification, tell the reviewer/verifier to finish by calling review_verdict for the tree under review. '
+    'Before pushing to main, confirm a pass was recorded for the final tree; after further edits dispatch a re-review. Do not add an Unreviewed: trailer to skip a review that is feasible.')
 # Delegating roles can stop only children they dispatched themselves.
 CANCEL_GUIDANCE = ("\nTo stop a child you dispatched (e.g. after a rule change), call task_dispatch_cancel "
     "{taskId, workKey, reason}; it interrupts it and releases its locks.")
@@ -338,6 +344,10 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
             definition['system'] += BUILDER_FILE_WRITE_GUIDANCE
         if readonly:
             definition['system'] += READONLY_IDENTITY_GUIDANCE
+        if role in ('reviewer', 'verifier'):
+            definition['system'] += REVIEW_VERDICT_GUIDANCE
+        if delegate:
+            definition['system'] += ROUTER_REVIEW_GUIDANCE
         if role == 'verifier':
             definition['system'] += '\nExecute the assigned checks and report commands, exit codes and findings. Do not implement production repairs. Create verification scripts and fixtures only in the explicitly assigned .artifacts directory; reserve that directory in writePaths before writing. Never use artifact paths or symlinks to evade a production edit denial. Shell execution can write artifacts; retain declared workspace ownership and all native approvals. This role is not a read-only sandbox.'
         agents[visible_role(role)] = definition
@@ -354,7 +364,7 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
         if builtin == 'explore':
             agents[builtin]['permissions'].append({'action':'edit','resource':'*','effect':'deny'})
     permissions = [{'action':'*','resource':'*','effect':'ask'}]
-    permissions += [{'action':a,'resource':'*','effect':'allow'} for a in ('read','glob','grep','edit','webfetch','codex_quota','model_status','task_contract','task_intent','task_artifact','task_dispatch_status','task_outcome','large_file_check','large_file_summary','subscription_quota','repo_identity')]
+    permissions += [{'action':a,'resource':'*','effect':'allow'} for a in ('read','glob','grep','edit','webfetch','codex_quota','model_status','task_contract','task_intent','task_artifact','task_dispatch_status','task_outcome','large_file_check','large_file_summary','subscription_quota','repo_identity','review_verdict')]
     for action in ('read','edit'):
         permissions += [{'action':action,'resource':p,'effect':'deny'} for p in SECRET_FILE_DENY]
         permissions += [{'action':action,'resource':p,'effect':'allow'} for p in ENV_TEMPLATE_FILE_ALLOW]

@@ -57,6 +57,16 @@ class ConfigureTests(unittest.TestCase):
         self.assertIn('harness-quick-builder for routine normal-risk mechanical', a['harness-router']['system'])
         self.assertNotIn('harness-quick-builder for routine', a['harness-builder']['system'])
 
+    def test_reviewers_are_told_to_call_review_verdict(self):
+        c = profile({k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
+        a = c['agents']
+        for role in ('harness-reviewer','harness-verifier','reviewer','verifier'):
+            self.assertIn('review_verdict', a[role]['system'], role)
+        for role in ('harness-router','router','harness-coordinator'):
+            self.assertIn('review_verdict', a[role]['system'], role)
+        self.assertNotIn('review_verdict', a['harness-builder']['system'])
+        self.assertIn('review_verdict', json.dumps(c['permissions']))
+
     def test_delegating_roles_are_advised_to_register_intent_before_first_handoff(self):
         p=profile({k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
         for role in ('harness-router','router','harness-coordinator','coordinator'):
