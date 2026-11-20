@@ -12,8 +12,8 @@
 // reflog expire/delete, gc --prune, git prune, update-ref -d), deletes (rm/rmdir/unlink, find
 // -delete/-exec rm, rsync --delete/--remove-source-files) whose targets are not strictly inside the
 // project or a data dir (or are the project root or .git), disk writes (dd, mkfs*, shred, wipefs,
-// partitioners, /dev block devices), secret-looking paths, truncating redirects outside the
-// project, and the same inside sh/bash -c, eval, heredocs fed to a shell, and ssh remote commands
+// partitioners, /dev block devices), secret-looking paths (except the value of docker's
+// --env-file), truncating redirects outside the project, and the same inside sh/bash -c, eval, heredocs fed to a shell, and ssh remote commands
 // (remote deletes of /, top-level dirs or the remote home). Deny rules are never touched.
 
 import fs from 'node:fs';
@@ -90,10 +90,57 @@ export function pathResourcesInside(resources, project, locationDirectory) {
   });
 }
 
-// True when a native shell resource still names a secret-looking path once env templates are removed.
+// Indexes of the words that are the value of docker's env-file option (`--env-file x` or
+// `--env-file=x`) of a docker / docker-compose command. Docker loads that file into the
+// containers' environment; deploys pass `.env` that way, so it is not a secret read.
+// The docker word must be in command position: first word of the line or after a shell
+// separator (`&&`, `||`, `|`, `;`, `&`, or a word ending in one), after leading VAR=value
+// assignments and simple wrappers (sudo/env/timeout/nice/nohup/command/exec/time with their
+// dash options and numeric arguments), the remote command of `ssh [opts] host`, or a
+// `sh|bash -c` body. `cat docker
+// --env-file .env`, `cp -- docker --env-file x.key …` and `sudo -u u docker …` do not qualify.
+// A separator or `--` ends the exemption. Native resources are split on whitespace only.
+const DOCKER_COMMAND = /^(?:.*\/)?(docker|docker-compose)$/;
+const WRAPPER_COMMAND = /^(?:.*\/)?(sudo|env|timeout|nice|nohup|command|exec|time)$/;
+const SSH_ARG_FLAGS = new Set(['-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-Q', '-R', '-S', '-W', '-w', '-B']);
+export function dockerEnvFileValues(words) {
+  const values = new Set();
+  let state = 'command', docker = false;
+  for (let k = 0; k < words.length; k++) {
+    const raw = words[k];
+    if (/^(&&|\|\|?|;|&)$/.test(raw)) { state = 'command'; docker = false; continue; }
+    const word = raw.replace(/^["'(]+/, '');
+    const ends = /[;&|]$/.test(raw);
+    if (state === 'shell') {
+      if (word === '-c') state = 'command'; // the -c body starts a command
+      else if (!word.startsWith('-')) { state = 'args'; docker = false; } // a script file
+    } else if (state === 'ssh') {
+      if (SSH_ARG_FLAGS.has(word)) k++;
+      else if (!word.startsWith('-')) state = 'command'; // the host; its remote command follows
+    } else if (state === 'command' || state === 'wrapper') {
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) && state === 'command') { /* assignment */ }
+      else if (state === 'wrapper' && (word.startsWith('-') || /^\d+(\.\d+)?[smhd]?$/.test(word))) { /* wrapper option */ }
+      else if (WRAPPER_COMMAND.test(word)) state = 'wrapper';
+      else if (/^(?:.*\/)?ssh$/.test(word)) state = 'ssh';
+      else if (SHELL_WORD.test(word)) state = 'shell';
+      else { docker = DOCKER_COMMAND.test(word); state = 'args'; }
+    } else if (docker) {
+      if (word === '--') docker = false;
+      else if (word === '--env-file' && k + 1 < words.length) { values.add(++k); if (/[;&|]$/.test(words[k])) { state = 'command'; docker = false; } continue; }
+      else if (word.startsWith('--env-file=')) values.add(k);
+    }
+    if (ends) { state = 'command'; docker = false; }
+  }
+  return values;
+}
+
+// True when a native shell resource still names a secret-looking path once env templates and
+// docker env-file values are removed.
 export function secretShellResource(resource) {
   if (!SECRET_SHELL_PATTERNS.some(pattern => wildcardMatch(resource, pattern))) return false;
-  const rest = String(resource).split(/\s+/).filter(word => !isEnvTemplatePath(word)).join(' ');
+  const words = String(resource).split(/\s+/);
+  const envFiles = dockerEnvFileValues(words);
+  const rest = words.filter((word, k) => !isEnvTemplatePath(word) && !envFiles.has(k)).join(' ');
   return SECRET_SHELL_PATTERNS.some(pattern => wildcardMatch(rest, pattern));
 }
 
@@ -299,7 +346,8 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     if (history) reasons.push(`${text}: ${history}`);
     const disk = words.find(word => DISK_COMMANDS.test(word) || BLOCK_DEVICE.test(word) || /^of=\/dev\//.test(word));
     if (disk) reasons.push(`${text}: ${disk} writes disks or devices`);
-    const secret = words.find(word => isSecretPath(word) && !isEnvTemplatePath(word));
+    const envFiles = dockerEnvFileValues(words);
+    const secret = words.find((word, k) => isSecretPath(word) && !isEnvTemplatePath(word) && !envFiles.has(k));
     if (secret !== undefined) reasons.push(`${text}: names secret-looking path ${JSON.stringify(secret)}`);
     for (const redirect of redirects) {
       if (!redirect.file) continue;

@@ -133,7 +133,18 @@ and `ssh` remote command):
   for `/`, a top-level directory or the remote home (and globs over them). `docker rm`,
   `compose rm`, `git rm` and similar are not file deletes;
 - `dd`, `mkfs*`, `mkswap`, `shred`, `wipefs`, partitioners, `/dev` block devices;
-- secret-looking paths (words, redirects, and the native `SECRET_SHELL_ASK` patterns);
+- secret-looking paths (words, redirects, and the native `SECRET_SHELL_ASK` patterns). One
+  exception: the value of docker's env-file option (`--env-file FILE` or `--env-file=FILE` after
+  a `docker`/`docker-compose` word, e.g. `docker compose --env-file ../.env up -d`, also behind
+  `sudo`, in `sh -c` bodies and `ssh` remote commands) is not checked, because docker loads it
+  into the containers' environment. Every other word still is: `docker compose --env-file .env up
+  && cat .env`, `docker cp secrets.pem c:/x` and `cat .env` still ask, and `--env-file` on other
+  commands is checked as before. `docker` must be the command word (first word, after a
+  separator, `VAR=x` assignments, simple wrappers such as `sudo -E`/`timeout 600`, `ssh [opts]
+  host` or `sh -c`), so `cat -- docker --env-file .env` still asks; `--` ends the exemption.
+  Accepted residual risk (approved: passing an env file to docker is fine): docker itself can
+  print the file's values, e.g. `docker compose --env-file .env config` or
+  `docker run --env-file .env alpine env`;
 - `curl … | bash` (a shell reading piped input), `ssh -o ProxyCommand|LocalCommand`.
 
 Known gaps: script files (`bash deploy.sh`, `python x.py`, `make`) and interpreters (`python -c`,

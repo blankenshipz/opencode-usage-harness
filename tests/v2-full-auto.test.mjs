@@ -116,8 +116,37 @@ test('full-auto still asks for force pushes, history rewrites, outside deletes, 
   for (const command of ASKED) assert.notEqual(await decide(command), 'allow', command);
 });
 
+test('full-auto exempts only the value of docker --env-file from the secret-path ask', async () => {
+  const allowed = [
+    'docker compose --env-file ../.env up -d', 'docker compose -f x.yml --env-file .env.prod up', 'docker --env-file .env run --rm img',
+    'docker run --env-file=.env img', 'docker compose --env-file=/abs/path/.env pull', 'docker-compose --env-file .env up -d',
+    'sudo docker compose --env-file ../.env up -d', 'bash -c "docker compose --env-file .env up -d"', "sh -c 'cd app && docker run --env-file=.env img'",
+    'ssh garage-server "cd app && docker compose --env-file .env up -d"', 'ssh garage-server docker compose --env-file .env pull',
+    'git pull && docker compose --env-file ../.env up -d --build',
+    'FOO=1 docker compose --env-file .env up -d', 'timeout 600 docker compose --env-file .env pull', 'sudo -E docker compose --env-file .env up -d',
+    'ssh -p 2222 garage-server docker compose --env-file .env pull', '/usr/bin/docker compose --env-file=.env up',
+  ];
+  const asked = [
+    'docker compose --env-file .env up && cat .env', 'docker compose --env-file .env up; cp .env /tmp/x', 'docker run --env-file .env img cat .env',
+    'docker cp secrets.pem c:/x', 'docker compose --env-file .env -f secrets.yml up', 'cat --env-file .env', 'foo --env-file=/abs/.env',
+    'cat .env', 'less .env.prod', 'head ../.env', 'tail -n 5 .env', 'cp .env /tmp/x', 'scp .env garage-server:/opt/x/', 'rsync -a .env garage-server:/opt/x/',
+    'base64 server.key', 'cat certs/server.pem', 'ssh garage-server "cd app && docker compose --env-file .env up -d && cat .env"',
+    'bash -c "docker compose --env-file .env up && cat .env"', 'sudo cat .env',
+    // The docker word must be the command, not an argument (review finding).
+    'cat -- docker --env-file .env', 'head -n 50 -- /usr/bin/docker --env-file ../.env', 'awk 1 docker --env-file .env',
+    'cp -- docker --env-file server.key /tmp/k', 'scp -- docker --env-file .env host:/tmp/x', 'echo docker --env-file .env | cat .env',
+    'docker compose up; cat --env-file .env', 'docker compose up -d && less --env-file=.env', 'docker run img -- cat --env-file .env',
+    'sudo -u deploy docker compose --env-file .env up',
+  ];
+  for (const command of allowed) assert.equal(await decide(command), 'allow', command);
+  for (const command of asked) assert.notEqual(await decide(command), 'allow', command);
+  // Today's behaviour for other docker arguments is kept (volume specs are not path-checked).
+  assert.equal(await decide('docker run -v ./id_rsa:/k img'), 'allow');
+});
+
 test('other projects keep the normal permissive policy', async () => {
-  for (const command of ['git stash', 'kill 1', 'rm -rf build', 'git commit -m x', 'bash -c "ls"', 'docker compose up -d'])
+  for (const command of ['git stash', 'kill 1', 'rm -rf build', 'git commit -m x', 'bash -c "ls"', 'docker compose up -d',
+    'docker compose --env-file ../.env up -d', 'docker run --env-file=.env img'])
     assert.equal(await decide(command, OTHER), explicitShellEffect(command, RULES).effect, command);
 });
 
