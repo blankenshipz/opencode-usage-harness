@@ -18,6 +18,7 @@
 import crypto from 'node:crypto';
 
 import { holdWake, ROUTER_WAKE_HOLD_MS } from './router-maintenance.mjs';
+import { harnessTerminalReceipt, sessionEndOutcome, appendOutcome as defaultAppendOutcome } from './session-end-receipts.mjs';
 export const RESULT_DELIVERY_GRACE_MS = 15000;
 export const RESULT_DELIVERY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const RESULT_DELIVERY_REPORT_LIMIT = 16000;
@@ -74,18 +75,26 @@ export function deliveryDecision({ delivery, evidence, now, graceMs = RESULT_DEL
 
 export function createResultDelivery({ registry, workspace, ctx, loadEvidence, loadFinalText, onTerminalFailure, now = Date.now,
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; }, cancel = clearTimeout,
-  graceMs = RESULT_DELIVERY_GRACE_MS, maxAgeMs = RESULT_DELIVERY_MAX_AGE_MS, wakeHoldMs = ROUTER_WAKE_HOLD_MS }) {
+  graceMs = RESULT_DELIVERY_GRACE_MS, maxAgeMs = RESULT_DELIVERY_MAX_AGE_MS, wakeHoldMs = ROUTER_WAKE_HOLD_MS, appendOutcome = defaultAppendOutcome }) {
   const timers = new Map(), running = new Map();
   let disposed = false;
-  const finish = (key, generation, patch, extra) => registry(workspace, async (state, save) => {
-    const record = state.records.find(r => r.key === key);
-    const delivery = record?.resultDelivery;
-    if (!record || record.admissionGeneration !== generation || delivery?.generation !== generation || delivery.status !== 'pending') return delivery?.status ?? 'superseded';
-    record.resultDelivery = { ...delivery, ...patch, settledAt:now() };
-    extra?.(record);
-    record.updatedAt = Date.now(); await save();
-    return patch.status;
-  });
+  const finish = async (key, generation, patch, extra, terminal) => {
+    let ended;
+    const status = await registry(workspace, async (state, save) => {
+      const record = state.records.find(r => r.key === key);
+      const delivery = record?.resultDelivery;
+      if (!record || record.admissionGeneration !== generation || delivery?.generation !== generation || delivery.status !== 'pending') return delivery?.status ?? 'superseded';
+      record.resultDelivery = { ...delivery, ...patch, settledAt:now() };
+      extra?.(record);
+      // r20 item 7: the harness itself writes the terminal receipt and a session-end outcome.
+      const receipt = harnessTerminalReceipt({ record, terminal, now:now() });
+      if (receipt && record.harnessTerminalReceipt?.generation !== generation) { record.harnessTerminalReceipt = receipt; ended = sessionEndOutcome({ record, receipt }); }
+      record.updatedAt = Date.now(); await save();
+      return patch.status;
+    });
+    if (ended) await Promise.resolve().then(() => appendOutcome(ended)).catch(() => {});
+    return status;
+  };
   const run = async (key, generation) => {
     const record = await registry(workspace, async state => structuredClone(state.records.find(r => r.key === key) ?? null));
     const delivery = record?.resultDelivery;
@@ -104,7 +113,7 @@ export function createResultDelivery({ registry, workspace, ctx, loadEvidence, l
     // A failed or interrupted child no longer holds its ownership row or writer leases.
     if (terminal.outcome !== 'succeeded' && typeof onTerminalFailure === 'function')
       await Promise.resolve().then(() => onTerminalFailure(key, generation, terminal.outcome)).catch(() => {});
-    if (decision.action === 'final') return finish(key, generation, { status:decision.status, via:decision.via, outcome:terminal.outcome });
+    if (decision.action === 'final') return finish(key, generation, { status:decision.status, via:decision.via, outcome:terminal.outcome }, undefined, terminal);
     if (typeof ctx?.session?.synthetic !== 'function') return 'pending';
     // r20 item 8: while sibling background children still run, hold a waking delivery (bounded) so the parent wakes once.
     if (decision.resume && delivery.mode === 'background') {
@@ -131,7 +140,7 @@ export function createResultDelivery({ registry, workspace, ctx, loadEvidence, l
       current.foregroundResult = { generation, sessionID:current.childID, status:'completed', output:deliveredReport(report, 'succeeded'),
         truncated:truncated || report.length > RESULT_DELIVERY_REPORT_LIMIT, length:Math.max(length, report.length), completedAt:terminal.completedAt ?? now(),
         receipt:{ promptID:terminal.promptID, assistantID:terminal.assistantID, idleID:terminal.idleID, ...(terminal.completedAt ? { completedAt:terminal.completedAt } : {}) } };
-    });
+    }, terminal);
   };
   const check = (key, generation) => {
     const id = `${key}\0${generation}`;

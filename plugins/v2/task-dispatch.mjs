@@ -409,7 +409,7 @@ export function taskWorkStatus(state,rootID,taskId) {
   const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
-export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, loadDeliveryEvidence = runtimeDeliveryEvidence, deliverySchedule, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot, parkMonitor = defaultParkMonitor } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, loadDeliveryEvidence = runtimeDeliveryEvidence, deliverySchedule, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot, parkMonitor = defaultParkMonitor, appendOutcome } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -423,7 +423,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     canonicalWorkspace:()=>canonicalWriterPath(workspace), loadSessions, loadTerminalReceipt, now });
   // Every admitted generation's result must reach its parent even when the
   // handoff call is aborted or its returned result is not recorded.
-  const resultDelivery = createResultDelivery({ registry, workspace, ctx, loadEvidence:loadDeliveryEvidence, loadFinalText, now,
+  const resultDelivery = createResultDelivery({ registry, workspace, ctx, loadEvidence:loadDeliveryEvidence, loadFinalText, now, ...(appendOutcome ? { appendOutcome } : {}),
     onTerminalFailure:(key,generation)=>reconciler.settleGeneration(key,generation),
     ...(deliverySchedule ? { schedule:deliverySchedule } : {}) });
   try { await reconciler.reconcile(); } catch { /* never block plugin start; the next start retries */ }
