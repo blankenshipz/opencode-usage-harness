@@ -86,3 +86,39 @@ test('without the permission hook API no probe is attempted', async () => {
   assert.deepEqual(await reevaluation.recheck(), []);
   assert.equal(h.probes.length, 0);
 });
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pendingStore } from '../plugins/v2/permission-reevaluate.mjs';
+
+test('asks pending under the previous plugin instance are re-checked on reload, approve-only and logged', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'perm-pending-'));
+  const store = pendingStore('/w/p', { root });
+  // Previous instance: two asks were raised and persisted.
+  const before = harness(() => 'ask');
+  const logs1 = [];
+  const first = await installPermissionReevaluation(before.ctx, { setTimer: before.setTimer, clearTimer: () => {}, store, log: r => logs1.push(r) });
+  before.ask({ id: 'per_a', sessionID: 'ses_1', action: 'read', resources: ['/x/own.out'] });
+  before.ask({ id: 'per_b', sessionID: 'ses_1', action: 'shell', resources: ['rm -rf /tmp/y'] });
+  await tick(); await tick();
+  assert.deepEqual(store.load().map(([id]) => id).sort(), ['per_a', 'per_b']);
+  first.stop();
+  assert.equal(store.load().length, 2, 'stop keeps the persisted asks for the next instance');
+
+  // New instance (deploy hot reload): the native asks still exist; new rules allow only per_a.
+  const after = harness(input => input.action === 'read' ? 'allow' : 'ask');
+  for (const id of ['per_a', 'per_b']) after.pending.set(id, { id, sessionID: 'ses_1', action: id === 'per_a' ? 'read' : 'shell', resources: [] });
+  const logs = [];
+  const second = await installPermissionReevaluation(after.ctx, { setTimer: after.setTimer, clearTimer: () => {}, store, log: r => logs.push(r) });
+  assert.equal(after.timers.length, 2, 'a recheck is scheduled on install');
+  after.timers[0].fn(); await second.recheck();
+  assert.deepEqual(after.replies, [{ sessionID: 'ses_1', requestID: 'per_a', decision: 'once' }]);
+  assert.ok(after.replies.every(reply => reply.decision === 'once'), 'never rejects');
+  assert.ok(after.pending.has('per_b'), 'the still-ask request stays answerable');
+  assert.ok(logs.some(r => r.requestID === 'per_a' && r.outcome === 'approved_once' && r.trigger === 'reload'));
+  assert.ok(logs.some(r => r.requestID === 'per_b' && r.outcome === 'still_pending'));
+  assert.deepEqual(store.load().map(([id]) => id), ['per_b']);
+  second.stop();
+  fs.rmSync(root, { recursive: true, force: true });
+});

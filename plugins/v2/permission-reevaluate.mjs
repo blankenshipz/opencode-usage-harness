@@ -8,10 +8,48 @@
 // a new ask) and replies "once" only when the current rules now allow it.
 // Requests forced by the harness shell guard always stay with a human.
 import { markers } from './shell-guard.mjs';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { statePath } from './paths.mjs';
+
+// r20 items 2/3: the pending map is persisted per location, so a plugin hot reload (deploy) can
+// re-check asks raised under the previous release. Decisions are approve-only and logged.
+export function pendingStore(directory, { root = statePath('permission-pending') } = {}) {
+  const file = path.join(root, `${crypto.createHash('sha256').update(String(directory ?? '')).digest('hex').slice(0, 24)}.json`);
+  return {
+    file,
+    load() {
+      try {
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return Object.entries(data?.pending ?? {}).filter(([id, sid]) => typeof id === 'string' && typeof sid === 'string');
+      } catch { return []; }
+    },
+    save(map) {
+      try {
+        fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+        const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+        fs.writeFileSync(temporary, JSON.stringify({ pending: Object.fromEntries(map) }), { mode: 0o600 });
+        fs.renameSync(temporary, file);
+      } catch { /* best effort */ }
+    },
+  };
+}
+
+export function reevaluationLogger({ file = statePath('telemetry', 'permission-reevaluation.jsonl') } = {}) {
+  return record => {
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(file, JSON.stringify(record) + '\n', { mode: 0o600 });
+    } catch { /* logging must not affect permissions */ }
+  };
+}
 
 const listData = value => Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
 
-export async function installPermissionReevaluation(ctx, { delays = [1500, 6000], setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+export async function installPermissionReevaluation(ctx, { delays = [1500, 6000], setTimer = setTimeout, clearTimer = clearTimeout,
+  store = ctx?.location?.directory ? pendingStore(ctx.location.directory) : undefined,
+  log = ctx?.location?.directory ? reevaluationLogger() : () => {}, now = () => Date.now() } = {}) {
   const permission = ctx?.permission;
   if (typeof ctx?.event?.subscribe !== 'function' || typeof permission?.hook !== 'function' || typeof permission?.assert !== 'function' ||
       typeof permission?.list !== 'function' || typeof permission?.reply !== 'function') return { stop() {}, recheck: async () => [] };
@@ -22,7 +60,9 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
       event.message = 'harness permission probe: still requires approval';
     }
   });
-  const pending = new Map(); // requestID -> sessionID
+  const pending = new Map(store?.load?.() ?? []); // requestID -> sessionID
+  const persist = () => store?.save?.(pending);
+  let trigger = pending.size ? 'reload' : 'config';
   const callAgents = new Map(); // `${sessionID}\0${callID}` -> agent
   const controller = new AbortController();
   let timers = [], running = Promise.resolve();
@@ -44,6 +84,7 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
       try { requests = listData(await permission.list({ sessionID })); } catch { continue; }
       const live = new Set(requests.map(request => request?.id));
       for (const [id, owner] of pending) if (owner === sessionID && !live.has(id)) pending.delete(id);
+      persist();
       for (const request of requests) {
         if (!request?.id || request.metadata?.[markers.GUARD_MARKER]) continue;
         const agent = request.source?.id ? callAgents.get(`${sessionID}\0${request.source.id}`) : undefined;
@@ -52,11 +93,17 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
             sessionID, ...(agent ? { agent } : {}), action: request.action, resources: request.resources,
             metadata: { ...(request.metadata ?? {}), [markers.PROBE_MARKER]: true },
           });
-        } catch { continue; } // still ask, denied, or agent registry not reloaded yet
+        } catch {
+          // still ask, denied, or agent registry not reloaded yet: never auto-deny, leave it to a human
+          log({ at: new Date(now()).toISOString(), trigger, sessionID, requestID: request.id, action: request.action, outcome: 'still_pending' });
+          continue;
+        }
         try {
           await permission.reply({ sessionID, requestID: request.id, decision: 'once' });
-          pending.delete(request.id);
+          pending.delete(request.id); persist();
           resolved.push(request.id);
+          log({ at: new Date(now()).toISOString(), trigger, sessionID, requestID: request.id, action: request.action,
+            resources: (request.resources ?? []).map(r => String(r).slice(0, 160)), outcome: 'approved_once' });
         } catch { /* already answered elsewhere */ }
       }
     }
@@ -71,18 +118,20 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
     timers = delays.map(delay => setTimer(() => { void recheck(); }, delay));
   };
 
+  // Asks persisted by the previous plugin instance (deploy hot reload) are re-checked once rules settle.
+  schedule();
   void (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         const data = event?.data ?? {};
-        if (event?.type === 'permission.asked' && data.id && data.sessionID) pending.set(data.id, data.sessionID);
-        else if (event?.type === 'permission.replied') pending.delete(data.requestID);
-        else if (event?.type === 'config.updated' || event?.type === 'agent.updated') schedule();
+        if (event?.type === 'permission.asked' && data.id && data.sessionID) { pending.set(data.id, data.sessionID); persist(); }
+        else if (event?.type === 'permission.replied') { if (pending.delete(data.requestID)) persist(); }
+        else if (event?.type === 'config.updated' || event?.type === 'agent.updated') { trigger = 'config'; schedule(); }
       }
     } catch { /* re-evaluation is best effort; humans can still answer */ }
   })();
   return {
     recheck,
-    stop() { controller.abort(); for (const timer of timers) clearTimer(timer); pending.clear(); callAgents.clear(); },
+    stop() { controller.abort(); for (const timer of timers) clearTimer(timer); pending.clear(); callAgents.clear(); }, // keeps the store for the next instance
   };
 }
