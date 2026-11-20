@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — compression coverage
+
+- Live telemetry (2026-11-19): 0 of 1,252 candidates compressed, 57% `protected_tool`, 37% `below_minimum`. The protected bucket was almost entirely `read`/`edit`/`write`.
+- Native grep output from OpenCode 2.0.30 (blank line after every match) is now parsed; previously `search-preview`/`path-prefix` never fired on live grep results.
+- Protected tools narrowed to `read`, dispatch/intent/outcome/artifact/contract control tools, `check_prepare`/`check_status` receipts and `large_file_*`. `edit`/`write`/`patch` are no longer protected (their outputs are tiny). Harness diagnostics JSON tools (`harness_health`, `subscription_quota`, `codex_quota`, `model_status`, `repo_identity`) are compressible JSON. CodeMode calls into protected tools get lossless projections only.
+- Lossless projections start at 2 KiB (lossy keep 4 KiB). New lossless `grep-lines`. Shorter retrieval marker (~300 fewer characters per projection).
+- Replaying the day's 1,379 real tool results: 24 projections prepared, about 104k characters saved (before: 0).
+
 ## Unreleased — check receipts readable outside the state dir
 
 - `configure.py` always emits a global `external_directory` allow for `<resolved state dir>/check-receipts/*`, so agents in a project outside the state dir can read check receipts without a prompt. It does not allow the rest of the state dir, it is not persisted, and secret denials still apply.

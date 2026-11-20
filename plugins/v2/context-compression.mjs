@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { statePath } from './paths.mjs';
-import { compactToolText } from './result-compactor.mjs';
+import { compactToolText, MIN_CANDIDATE_CHARS } from './result-compactor.mjs';
 import { createCompressionDiagnostics } from './compression-diagnostics.mjs';
 import { isNativeAgent } from './agent-mode.mjs';
 
@@ -12,6 +12,17 @@ const digest = text => crypto.createHash('sha256').update(text).digest('hex');
 const key = e => JSON.stringify([e.sessionID, e.messageID, e.id]);
 const marker = '[harness compacted';
 const MAX_RECORDS = 256, MAX_STORE_BYTES = 128 * 1024 * 1024;
+// Outputs that must reach the model verbatim: source text that edits anchor on
+// (read) and dispatch, intent, outcome and check-receipt control records.
+// Edit/write/patch confirmations are simply too small to compress.
+export const PROTECTED_TOOLS = new Set(['read', 'task_dispatch', 'task_dispatch_collect', 'task_dispatch_status', 'task_dispatch_cancel',
+  'task_dispatch_template', 'task_dispatch_reconcile_terminal', 'task_intent', 'task_outcome', 'task_artifact', 'task_contract',
+  'check_prepare', 'check_status', 'large_file_check', 'large_file_allow_direct', 'large_file_json', 'large_file_summary']);
+// Harness diagnostics with JSON results; a projection keeps the original saved.
+const JSON_TOOLS = new Set(['harness_health', 'subscription_quota', 'codex_quota', 'model_status', 'repo_identity']);
+// CodeMode calls into protected tools get value-preserving projections only.
+const PROTECTED_CALL = new RegExp(String.raw`\btools\.(?:${[...PROTECTED_TOOLS].join('|')})\b`);
+export const losslessOnly = event => event.tool === 'execute' && typeof event.input?.code === 'string' && PROTECTED_CALL.test(event.input.code);
 
 // Shell arguments for structured commands: bare words or simple quoted strings
 // without expansion. Pipes, redirection and substitution disqualify a command.
@@ -40,7 +51,7 @@ function gitSummaryCommand(command) {
 
 export function compressionKind(event) {
   // No speculative classification of third-party tools: unknown means unchanged.
-  if (event.tool === 'execute') return 'json';
+  if (event.tool === 'execute' || JSON_TOOLS.has(event.tool)) return 'json';
   if (['grep', 'glob'].includes(event.tool)) return event.tool;
   if (event.tool === 'shell') {
     const command = event.input?.command;
@@ -69,7 +80,8 @@ export function createOutputStore(directory = statePath('tool-output-store'), op
     const preservation = compacted.preservation ?? (compacted.lossless === false
       ? 'unchanged context omitted; every file, hunk, and changed line retained; this preview is not an applyable patch.'
       : 'all values/entries retained.');
-    const projected = `${compacted.text}\n${marker} ${compacted.strategy}; ${preservation} Exact original snapshot: ${path.join(destination, 'original.txt')}. For bounded retrieval use native read on ${chunksPath}, offset=1, limit=3; ignore native read headers and strip each N: line prefix; each stored line is a JSON string, concatenate decoded strings in order. Snapshot is not current source.]`;
+    // Keep the marker short: it is paid on every projection.
+    const projected = `${compacted.text}\n${marker} ${compacted.strategy}; ${preservation} Original: native read ${chunksPath} offset=1 limit=3; strip "N: " prefixes, JSON-decode each line, concatenate. Snapshot, not current source.]`;
     // Include the retrieval instructions in the saving; compression must pay for itself.
     if (Buffer.byteLength(projected) > 24 * 1024 || projected.split('\n').length > 1500) return skip('projection_over_budget');
     if (original.length - projected.length < 512 || projected.length > original.length * 0.85) return skip('no_net_saving');
@@ -199,7 +211,7 @@ export async function installContextCompression(ctx, options = {}) {
         if (nativeMcp) kind = 'json';
       }
       if (!kind) {
-        const protectedTool = ['read', 'patch', 'write', 'edit', 'task_dispatch', 'task_dispatch_collect', 'task_dispatch_status', 'task_intent', 'task_outcome', 'task_artifact'].includes(event.tool);
+        const protectedTool = PROTECTED_TOOLS.has(event.tool);
         const content = event.result?.content;
         const originalChars = typeof content === 'string' ? content.length : undefined;
         observe({ type: 'candidate', sessionID: event.sessionID, reason: protectedTool ? 'protected_tool' : 'unsupported_tool',
@@ -215,11 +227,11 @@ export async function installContextCompression(ctx, options = {}) {
         if (block?.type !== 'text' || typeof block.text !== 'string') { next.push(block); continue; }
         if (block.text.includes(marker)) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'already_projected', processingMs: Date.now() - blockStarted }); next.push(block); continue; }
         let excluded;
-        if (block.text.length < 4096) excluded = 'below_minimum';
+        if (block.text.length < MIN_CANDIDATE_CHARS) excluded = 'below_minimum';
         else if (Buffer.byteLength(block.text) > 1024 * 1024) excluded = 'input_over_budget';
         else if (Buffer.from(block.text,'utf8').toString('utf8') !== block.text) excluded = 'invalid_unicode';
         if (excluded) { observe({ type:'candidate', sessionID:event.sessionID, reason:excluded, processingMs:Date.now()-blockStarted, originalChars:block.text.length }); next.push(block); continue; }
-        const compacted = compactToolText(block.text, kind);
+        const compacted = compactToolText(block.text, kind, { losslessOnly: losslessOnly(event) });
         if (!compacted) { observe({ type: 'candidate', sessionID: event.sessionID, reason: 'no_useful_projection', processingMs: Date.now() - blockStarted, originalChars: block.text.length }); next.push(block); continue; }
         let skipReason = 'store_not_published';
         const text = await save(event, index, block.text, compacted, reason => { skipReason = reason; });

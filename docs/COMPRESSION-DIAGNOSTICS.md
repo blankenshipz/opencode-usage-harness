@@ -76,7 +76,22 @@ structured results from the 4 KiB minimum upward:
 Native `grep` results also get a `search-preview` from 4 KiB. Below 16 KiB a
 lossy projection is used only when no lossless strategy is useful, and every
 projection must still save at least 512 characters and be at most 85% of the
-original. Protected tools (`read`, `edit`, `write`, `patch`, `task_*`) are
-never projected. Every projection ends with the standard
+original. Protected tools are never projected: `read` (edits anchor on its
+exact text), the `task_dispatch*`, `task_intent`, `task_outcome`,
+`task_artifact` and `task_contract` control records, the `check_prepare` /
+`check_status` receipt tools and the `large_file_*` guard tools. CodeMode
+`execute` calls that invoke one of these get value-preserving projections only
+(`json-whitespace`, `json-table`, `path-prefix`). `edit`/`write`/`patch` are
+not protected: their confirmations are too small to project and report as
+`unsupported_tool`. `harness_health`, `subscription_quota`, `codex_quota`,
+`model_status` and `repo_identity` are treated as JSON.
+
+Lossless projections start at 2 KiB; lossy ones keep the 4 KiB floor. Native
+`grep` output from OpenCode 2.0.30 has a blank line after every match; the
+parser accepts that layout (earlier it rejected it, so native grep never
+projected), and `grep-lines` removes the `  Line ` prefixes and blank
+separators without dropping a match. The retrieval marker was shortened to
+name only `chunks.jsonl` (`original.txt` sits next to it), since its length
+counts against every projection's net saving. Every projection ends with the standard
 `[harness compacted …]` marker naming the exact saved original and how to
 read it.

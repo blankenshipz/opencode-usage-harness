@@ -6,10 +6,13 @@ const useful = (before, after) => before.length - after.length >= 512 && after.l
 // Lossy previews of native search results start at 16 KiB.
 const SEARCH_PREVIEW_MIN_CHARS = 16 * 1024;
 // Structured kinds (status-like JSON, grouped grep/rg text, git summaries and
-// native grep) may be projected from the global 4 KiB minimum. Below
+// native grep) may be projected from 4 KiB. Below
 // SEARCH_PREVIEW_MIN_CHARS a lossy projection is a fallback: it is chosen only
 // when no lossless candidate passes useful().
 export const STRUCTURED_PREVIEW_MIN_CHARS = 4 * 1024;
+// Lossless projections start lower. useful() and the output store's net-saving
+// check (which counts the retrieval marker) decide whether one pays for itself.
+export const MIN_CANDIDATE_CHARS = 2 * 1024;
 // Status JSON: arrays longer than KEEP + SLACK keep their first KEEP entries
 // plus every error entry; non-error strings are cut to STATUS_STRING_MAX.
 const STATUS_ARRAY_KEEP = 5;
@@ -141,29 +144,53 @@ function globPreview(text) {
 function previewLength(lines, next) {
   return lines.reduce((size, line) => size + line.length + 1, 0) + next.length + 1;
 }
-function grepPreview(text, lowBand = false) {
+const GREP_TRUNCATED = /^\(Results are truncated: showing first \d+ results\. Consider using a more specific path or pattern\.\)$/;
+const GREP_MATCH = /^  Line \d+: /;
+// Native grep: "Found N matches", then per file "<path>:" and "  Line N: text"
+// lines. OpenCode 2.0.30 keeps each match's own newline, so every match line is
+// followed by a blank line (and groups by two); the compact layout with one
+// blank line between groups is accepted too. Anything else stays native.
+function parseNativeGrep(text) {
   const lines = text.split('\n');
-  if (lines.at(-1) === '') lines.pop();
+  while (lines.at(-1) === '') lines.pop();
   const heading = /^Found (\d+) matches$/.exec(lines[0] ?? '');
   if (!heading) return undefined;
-  const groups = [];
+  const groups = []; let truncated;
   for (let i = 1; i < lines.length;) {
     // This is native tool truncation, not a form we reinterpret.
-    if (/^\(Results are truncated: showing first \d+ results\. Consider using a more specific path or pattern\.\)$/.test(lines[i])) {
-      if (++i !== lines.length) return undefined;
-      break;
+    if (GREP_TRUNCATED.test(lines[i])) {
+      if (i !== lines.length - 1) return undefined;
+      truncated = lines[i]; break;
     }
     const file = lines[i];
-    if (!file?.endsWith(':') || !nativePath(file.slice(0, -1))) return undefined;
+    if (!file.endsWith(':') || !nativePath(file.slice(0, -1))) return undefined;
     i++;
     const matches = [];
-    while (i < lines.length && /^  Line \d+: /.test(lines[i])) matches.push(lines[i++]);
+    while (i < lines.length && GREP_MATCH.test(lines[i])) {
+      matches.push(lines[i++]);
+      if (lines[i] === '' && GREP_MATCH.test(lines[i + 1] ?? '')) i++;
+    }
     if (!matches.length) return undefined;
     groups.push({ file, matches });
-    if (i === lines.length) break; // Native output may omit its final separator.
-    if (lines[i] !== '') return undefined;
-    i++;
+    let blanks = 0;
+    while (i < lines.length && lines[i] === '') { i++; blanks++; }
+    if (blanks > 2 || (i < lines.length && !blanks)) return undefined;
   }
+  return { count: heading[1], groups, truncated };
+}
+// Lossless: only the fixed "  Line " prefix and blank separator lines go.
+function grepLines(text) {
+  const parsed = parseNativeGrep(text);
+  if (!parsed) return undefined;
+  const out = ['[harness grep-lines; each "N: text" line was "  Line N: text"; blank separator lines removed]', `Found ${parsed.count} matches`];
+  for (const group of parsed.groups) out.push(group.file, ...group.matches.map(match => match.slice(7)));
+  if (parsed.truncated) out.push(parsed.truncated);
+  return out.join('\n');
+}
+function grepPreview(text, lowBand = false) {
+  const parsed = parseNativeGrep(text);
+  if (!parsed) return undefined;
+  const heading = [, parsed.count], groups = parsed.groups;
   const totalMatches = groups.reduce((count, group) => count + group.matches.length, 0);
   if (!lowBand && totalMatches <= SEARCH_PREVIEW_MAX_MATCHES && groups.length <= SEARCH_PREVIEW_MAX_FILES) return undefined;
   const shown = [], usedFiles = new Set(); let shownMatches = 0;
@@ -346,8 +373,10 @@ function gitSummaryProjection(text) {
   return `[harness git-summary; summary, branch and error lines retained verbatim; ${runs} long lists collapsed (${omitted} entries omitted, counted)]\n${out.join('\n')}${trailing ? '\n' : ''}`;
 }
 
-export function compactToolText(text, kind) {
-  if (typeof text !== 'string' || text.length < 4096 || Buffer.from(text, 'utf8').toString('utf8') !== text || Buffer.byteLength(text) > MAX_BYTES || !['shell', 'grep', 'glob', 'json', 'diff', 'search', 'git'].includes(kind)) return undefined;
+// options.losslessOnly: only value-preserving projections (whitespace, tables,
+// prefixes, layout); used where the output must stay verbatim in substance.
+export function compactToolText(text, kind, options = {}) {
+  if (typeof text !== 'string' || text.length < MIN_CANDIDATE_CHARS || Buffer.from(text, 'utf8').toString('utf8') !== text || Buffer.byteLength(text) > MAX_BYTES || !['shell', 'grep', 'glob', 'json', 'diff', 'search', 'git'].includes(kind)) return undefined;
   const candidates = [];
   if (kind === 'diff') { const preview = previewDiff(text); if (preview) candidates.push(preview); }
   const minified = jsonMinify(text);
@@ -363,6 +392,7 @@ export function compactToolText(text, kind) {
     candidates.push({ text: searchPreview(text, kind), strategy: 'search-preview', lossless: false,
       preservation: 'this search preview omits results; the exact native original is saved for retrieval.' });
     candidates.push({ text: pathPrefix(text), strategy: 'path-prefix' });
+    if (kind === 'grep') candidates.push({ text: grepLines(text), strategy: 'grep-lines' });
   }
   if (minified === undefined && kind === 'search') {
     candidates.push({ text: grepGroupsProjection(text), strategy: 'grep-groups', lossless: false,
@@ -371,7 +401,8 @@ export function compactToolText(text, kind) {
   }
   if (minified === undefined && kind === 'git') candidates.push({ text: gitSummaryProjection(text), strategy: 'git-summary', lossless: false,
     preservation: 'this git summary collapses long file and commit lists (counted); summary and error lines are retained; the exact original is saved for retrieval.' });
-  const viable = candidates.filter(x => typeof x.text === 'string' && useful(text, x.text));
+  const viable = candidates.filter(x => typeof x.text === 'string' && useful(text, x.text) &&
+    (x.lossless !== false || (!options.losslessOnly && text.length >= STRUCTURED_PREVIEW_MIN_CHARS)));
   // Below the 16 KiB preview floor, prefer any useful lossless projection.
   const lossless = viable.filter(x => x.lossless !== false);
   const pool = text.length < SEARCH_PREVIEW_MIN_CHARS && lossless.length ? lossless : viable;

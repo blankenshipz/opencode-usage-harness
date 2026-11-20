@@ -238,8 +238,7 @@ test('near-miss structured results are now prepared, with a retrieval marker; pr
   await hooks['execute.before'](e);await hooks['execute.after'](e);
   assert.deepEqual(reasons.at(-1),['prepared',strategy]);
   assert.ok(e.result.content.includes(`\n[harness compacted ${strategy}; this `));
-  assert.match(e.result.content,/the exact original is saved for retrieval\. Exact original snapshot: /);
-  assert.match(e.result.content,/For bounded retrieval use native read on .*chunks\.jsonl, offset=1, limit=3/);
+  assert.match(e.result.content,/the exact original is saved for retrieval\. Original: native read \/\S+\/chunks\.jsonl offset=1 limit=3; /);
  }
  const statusOut=reasons.length;
  assert.ok((await fs.readdir(f.directory)).filter(x=>!x.startsWith('.')).length===3);
