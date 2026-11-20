@@ -1,0 +1,39 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createParkMonitor, installParkYield, parkedResult, NOTIFY_AFTER_MS, PARK_AFTER_MS } from '../plugins/v2/park-yield.mjs';
+
+test('stalled at 10 min, parked at 30 min, logged once each, never replies', async () => {
+  let at = 0; const logs = [];
+  const m = createParkMonitor({ now: () => at, log: r => logs.push(r) });
+  m.asked({ id: 'per_1', sessionID: 'child', action: 'bash', since: 0 });
+  at = NOTIFY_AFTER_MS - 1; assert.deepEqual(await m.tick(), []);
+  at = NOTIFY_AFTER_MS; assert.equal((await m.tick())[0].outcome, 'stalled');
+  assert.deepEqual(await m.tick(), []);
+  at = PARK_AFTER_MS; const parked = await m.tick();
+  assert.equal(parked[0].outcome, 'parked'); assert.equal(parked[0].answerable, true);
+  assert.deepEqual(logs.map(l => l.outcome), ['stalled', 'parked']);
+  assert.equal(m.pending().length, 1, 'parked ask stays pending/answerable');
+});
+
+test('whenParked resolves only for matching sessions; reply clears the ask', async () => {
+  let at = 0; const m = createParkMonitor({ now: () => at });
+  const other = m.whenParked(sid => sid === 'other');
+  const mine = m.whenParked(async sid => sid === 'grandchild');
+  m.asked({ id: 'per_2', sessionID: 'grandchild', since: 0 });
+  m.asked({ id: 'per_3', sessionID: 'x', since: 0 });
+  at = PARK_AFTER_MS; await m.tick();
+  const got = await mine.promise; assert.equal(got.requestID, 'per_2'); assert.equal(got.pendingMs, PARK_AFTER_MS);
+  let otherDone = false; other.promise.then(() => { otherDone = true; }); await new Promise(r => setImmediate(r));
+  assert.equal(otherDone, false); other.cancel();
+  m.replied('per_2'); assert.deepEqual(m.pending().map(p => p.requestID), ['per_3']);
+});
+
+test('install tracks asked/replied events and the parked result is never a pass', async () => {
+  const events = [{ type: 'permission.asked', data: { id: 'per_9', sessionID: 's', action: 'edit' } }, { type: 'permission.replied', data: { sessionID: 's', requestID: 'per_9' } }];
+  const m = createParkMonitor(); let interval;
+  const ctx = { event: { subscribe: async function* () { for (const e of events) yield e; } } };
+  const handle = installParkYield(ctx, { monitor: m, setTimer: (fn, ms) => (interval = ms, { unref() {} }), clearTimer: () => {} });
+  await new Promise(r => setImmediate(r)); assert.equal(interval, 60_000); assert.equal(m.pending().length, 0); handle.stop();
+  const r = parkedResult({ parked: { requestID: 'per_1', sessionID: 'c', action: 'bash', pendingMs: PARK_AFTER_MS }, identity: { sessionID: 'c', agent: 'verifier', generation: 1 }, collect: {} });
+  assert.equal(r.metadata.status, 'blocked'); assert.equal(r.metadata.verdict, 'blocked'); assert.match(r.content, /NOT a pass/); assert.match(r.content, /not denied/);
+});

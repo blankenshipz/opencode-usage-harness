@@ -1274,3 +1274,22 @@ test('timed reminders are persisted once and never become a transient tail that 
  assert.equal(await deliverTimedReminder(failing,e,'R2'),true);assert.deepEqual(e.messages,[{role:'user',content:[{type:'text',text:'R2'}]}]);
  const none={sessionID:'s3',messages:[]};assert.equal(await deliverTimedReminder({},none,'R3'),true);assert.equal(none.messages.at(-1).role,'user');
 });
+test('park and yield: a foreground child parked on an ask returns blocked to the parent and is recorded later', async t => {
+ const { createParkMonitor, PARK_AFTER_MS } = await import('../plugins/v2/park-yield.mjs');
+ let at = 0, release; const monitor = createParkMonitor({ now: () => at });
+ const h = await harness(t, async (input, context, sessions) => {
+  const id = 'ses_parked'; sessions.push({ id, parentID: context.sessionID, agent: input.agent, directory: '/project', active: true });
+  await context.progress({ sessionID: id, status: 'running' });
+  sessions.push({ id: 'ses_grand', parentID: id, agent: 'builder', directory: '/project', active: true });
+  monitor.asked({ id: 'per_x', sessionID: 'ses_grand', action: 'bash', since: 0 });
+  at = PARK_AFTER_MS; setImmediate(() => monitor.tick());
+  await new Promise(r => { release = r; });
+  return { output: { sessionID: id, status: 'completed', output: 'LATE' }, content: 'LATE', metadata: { sessionID: id, status: 'completed' } };
+ }, undefined, { parkMonitor: monitor });
+ const result = await h.call(base);
+ assert.equal(result.metadata.status, 'blocked'); assert.match(result.content, /BLOCKED/); assert.match(result.content, /NOT a pass/);
+ assert.equal(result.metadata.parked.requestID, 'per_x');
+ await h.registry('/project', async state => { const r = state.records.find(r => r.childID === 'ses_parked'); assert.equal(r.parked.requestID, 'per_x'); assert.notEqual(r.state, 'completed'); });
+ release(); await new Promise(r => setTimeout(r, 50));
+ await h.registry('/project', async state => { const r = state.records.find(r => r.childID === 'ses_parked'); assert.equal(r.state, 'completed'); assert.equal(r.foregroundResult.output, 'LATE'); });
+});

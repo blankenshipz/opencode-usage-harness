@@ -26,6 +26,7 @@ import { rootProgressStatus, rootProgressReminder } from './root-progress.mjs';
 import { createTerminalSettler, terminalSettlementEligibility } from './terminal-settlement.mjs';
 import { createDispatchCanceller, cancelInputSchema } from './task-dispatch-cancel.mjs';
 import { createResultDelivery } from './result-delivery.mjs';
+import { parkMonitor as defaultParkMonitor, parkedResult } from './park-yield.mjs';
 import { createStaleReconciler } from './dispatch-reconcile.mjs';
 import { midRunCompactionEnabled, midRunCompactionDecision, settleMidRunCompaction, admitMidRunCompaction, recordAdmitted, recordAdmissionFailure, recordBaseline, buildContinuation, activeContinuation, midRunCompactionStatus, pendingCompactionPreservation, BRIEF_LIMIT } from './mid-run-compaction.mjs';
 
@@ -406,7 +407,7 @@ export function taskWorkStatus(state,rootID,taskId) {
   const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
-export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, loadDeliveryEvidence = runtimeDeliveryEvidence, deliverySchedule, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, loadDeliveryEvidence = runtimeDeliveryEvidence, deliverySchedule, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot, parkMonitor = defaultParkMonitor } = {}) {
   if (!ctx.agent?.list) return;
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
@@ -963,12 +964,33 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           marker,promptHash:`${promptHash},${prefixedPromptHash}`,agent:input.agent,description:input.description,taskId:input.taskId,workKey:input.workKey};
         // A bounded copy of the assignment survives a later mid-run compaction (never exported by status).
         await update({completionBinding,completionReceipt:undefined,resultDelivery:pendingDelivery,handoffBrief:typeof input.prompt==='string'?{generation:admission.generation,text:input.prompt.slice(0,BRIEF_LIMIT)}:undefined});
-        const result = await rawExecute({ agent:input.agent,description:input.description,prompt:boundedHandoff,...(admission.childID?{sessionID:admission.childID}:{}),...(admission.routing.selected?{model:admission.routing.selected}:{}),background:backgroundDispatch(input) }, {
+        const execution = rawExecute({ agent:input.agent,description:input.description,prompt:boundedHandoff,...(admission.childID?{sessionID:admission.childID}:{}),...(admission.routing.selected?{model:admission.routing.selected}:{}),background:backgroundDispatch(input) }, {
           ...context, progress: async progress => {
             if(progress.sessionID) { observed=progress.sessionID;await update({childID:observed,state:'running'}); }
             return visible.native(progress);
           },
         });
+        // r20 item 6: a foreground child whose permission ask (or a descendant's) is parked after
+        // 30 min releases this parent with an explicit blocked result. The ask is never answered here.
+        const parkWait = completionBinding.background ? undefined : parkMonitor?.whenParked?.(async sessionID => {
+          if (!observed) return false;
+          if (sessionID === observed) return true;
+          return descendant(await loadSessions().catch(() => []), sessionID, observed);
+        });
+        const raced = parkWait ? await Promise.race([execution.then(value => ({ value }), error => ({ error })), parkWait.promise.then(parked => ({ parked }))]) : { value: await execution };
+        parkWait?.cancel();
+        if (raced.error) throw raced.error;
+        if (raced.parked) {
+          const identity={taskId:input.taskId,workKey:input.workKey,sessionID:observed,agent:input.agent,generation:admission.generation};
+          // The child keeps running; record its eventual outcome in the background like a normal return.
+          void execution.then(async later => {
+            const laterStatus=nativeStatus(later), report=laterStatus==='running'?undefined:boundedReport(nativeReport(later));
+            await update({state:later?.metadata?.status ?? later?.output?.status ?? 'completed',inFlight:null,...(report?{foregroundResult:{generation:admission.generation,sessionID:observed,status:laterStatus,output:report.text,truncated:report.truncated,length:report.length,completedAt:now()}}:{})});
+          }, async () => { await update({state:'paused',inFlight:null}).catch(() => {}); }).catch(() => {});
+          await update({parked:{generation:admission.generation,...raced.parked,at:now()}}).catch(() => {});
+          return parkedResult({ parked: raced.parked, identity, collect: collectArguments(identity) });
+        }
+        const result = raced.value;
         observed = result?.metadata?.sessionID ?? result?.output?.sessionID ?? observed;
         // A native return is the first durable evidence that it accepted this delivery. Until then,
         // retries deliberately resend the full intent rather than treating a progress event as an acknowledgement.
