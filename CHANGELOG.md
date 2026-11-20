@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — plain git push allowed under the permissive shell policy
+
+- Approved 2026-11-19: harness agents may `git push` without a prompt. Plain `git push`, `-u`/`--set-upstream`, `origin <branch>`, `--tags`, also behind wrappers, are allowed.
+- Still ask: `--force*` (incl. `--force-with-lease`), `-f`, `+refspec`, `:ref` and `--delete`/`-d` deletes, `--mirror`, `--prune`, `--receive-pack`/`--exec` (`GIT_PUSH_ASK`, also behind every wrapper and after `--`), plus every other existing ask (reset --hard, rebase, commit, ...).
+- `shell-guard.mjs` `gitPushDanger` checks every segment of the raw command, including compound, nested `$(...)` and wrapped ones. It forces an ask for forms wildcards miss: `-uf` clusters, quoted refspecs, `git -C d push -f`, `/usr/bin/git`, `-c alias.*`/`remote.*.push`/`push.*`, `git config` writes of those keys, and `GIT_CONFIG_*` env. `tests/v2-shell-guard-push.test.mjs` checks it against the live configure rules.
+
 ## Unreleased — wrapped dangerous commands ask under the permissive shell policy
 
 - Permissive (`shell *` allow) already allows read-only git, check_receipt.py-wrapped test/lint commands, test runners and linters. The 2026-11-19 asks for those came from the earlier allowlist policy, /tmp and receipts, all fixed since.

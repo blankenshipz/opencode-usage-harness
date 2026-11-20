@@ -267,7 +267,7 @@ class ConfigureTests(unittest.TestCase):
         asks=[r['resource'] for r in shell[1:] if r['effect']=='ask']
         self.assertEqual(sorted(asks),sorted(DANGEROUS_SHELL_ASK))
         self.assertTrue(all(r['effect']=='ask' or r['resource'] in ENV_TEMPLATE_SHELL_ALLOW for r in shell[1:]))
-        for required in ('git push*','sudo *','rm -rf *','*.env*','bash -*','eval *','git commit*'):
+        for required in ('git push *--force*','git push * +*','sudo *','rm -rf *','*.env*','bash -*','eval *','git commit*'):
             self.assertIn(required,DANGEROUS_SHELL_ASK)
         # Read-only roles keep their agent-level shell deny, which follows the global allow.
         for role in ('harness-router','harness-scout','harness-reviewer'):
@@ -496,11 +496,12 @@ class ConfigureTests(unittest.TestCase):
             for rule in rules:
                 if fnmatch.fnmatchcase(command,rule['resource']): out=rule['effect']
             return out
-        for command in ('python3 check_receipt.py -- git push origin main','env X=1 git commit -m x','xargs git push','timeout 5 kill 1',
+        for command in ('python3 check_receipt.py -- git push -f origin main','env X=1 git commit -m x','xargs git push --force','git push -f','git push origin +main','git push --delete origin x','git reset --hard','git rebase main','timeout 5 kill 1',
                         'nohup git reset --hard','env X=1 sh -c y','xargs rm -rf','find . -name x -exec rm -rf {} +','git commit -m x','sudo ls'):
             self.assertEqual(effect(command),'ask',command)
         for command in ('git log --oneline -5','git status','git diff --stat','python3 check_receipt.py run -- pytest -q','pytest -q tests',
-                        'npm run lint','ruff check .','timeout 60 pytest -q','timeout 5 git add x','env X=1 ssh host','xargs grep foo'):
+                        'npm run lint','ruff check .','timeout 60 pytest -q','timeout 5 git add x','env X=1 ssh host','xargs grep foo',
+                        'git push','git push -u origin feature-fix','git push origin main','python3 check_receipt.py -- git push origin main'):
             self.assertEqual(effect(command),'allow',command)
 
 if __name__=='__main__':unittest.main()

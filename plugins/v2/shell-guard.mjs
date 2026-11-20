@@ -8,7 +8,8 @@
 //   - an unquoted redirect targets a secret-looking path,
 //   - a bare redirect (no command word) would otherwise skip permission checks,
 //   - a compound command's redirect-bearing segment matches a configured
-//     shell ask/deny rule that the parser's resource would no longer match.
+//     shell ask/deny rule that the parser's resource would no longer match,
+//   - any segment force-pushes, deletes or mirrors a remote ref (gitPushDanger).
 // It is lexical and quoting-aware for common cases, not a shell interpreter.
 
 const SECRET_BASENAME = [
@@ -167,6 +168,68 @@ export function explicitShellEffect(resource, rules = []) {
   return rule ? { effect: rule.effect, pattern: rule.resource } : undefined;
 }
 
+// Git global options that take a separate argument word.
+const GIT_GLOBAL_WITH_ARG = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix', '--exec-path', '--list-cmds']);
+// Inline config that can turn a plain push into a forced/deleting one, or define an alias.
+const RISKY_GIT_CONFIG = /^(alias\.|push\.|remote\..*\.(push|mirror|receivepack)(=|$))/i;
+const GIT_CONFIG_ENV = /^GIT_CONFIG_(PARAMETERS|COUNT|KEY_\d+|VALUE_\d+|GLOBAL|SYSTEM)=/;
+const CONFIG_READ = new Set(['--get', '--get-all', '--get-regexp', '--get-urlmatch', '--list', '-l', 'get', 'list']);
+
+function pushArgsDanger(args) {
+  let positional = false;
+  for (const arg of args) {
+    if (!positional && arg === '--') { positional = true; continue; }
+    if (!positional && arg.startsWith('--')) {
+      if (/^--(force|mirror|delete|prune|receive-pack|exec)/.test(arg)) return `git push ${arg}`;
+      continue;
+    }
+    if (!positional && /^-[^-]/.test(arg)) {
+      // Short option cluster (-f, -uf, -fd); -o/--push-option values never start with '-'.
+      if (/[fd]/.test(arg.slice(1).split(/[o]/)[0])) return `git push ${arg}`;
+      continue;
+    }
+    if (arg.startsWith('+')) return `git push forced refspec ${arg}`;
+    if (arg.startsWith(':')) return `git push deleting refspec ${arg}`;
+  }
+  return undefined;
+}
+
+// Returns why one git invocation (words after `git`) can force/delete a remote ref, else undefined.
+function gitInvocationDanger(args) {
+  let i = 0;
+  for (; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith('-')) break;
+    const [name, inline] = arg.includes('=') ? [arg.slice(0, arg.indexOf('=')), arg.slice(arg.indexOf('=') + 1)] : [arg, undefined];
+    const value = inline ?? (GIT_GLOBAL_WITH_ARG.has(name) ? args[++i] : undefined);
+    if ((name === '-c' || name === '--config-env') && RISKY_GIT_CONFIG.test(value ?? ''))
+      return `git ${name} ${value} can redefine what git push does`;
+  }
+  const sub = args[i];
+  if (sub === 'push') return pushArgsDanger(args.slice(i + 1));
+  if (sub === 'config') {
+    const rest = args.slice(i + 1);
+    if (!rest.some(word => CONFIG_READ.has(word)) && rest.some(word => RISKY_GIT_CONFIG.test(word)))
+      return `git config ${rest.find(word => RISKY_GIT_CONFIG.test(word))} can redefine what git push does`;
+  }
+  return undefined;
+}
+
+// Force/delete/mirror pushes ask even under permissive and behind any wrapper (env, timeout,
+// xargs, find -exec, check_receipt.py --, ...): every `git` word in a segment starts a candidate
+// invocation. Conservative: `echo git push -f` asks too.
+export function gitPushDanger(words) {
+  if (!Array.isArray(words)) return undefined;
+  const env = words.find(word => GIT_CONFIG_ENV.test(word));
+  if (env && words.some(word => /(^|\/)git$/.test(word))) return `${env.split('=')[0]} can redefine what git does`;
+  for (let k = 0; k < words.length; k++) {
+    if (!/(^|\/)git$/.test(words[k])) continue;
+    const reason = gitInvocationDanger(words.slice(k + 1));
+    if (reason) return reason;
+  }
+  return undefined;
+}
+
 export function analyzeShellCommand(command, rules = []) {
   if (typeof command !== 'string' || !command.trim()) return { action: 'allow', reasons: [] };
   const { segments, compound } = scanShell(command);
@@ -190,6 +253,13 @@ export function analyzeShellCommand(command, rules = []) {
       } else if (secretWord !== undefined) {
         reasons.push(`segment ${JSON.stringify(segment.text.slice(0, 200))} names an env template together with secret-looking path ${JSON.stringify(secretWord)}`);
       }
+    }
+    // Native wildcards miss -uf, quoted refspecs and `git -C d push -f`; ask whenever the
+    // configured rules would allow (or nothing is configured) a force/delete push.
+    const pushDanger = gitPushDanger(segment.words);
+    if (pushDanger) {
+      const effect = explicitShellEffect(segment.text, rules)?.effect;
+      if (effect === 'allow' || !rules.length) reasons.push(`segment ${JSON.stringify(segment.text.slice(0, 200))} is a force/delete push (${pushDanger})`);
     }
     if (!segment.hasCommand && segment.redirects.some(redirect => redirect.file))
       reasons.push(`bare redirection ${JSON.stringify(segment.text)} has no command, so OpenCode would not check it`);

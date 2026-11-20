@@ -146,10 +146,19 @@ def namespace_harness_agents(agents):
 ALLOWLIST_SHELL_ALLOW = ('pwd','git status*','git diff*','git log*','npm test*','npm run test*','pytest*','python3 -m pytest*','go test*','gofmt *')
 # Permissive shell policy: allow by default, ask only for clearly dangerous commands.
 # Lexical, not a sandbox: e.g. `bash -c '...'` contents are not parsed, so those ask.
+# Plain `git push` (incl. `-u`, `origin <branch>`, `--tags`) is allowed under permissive; history-
+# rewriting or deleting pushes ask. Wildcards cannot see short-flag clusters (-uf), quoted refspecs
+# or git global options (git -C d push -f); plugins/v2/shell-guard.mjs classifies those and forces
+# an ask, and tests/v2-shell-guard-push.test.mjs checks the two agree.
+GIT_PUSH_ASK = ('git push *--force*', 'git push *--mirror*', 'git push *--delete*', 'git push *--prune*',
+                'git push *--receive-pack*', 'git push *--exec*',
+                'git push -f', 'git push -f *', 'git push * -f', 'git push * -f *',
+                'git push -d', 'git push -d *', 'git push * -d', 'git push * -d *',
+                'git push * +*', 'git push * :*', 'git push * "+*', "git push * '+*", 'git push * ":*', "git push * ':*")
 _RM_RECURSIVE = ('-r', '-R', '-rf', '-fr', '-Rf', '-fR', '-rF', '-Fr', '-rfv', '-vrf', '-frv', '-rvf', '-fvr', '-vfr', '--recursive')
 DANGEROUS_COMMAND_ASK = tuple(p for flag in _RM_RECURSIVE for p in (f'rm {flag} *', f'rm * {flag} *', f'rm * {flag}')) + (
     'sudo *', '* sudo *', 'doas *', 'su', 'su *',
-    'git push*', 'git reset *--hard*', 'git clean *-*f*', 'git checkout -- *', 'git checkout * -- *', 'git checkout .',
+    *GIT_PUSH_ASK, 'git reset *--hard*', 'git clean *-*f*', 'git checkout -- *', 'git checkout * -- *', 'git checkout .',
     'git checkout -f*', 'git restore *', 'git rebase*', 'git commit*', 'git stash*', 'git branch -D*', 'git branch * -D*',
     'git * --force*', 'git * -f', 'git filter-branch*', 'git update-ref -d*',
     'chmod -R*', 'chmod * -R*', 'chown -R*', 'chown * -R*',
@@ -158,13 +167,14 @@ DANGEROUS_COMMAND_ASK = tuple(p for flag in _RM_RECURSIVE for p in (f'rm {flag} 
 # Wrappers run their argument as a command, so a dangerous command behind one would match only
 # the wrapper's prefix (allowed by `*` under permissive). Ask for the wrapped forms too, including
 # argv after `--` (check_receipt.py and similar runners) and find -exec/-ok.
-_WRAPPED_DANGEROUS = ('git push', 'git commit', 'git reset', 'git rebase', 'git clean', 'git checkout --', 'git restore',
+_WRAPPED_DANGEROUS = ('git commit', 'git reset', 'git rebase', 'git clean', 'git checkout --', 'git restore',
                       'git stash', 'git filter-branch', 'git update-ref', 'rm -r', 'rm -R', 'rm -f', 'rm --recursive', 'sudo', 'doas',
                       'kill', 'pkill', 'killall', 'dd', 'mkfs', 'shred', 'chmod -R', 'chown -R', 'sh', 'bash', 'zsh', 'dash', 'eval')
 _SHELL_WRAPPERS = ('env', 'xargs', 'timeout', 'nice', 'nohup', 'command', 'time', 'stdbuf', 'setsid', 'exec', 'builtin', 'flock', 'parallel')
 WRAPPED_COMMAND_ASK = tuple(dict.fromkeys(
     [f'{w} {f}{c}{t}' for w in _SHELL_WRAPPERS for c in _WRAPPED_DANGEROUS for f in ('', '* ') for t in ('', ' *')] +
     [f'* -- {c} *' for c in _WRAPPED_DANGEROUS] + [f'* -- {c}' for c in _WRAPPED_DANGEROUS] +
+    [f'{w} {f}{p}' for w in _SHELL_WRAPPERS for p in GIT_PUSH_ASK for f in ('', '* ')] + [f'* -- {p}' for p in GIT_PUSH_ASK] +
     ['find *-exec*', 'find *-ok*', 'find *-execdir*', 'find *-okdir*']))
 SECRET_SHELL_ASK = ('*.env*', '*auth.json*', '*.pem*', '*.key*', '*credentials*', '*secret*', '*financial-policy*', '*external-write-grants*')
 DANGEROUS_SHELL_ASK = DANGEROUS_COMMAND_ASK + WRAPPED_COMMAND_ASK + SECRET_SHELL_ASK
