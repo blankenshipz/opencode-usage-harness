@@ -11,13 +11,14 @@ const tmp = () => fs.mkdtemp(path.join(os.tmpdir(), 'check-rerun-'));
 
 test('reruns allowlisted argv checks for real and reports exit codes', async () => {
   const dir = await tmp();
-  const ok = await rerunChecks({ directory: dir, checks: [{ id: 'a', argv: ['node', '-e', 'process.exit(0)'] }] });
+  await fs.writeFile(path.join(dir, 'ok.js'), 'process.exit(0)'); await fs.writeFile(path.join(dir, 'bad.js'), 'process.exit(3)'); await fs.writeFile(path.join(dir, 'slow.js'), 'setTimeout(()=>{},5000)');
+  const ok = await rerunChecks({ directory: dir, checks: [{ id: 'a', argv: ['node', 'ok.js'] }] });
   assert.equal(ok.checksVerified, true);
   assert.equal(ok.checks[0].exitCode, 0);
-  const bad = await rerunChecks({ directory: dir, checks: [{ id: 'a', argv: ['node', '-e', 'process.exit(0)'] }, { id: 'b', argv: ['node', '-e', 'process.exit(3)'] }] });
+  const bad = await rerunChecks({ directory: dir, checks: [{ id: 'a', argv: ['node', 'ok.js'] }, { id: 'b', argv: ['node', 'bad.js'] }] });
   assert.equal(bad.checksVerified, false);
   assert.deepEqual(bad.checks.map(c => c.exitCode), [0, 3]);
-  const slow = await rerunChecks({ directory: dir, timeoutMs: 200, checks: [{ id: 's', argv: ['node', '-e', 'setTimeout(()=>{},5000)'] }] });
+  const slow = await rerunChecks({ directory: dir, timeoutMs: 200, checks: [{ id: 's', argv: ['node', 'slow.js'] }] });
   assert.equal(slow.checks[0].timedOut, true);
   assert.equal(slow.checksVerified, false);
 });
@@ -58,10 +59,25 @@ test('intent checks accept argv/cwd and reject bad ones', () => {
 test('sessionEndOutcome sets checksVerified only for succeeded sessions with verification', async () => {
   const record = { childID: 'c', parentID: 'p', taskId: 't', workKey: 'w', agent: 'a' };
   const receipt = { writtenAt: 0, generation: 1, outcome: 'succeeded' };
-  const verification = await verifySessionEnd({ record, directory: await tmp(), intent: { checks: [{ id: 'a', argv: ['node', '-e', '0'] }] } });
+  const vdir = await tmp(); await fs.writeFile(path.join(vdir, 'ok.js'), '');
+  const verification = await verifySessionEnd({ record, directory: vdir, intent: { checks: [{ id: 'a', argv: ['node', 'ok.js'] }] } });
   assert.equal(sessionEndOutcome({ record, receipt, verification }).checksVerified, true);
   assert.equal(sessionEndOutcome({ record, receipt, verification }).checks[0].id, 'a');
   assert.equal(sessionEndOutcome({ record, receipt }).checksVerified, false);
   assert.equal(sessionEndOutcome({ record, receipt: { ...receipt, outcome: 'failed' }, verification }).checksVerified, false);
   assert.equal(await verifySessionEnd({ record, directory: '/tmp', intent: { checks: [{ id: 'x' }] } }), undefined);
+});
+
+test('r26: inline code and package fetchers are never rerun', async () => {
+  const { rerunChecks } = await import('../plugins/v2/check-rerun.mjs');
+  const ran = [];
+  const run = async (file, args) => { ran.push([file, ...args]); return { exitCode: 0, timedOut: false }; };
+  const dir = process.cwd();
+  for (const argv of [['node', '-e', 'x'], ['python3', '-c', 'x'], ['npx', 'jest'], ['python3', '-m', 'http.server'], ['node', '--eval=x'], ['bash', '-c', 'x'], ['npm', 'exec', 'x'], ['deno', 'eval', 'x']]) {
+    const r = await rerunChecks({ checks: [{ id: 'c', argv }], directory: dir, run });
+    assert.equal(r.checksVerified, false, argv.join(' ')); assert.deepEqual(r.skipped, ['c']);
+  }
+  assert.equal(ran.length, 0);
+  const ok = await rerunChecks({ checks: [{ id: 't', argv: ['python3', '-m', 'pytest', '-q'] }, { id: 'n', argv: ['npm', 'test'] }], directory: dir, run });
+  assert.equal(ok.checksVerified, true);
 });

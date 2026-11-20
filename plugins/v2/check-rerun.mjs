@@ -5,7 +5,12 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-export const RUNNERS = new Set(['npm', 'npx', 'node', 'pnpm', 'yarn', 'bun', 'pytest', 'python', 'python3', 'go', 'cargo', 'make', 'tsc', 'ruff', 'uv', 'deno', 'bash']);
+// npx/uv/bunx can fetch and run arbitrary packages, so they are not runners.
+export const RUNNERS = new Set(['npm', 'node', 'pnpm', 'yarn', 'bun', 'pytest', 'python', 'python3', 'go', 'cargo', 'make', 'tsc', 'ruff', 'deno', 'bash']);
+// Inline code would let a declared "check" run arbitrary code outside the permission
+// system; only repo files, package scripts and test runners are rerun.
+const INLINE = new Set(['-e', '--eval', '-p', '--print', '-c', '--command', '-r', '--require', '--import', '--loader', '--experimental-loader', 'eval', 'x', 'dlx', 'exec']);
+const PY_MODULES = new Set(['pytest', 'unittest']);
 const SECRET_ENV = /^(ANTHROPIC_|OPENAI_|GH_|GITHUB_)|TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL/i;
 
 export function scrubEnv(env = process.env) {
@@ -24,6 +29,13 @@ async function resolveCwd(root, rel) {
 async function allowed(argv, root, cwd) {
   const runner = path.basename(argv[0]);
   if (argv[0] !== runner || !RUNNERS.has(runner)) return false; // bare runner names only, resolved via PATH
+  const args = argv.slice(1);
+  if (args.some(a => INLINE.has(a) || /^-(e|c|p|r)\S+/.test(a) && ['node', 'python', 'python3', 'deno', 'bun'].includes(runner) || /^--(eval|print|require|import|loader)=/.test(a))) return false;
+  if (['python', 'python3'].includes(runner)) {
+    const m = args.indexOf('-m');
+    if (m >= 0 && !PY_MODULES.has(args[m + 1])) return false;
+    if (m < 0) { const script = args.find(a => !a.startsWith('-')); if (!script || path.isAbsolute(script) || hasDotDot(script)) return false; }
+  }
   if (runner !== 'bash') return true;
   const script = argv[1];
   if (typeof script !== 'string' || !script || path.isAbsolute(script) || script.startsWith('-') || hasDotDot(script)) return false;

@@ -112,10 +112,16 @@ export async function installEnvCard(ctx, { cache = createEnvCardCache(), autoPe
   const stopAuto = await autoPermission(ctx);
   if (!directory) return { stop() { stopAuto?.stop?.(); } };
   const controller = new AbortController();
+  const pinned = new Map();
   if (ctx.session?.hook) await ctx.session.hook('context', async event => {
     if (!CARD_ROLES.has(canonicalHarnessRole(event?.agent)) || !Array.isArray(event.system)) return;
-    let text;
-    try { text = await cache.get(directory); } catch { return; }
+    // Pin the card per session: a later refresh (new root session) must not change an
+    // existing session's system prompt and force a full prompt-cache rewrite.
+    let text = pinned.get(event.sessionID);
+    if (text === undefined) {
+      try { text = await cache.get(directory); } catch { return; }
+      if (typeof event.sessionID === 'string') { if (pinned.size >= 2048) pinned.delete(pinned.keys().next().value); pinned.set(event.sessionID, text); }
+    }
     if (text && !event.system.some(p => p?.text === text)) event.system.push({ type: 'text', text });
   });
   if (typeof ctx.event?.subscribe === 'function') void (async () => {
