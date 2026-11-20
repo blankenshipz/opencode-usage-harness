@@ -99,16 +99,20 @@ test('asks pending under the previous plugin instance are re-checked on reload, 
   const before = harness(() => 'ask');
   const logs1 = [];
   const first = await installPermissionReevaluation(before.ctx, { setTimer: before.setTimer, clearTimer: () => {}, store, log: r => logs1.push(r) });
-  before.ask({ id: 'per_a', sessionID: 'ses_1', action: 'read', resources: ['/x/own.out'] });
-  before.ask({ id: 'per_b', sessionID: 'ses_1', action: 'shell', resources: ['rm -rf /tmp/y'] });
+  await before.toolHooks['execute.before']({ sessionID: 'ses_1', id: 'call_a', agent: 'verifier', tool: 'read' });
+  await before.toolHooks['execute.before']({ sessionID: 'ses_1', id: 'call_b', agent: 'builder', tool: 'bash' });
+  before.ask({ id: 'per_a', sessionID: 'ses_1', action: 'read', resources: ['/x/own.out'], source: { id: 'call_a' } });
+  before.ask({ id: 'per_b', sessionID: 'ses_1', action: 'shell', resources: ['rm -rf /tmp/y'], source: { id: 'call_b' } });
+  before.ask({ id: 'per_c', sessionID: 'ses_1', action: 'read', resources: ['/x/other.out'] });
   await tick(); await tick();
-  assert.deepEqual(store.load().map(([id]) => id).sort(), ['per_a', 'per_b']);
+  assert.deepEqual(store.load().map(([id]) => id).sort(), ['per_a', 'per_b', 'per_c']);
+  assert.deepEqual(store.load().find(([id]) => id === 'per_a')[2], { agent: 'verifier', tool: 'read' });
   first.stop();
-  assert.equal(store.load().length, 2, 'stop keeps the persisted asks for the next instance');
+  assert.equal(store.load().length, 3, 'stop keeps the persisted asks for the next instance');
 
   // New instance (deploy hot reload): the native asks still exist; new rules allow only per_a.
   const after = harness(input => input.action === 'read' ? 'allow' : 'ask');
-  for (const id of ['per_a', 'per_b']) after.pending.set(id, { id, sessionID: 'ses_1', action: id === 'per_a' ? 'read' : 'shell', resources: [] });
+  for (const id of ['per_a', 'per_b', 'per_c']) after.pending.set(id, { id, sessionID: 'ses_1', action: id === 'per_b' ? 'shell' : 'read', resources: [] });
   const logs = [];
   const second = await installPermissionReevaluation(after.ctx, { setTimer: after.setTimer, clearTimer: () => {}, store, log: r => logs.push(r) });
   assert.equal(after.timers.length, 2, 'a recheck is scheduled on install');
@@ -118,7 +122,9 @@ test('asks pending under the previous plugin instance are re-checked on reload, 
   assert.ok(after.pending.has('per_b'), 'the still-ask request stays answerable');
   assert.ok(logs.some(r => r.requestID === 'per_a' && r.outcome === 'approved_once' && r.trigger === 'reload'));
   assert.ok(logs.some(r => r.requestID === 'per_b' && r.outcome === 'still_pending'));
-  assert.deepEqual(store.load().map(([id]) => id), ['per_b']);
+  assert.ok(logs.some(r => r.requestID === 'per_c' && r.why === 'agent_unknown'), 'no agent: not probed under broader rules');
+  assert.equal(after.probes.find(p => p.metadata?.[markers.PROBE_MARKER] && p.agent === 'verifier')?.metadata.harnessProbeTool, 'read');
+  assert.deepEqual(store.load().map(([id]) => id).sort(), ['per_b', 'per_c']);
   second.stop();
   fs.rmSync(root, { recursive: true, force: true });
 });

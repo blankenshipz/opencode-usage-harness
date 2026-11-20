@@ -3,9 +3,11 @@
 // Downgrades native external_directory / read asks to allow when every resource lies in:
 //   - the session's own shell-output directory, <data>/opencode/shell/<location.project.id>/
 //     (OpenCode core/src/shell.ts writes sh_*.out there; other projects' outputs may hold
-//     secrets, so only the location's own project id qualifies), for any read-only tool; or
-//   - /usr (system files), only for calls of the read-only tools read/glob/grep/list, so an
-//     edit or write that passes the directory gate still hits its own edit ask.
+//     secrets, so only the location's own project id qualifies; never the shared `global` id); or
+//   - /usr (system files).
+// Both only for read actions or calls of the read-only tools read/glob/grep/list, so an edit,
+// write or shell call never passes the directory gate this way. On a reevaluation probe the
+// tool comes from the probe metadata (persisted with the pending ask).
 // Never touches deny or guard-forced asks; secret-looking paths stay asked. Reevaluation probes
 // are evaluated too, so asks raised before a deploy can be approved (never denied) by it.
 import os from 'node:os';
@@ -13,6 +15,7 @@ import path from 'node:path';
 import { isSecretPath, markers } from './shell-guard.mjs';
 import { realish } from './full-auto.mjs';
 
+export const PROBE_TOOL = 'harnessProbeTool';
 export const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list']);
 const SYSTEM_READ_ROOTS = ['/usr'];
 
@@ -22,7 +25,8 @@ export function opencodeDataDir(env = process.env) {
 }
 
 export function shellOutputDir(projectID, env = process.env) {
-  if (typeof projectID !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(projectID)) return undefined;
+  // `global` is shared by every non-git directory, so it is never "own" output.
+  if (typeof projectID !== 'string' || projectID === 'global' || !/^[A-Za-z0-9_-]{1,128}$/.test(projectID)) return undefined;
   return path.join(opencodeDataDir(env), 'shell', projectID);
 }
 
@@ -34,15 +38,19 @@ export function readScopeAllows(resources, { action, tool, projectID, env = proc
   if (action !== 'external_directory' && action !== 'read') return false;
   if (!Array.isArray(resources) || !resources.length) return false;
   const own = shellOutputDir(projectID, env);
-  const readOnly = READ_ONLY_TOOLS.has(tool);
+  // A plain read action is read-only by itself; the directory gate also fronts edit/write/bash.
+  const readOnly = action === 'read' || READ_ONLY_TOOLS.has(tool);
+  if (!readOnly) return false;
   return resources.every(resource => {
     if (typeof resource !== 'string' || !path.isAbsolute(resource)) return false;
     const target = resource.replace(/\/\*\*?$/, '');
     if (/[*?[\]{}]/.test(target) || target.split('/').includes('..')) return false;
     const lexical = path.resolve(target), real = realish(lexical, realpath ? { realpath } : undefined);
-    if (lexical.split('/').some(part => part && isSecretPath(part))) return false;
+    for (const candidate of [lexical, real]) {
+      if (isSecretPath(candidate) || isSecretPath(candidate + '/x') || candidate.split('/').some(part => part && isSecretPath(part))) return false;
+    }
     if (own && contains(own, lexical) && contains(realish(own, realpath ? { realpath } : undefined), real)) return true;
-    return readOnly && SYSTEM_READ_ROOTS.some(root => contains(root, lexical) && contains(root, real));
+    return SYSTEM_READ_ROOTS.some(root => contains(root, lexical) && contains(root, real));
   });
 }
 
@@ -61,7 +69,8 @@ export async function installReadScope(ctx, { env = process.env } = {}) {
   await permission.hook('evaluate', event => {
     // Guard-forced asks stay with a human. Reevaluation probes may pass (r20 item 3: approve-only).
     if (event?.effect !== 'ask' || event.metadata?.[markers.GUARD_MARKER]) return;
-    const tool = event.source?.id ? callTools.get(`${event.sessionID}\0${event.source.id}`) : undefined;
+    const tool = event.source?.id ? callTools.get(`${event.sessionID}\0${event.source.id}`)
+      : event.metadata?.[markers.PROBE_MARKER] ? event.metadata?.[PROBE_TOOL] : undefined;
     if (readScopeAllows(event.resources, { action: event.action, tool, projectID: ctx.location?.project?.id, env })) event.effect = 'allow';
   });
   return { stop() { callTools.clear(); } };

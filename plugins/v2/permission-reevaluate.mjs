@@ -12,6 +12,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { statePath } from './paths.mjs';
+import { PROBE_TOOL } from './read-scope.mjs';
 
 // r20 items 2/3: the pending map is persisted per location, so a plugin hot reload (deploy) can
 // re-check asks raised under the previous release. Decisions are approve-only and logged.
@@ -22,14 +23,16 @@ export function pendingStore(directory, { root = statePath('permission-pending')
     load() {
       try {
         const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-        return Object.entries(data?.pending ?? {}).filter(([id, sid]) => typeof id === 'string' && typeof sid === 'string');
+        const meta = data?.meta && typeof data.meta === 'object' ? data.meta : {};
+        return Object.entries(data?.pending ?? {}).filter(([id, sid]) => typeof id === 'string' && typeof sid === 'string')
+          .map(([id, sid]) => [id, sid, meta[id] && typeof meta[id] === 'object' ? meta[id] : {}]);
       } catch { return []; }
     },
-    save(map) {
+    save(map, meta = new Map()) {
       try {
         fs.mkdirSync(root, { recursive: true, mode: 0o700 });
         const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
-        fs.writeFileSync(temporary, JSON.stringify({ pending: Object.fromEntries(map) }), { mode: 0o600 });
+        fs.writeFileSync(temporary, JSON.stringify({ pending: Object.fromEntries(map), meta: Object.fromEntries([...meta].filter(([id]) => map.has(id))) }), { mode: 0o600 });
         fs.renameSync(temporary, file);
       } catch { /* best effort */ }
     },
@@ -60,8 +63,12 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
       event.message = 'harness permission probe: still requires approval';
     }
   });
-  const pending = new Map(store?.load?.() ?? []); // requestID -> sessionID
-  const persist = () => store?.save?.(pending);
+  const loaded = store?.load?.() ?? [];
+  const pending = new Map(loaded.map(([id, sid]) => [id, sid])); // requestID -> sessionID
+  // requestID -> {agent, tool} of the asking call, so a probe after reload uses the asking agent's rules.
+  const askMeta = new Map(loaded.map(([id, , meta]) => [id, { agent: typeof meta?.agent === 'string' ? meta.agent : undefined, tool: typeof meta?.tool === 'string' ? meta.tool : undefined }]));
+  const reloaded = new Set(loaded.map(([id]) => id)); // raised under the previous plugin instance
+  const persist = () => { for (const id of askMeta.keys()) if (!pending.has(id)) askMeta.delete(id); store?.save?.(pending, askMeta); };
   let trigger = pending.size ? 'reload' : 'config';
   const callAgents = new Map(); // `${sessionID}\0${callID}` -> agent
   const controller = new AbortController();
@@ -71,7 +78,7 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
     await ctx.tool.hook('execute.before', event => {
       if (!event?.sessionID || !event?.id || !event?.agent) return;
       if (callAgents.size >= 4096) callAgents.delete(callAgents.keys().next().value);
-      callAgents.set(`${event.sessionID}\0${event.id}`, event.agent);
+      callAgents.set(`${event.sessionID}\0${event.id}`, { agent: event.agent, tool: typeof event.tool === 'string' ? event.tool : undefined });
     });
     await ctx.tool.hook('execute.after', event => { callAgents.delete(`${event?.sessionID}\0${event?.id}`); });
   }
@@ -87,11 +94,17 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
       persist();
       for (const request of requests) {
         if (!request?.id || request.metadata?.[markers.GUARD_MARKER]) continue;
-        const agent = request.source?.id ? callAgents.get(`${sessionID}\0${request.source.id}`) : undefined;
+        const call = (request.source?.id ? callAgents.get(`${sessionID}\0${request.source.id}`) : undefined) ?? askMeta.get(request.id);
+        const agent = call?.agent, tool = call?.tool;
+        // Without the asking agent a probe could use a broader ruleset: leave it with a human.
+        if (!agent && reloaded.has(request.id)) {
+          log({ at: new Date(now()).toISOString(), trigger, sessionID, requestID: request.id, action: request.action, outcome: 'still_pending', why: 'agent_unknown' });
+          continue;
+        }
         try {
           await permission.assert({
             sessionID, ...(agent ? { agent } : {}), action: request.action, resources: request.resources,
-            metadata: { ...(request.metadata ?? {}), [markers.PROBE_MARKER]: true },
+            metadata: { ...(request.metadata ?? {}), [markers.PROBE_MARKER]: true, ...(tool ? { [PROBE_TOOL]: tool } : {}) },
           });
         } catch {
           // still ask, denied, or agent registry not reloaded yet: never auto-deny, leave it to a human
@@ -124,7 +137,12 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
     try {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         const data = event?.data ?? {};
-        if (event?.type === 'permission.asked' && data.id && data.sessionID) { pending.set(data.id, data.sessionID); persist(); }
+        if (event?.type === 'permission.asked' && data.id && data.sessionID) {
+          pending.set(data.id, data.sessionID);
+          const call = data.source?.id ? callAgents.get(`${data.sessionID}\0${data.source.id}`) : undefined;
+          askMeta.set(data.id, { agent: call?.agent, tool: call?.tool });
+          persist();
+        }
         else if (event?.type === 'permission.replied') { if (pending.delete(data.requestID)) persist(); }
         else if (event?.type === 'config.updated' || event?.type === 'agent.updated') { trigger = 'config'; schedule(); }
       }
