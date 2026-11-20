@@ -22,3 +22,11 @@ test('sampler reads on a timer, feeds pace, and swallows failures', async () => 
   fn(); await new Promise(r => setImmediate(r)); assert.equal(n, 3); assert.equal(seen.length, 2); s.stop();
   assert.deepEqual(sampleQuota({}), { openai: 'unknown' });
 });
+
+test('throttle counts in-flight admissions, excludes the caller chain and parked children', () => {
+  const sessions = [{ id: 'a', active: true }, { id: 'b', active: true, parentID: 'a' }];
+  const base = { pace: 'ahead', newChild: true, rootID: 'root', sessions };
+  assert.ok(dispatchThrottle({ ...base, records: [{ rootID: 'root', childID: 'a' }, { rootID: 'root', key: 'k2', inFlight: 't', state: 'starting' }] }));
+  assert.equal(dispatchThrottle({ ...base, callerID: 'b', records: [{ rootID: 'root', childID: 'a' }, { rootID: 'root', childID: 'b' }] }), undefined);
+  assert.equal(dispatchThrottle({ ...base, records: [{ rootID: 'root', childID: 'a' }, { rootID: 'root', childID: 'b', admissionGeneration: 2, parked: { generation: 2 } }] }), undefined);
+});

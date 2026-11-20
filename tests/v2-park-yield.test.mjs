@@ -37,3 +37,14 @@ test('install tracks asked/replied events and the parked result is never a pass'
   const r = parkedResult({ parked: { requestID: 'per_1', sessionID: 'c', action: 'bash', pendingMs: PARK_AFTER_MS }, identity: { sessionID: 'c', agent: 'verifier', generation: 1 }, collect: {} });
   assert.equal(r.metadata.status, 'blocked'); assert.equal(r.metadata.verdict, 'blocked'); assert.match(r.content, /NOT a pass/); assert.match(r.content, /not denied/);
 });
+
+test('an ask answered while match() awaits never releases; session end forgets asks; tick is not reentrant', async () => {
+  let at = 0, unblock; const m = createParkMonitor({ now: () => at });
+  m.asked({ id: 'per_a', sessionID: 's', since: 0 });
+  const w = m.whenParked(async () => { await new Promise(r => { unblock = r; }); return true; });
+  at = PARK_AFTER_MS; const first = m.tick(); await new Promise(r => setImmediate(r));
+  assert.deepEqual(await m.tick(), [], 'reentrant tick is skipped');
+  m.replied('per_a'); unblock(); await first;
+  let done = false; w.promise.then(() => { done = true; }); await new Promise(r => setImmediate(r)); assert.equal(done, false); w.cancel();
+  m.asked({ id: 'per_b', sessionID: 'gone', since: 0 }); m.forgetSession('gone'); assert.equal(m.pending().length, 0);
+});

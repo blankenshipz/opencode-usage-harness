@@ -13,9 +13,16 @@ import { quotaPace } from './dispatch-routing.mjs';
 export const QUOTA_SAMPLE_MS = 10 * 60_000;
 export const THROTTLE_MAX_ACTIVE = 2;
 
-export function dispatchThrottle({ pace, newChild, compact = false, review = false, rootID, records, sessions, maxActive = THROTTLE_MAX_ACTIVE }) {
+// Counts same-root children that are active natively or still being admitted (inFlight, possibly
+// without a childID yet). Excludes the caller and its own ancestors, and parked children.
+export function dispatchThrottle({ pace, newChild, compact = false, review = false, rootID, records, sessions, callerID, maxActive = THROTTLE_MAX_ACTIVE }) {
   if (pace !== 'ahead' || !newChild || compact || review) return undefined;
-  const active = (records ?? []).filter(r => r?.rootID === rootID && r.childID && sessions?.some(s => s.id === r.childID && s.active)).map(r => r.childID);
+  const byID = new Map((sessions ?? []).map(s => [s.id, s]));
+  const ancestors = new Set();
+  for (let s = byID.get(callerID), guard = 0; s && guard < 64; s = byID.get(s.parentID), guard++) ancestors.add(s.id);
+  const active = (records ?? []).filter(r => r?.rootID === rootID && !(r.childID && ancestors.has(r.childID)) &&
+    !(r.parked && r.parked.generation === r.admissionGeneration) &&
+    ((r.childID && byID.get(r.childID)?.active) || (r.inFlight && ['starting', 'running'].includes(r.state ?? 'starting')))).map(r => r.childID ?? r.key);
   if (active.length < maxActive) return undefined;
   return { reason: 'quota_pace_ahead', active, maxActive,
     message: `task-dispatch: QUOTA_PACE_THROTTLED: provider quota pace is ahead of the sustainable rate; ${active.length} children of this root are active (limit ${maxActive} while ahead). No child was launched. Wait for an active child to finish (or continue an existing child) before starting new work; this is pacing, not a permission denial.` };

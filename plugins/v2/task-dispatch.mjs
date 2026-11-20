@@ -423,7 +423,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     canonicalWorkspace:()=>canonicalWriterPath(workspace), loadSessions, loadTerminalReceipt, now });
   // Every admitted generation's result must reach its parent even when the
   // handoff call is aborted or its returned result is not recorded.
-  const resultDelivery = createResultDelivery({ registry, workspace, ctx, loadEvidence:loadDeliveryEvidence, loadFinalText, now, ...(appendOutcome ? { appendOutcome } : {}),
+  const resultDelivery = createResultDelivery({ registry, workspace, ctx, loadEvidence:loadDeliveryEvidence, loadFinalText, now, loadSessions, ...(appendOutcome ? { appendOutcome } : {}),
     onTerminalFailure:(key,generation)=>reconciler.settleGeneration(key,generation),
     ...(deliverySchedule ? { schedule:deliverySchedule } : {}) });
   try { await reconciler.reconcile(); } catch { /* never block plugin start; the next start retries */ }
@@ -852,7 +852,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         if (routedInput.routing?.reviewProvenance) routing.reviewProvenance=routedInput.routing.reviewProvenance;
         if (routedInput.routing?.reviewIndependence) routing.reviewIndependence=routedInput.routing.reviewIndependence;
         // r20 item 4: while quota pace is ahead, cap concurrently active new children per root.
-        const throttled=dispatchThrottle({pace:routing.pace,newChild:!requested,compact:!!input.compact,review:routedInput.routing?.reviewIndependence==='required',rootID,records:state.records,sessions});
+        const throttled=dispatchThrottle({pace:routing.pace,newChild:!requested,compact:!!input.compact,review:routedInput.routing?.reviewIndependence==='required',rootID,records:state.records.filter(r=>r.key!==key),sessions,callerID:context.sessionID});
         if (throttled) throw Object.assign(new Error(throttled.message),{code:'QUOTA_PACE_THROTTLED'});
         let retainedCompactionEvidence;
         if (input.compact) {
@@ -993,11 +993,21 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         if (raced.parked) {
           const identity={taskId:input.taskId,workKey:input.workKey,sessionID:observed,agent:input.agent,generation:admission.generation};
           // The child keeps running; record its eventual outcome in the background like a normal return.
+          // The parent's tool call already returned BLOCKED, so the later result reaches it through the
+          // tracked fallback delivery (toolReturned:false, parked:true) rather than this call.
+          if (pendingDelivery) pendingDelivery={...pendingDelivery,toolReturned:false,returnedAt:now(),parked:true};
+          await update({parked:{generation:admission.generation,...raced.parked,at:now()},...(pendingDelivery?{resultDelivery:pendingDelivery}:{})}).catch(() => {});
           void execution.then(async later => {
+            const lateDenied=admissionDenial(later);
+            if (lateDenied) { await update({state:'denied',denial:receipt(lateDenied,input),inFlight:null,...(admission.restoreBinding ?? {})}); return; }
+            const laterID=later?.metadata?.sessionID ?? later?.output?.sessionID ?? observed;
             const laterStatus=nativeStatus(later), report=laterStatus==='running'?undefined:boundedReport(nativeReport(later));
-            await update({state:later?.metadata?.status ?? later?.output?.status ?? 'completed',inFlight:null,...(report?{foregroundResult:{generation:admission.generation,sessionID:observed,status:laterStatus,output:report.text,truncated:report.truncated,length:report.length,completedAt:now()}}:{})});
-          }, async () => { await update({state:'paused',inFlight:null}).catch(() => {}); }).catch(() => {});
-          await update({parked:{generation:admission.generation,...raced.parked,at:now()}}).catch(() => {});
+            await update({childID:laterID,state:later?.metadata?.status ?? later?.output?.status ?? 'completed',denial:undefined,deliveredIntentRevision:admission.intent?.revision,deliveredCheckIds:admission.intent?input.checkIds:undefined,inFlight:null,
+              ...(report?{foregroundResult:{generation:admission.generation,sessionID:laterID,status:laterStatus,output:report.text,truncated:report.truncated,length:report.length,completedAt:now()}}:{})},true);
+          }, async error => {
+            const lateDenied=admissionDenial(error);
+            await update(lateDenied?{state:'denied',denial:receipt(lateDenied,input),inFlight:null,...(admission.restoreBinding ?? {})}:{state:'paused',inFlight:null});
+          }).catch(() => {});
           return parkedResult({ parked: raced.parked, identity, collect: collectArguments(identity) });
         }
         const result = raced.value;

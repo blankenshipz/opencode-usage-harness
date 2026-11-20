@@ -26,12 +26,14 @@ export function parkLogger({ file = statePath('telemetry', 'permission-park.json
 export function createParkMonitor({ now = Date.now, notifyAfter = NOTIFY_AFTER_MS, parkAfter = PARK_AFTER_MS, log = () => {} } = {}) {
   const asks = new Map(); // requestID -> {sessionID, since, action, stalled, parked}
   const waiters = new Set();
+  let ticking = false;
   const parkedRecord = (id, ask) => ({ requestID: id, sessionID: ask.sessionID, action: ask.action, pendingMs: now() - ask.since });
   const offer = async record => {
     for (const waiter of [...waiters]) {
       let match = false;
       try { match = await waiter.match(record.sessionID); } catch { match = false; }
-      if (match && waiters.delete(waiter)) waiter.resolve(record);
+      // An ask answered while match() was awaiting is no longer parked: never release on it.
+      if (match && asks.get(record.requestID)?.parked && waiters.delete(waiter)) waiter.resolve(record);
     }
   };
   return {
@@ -42,7 +44,13 @@ export function createParkMonitor({ now = Date.now, notifyAfter = NOTIFY_AFTER_M
     },
     replied(id) { asks.delete(id); },
     pending() { return [...asks].map(([id, ask]) => ({ requestID: id, ...ask })); },
+    forgetSession(sessionID) { for (const [id, ask] of asks) if (ask.sessionID === sessionID) asks.delete(id); },
     async tick() {
+      if (ticking) return [];
+      ticking = true;
+      try { return await this.tickOnce(); } finally { ticking = false; }
+    },
+    async tickOnce() {
       const at = now(), events = [];
       for (const [id, ask] of asks) {
         const age = at - ask.since;
@@ -83,6 +91,8 @@ export function installParkYield(ctx, { monitor = parkMonitor, tickMs = PARK_TIC
         const data = event?.data ?? {};
         if (event?.type === 'permission.asked' && data.id && data.sessionID) monitor.asked({ id: data.id, sessionID: data.sessionID, action: data.action });
         else if (event?.type === 'permission.replied') monitor.replied(data.requestID ?? data.id);
+        // An aborted or deleted session's asks can no longer be answered; never park on them.
+        else if (['session.deleted', 'session.execution.interrupted'].includes(event?.type) && (data.sessionID ?? data.id)) monitor.forgetSession(data.sessionID ?? data.id);
       }
     } catch { /* subscription closed */ }
   })();

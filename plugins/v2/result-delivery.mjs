@@ -63,7 +63,9 @@ export function deliveryDecision({ delivery, evidence, now, graceMs = RESULT_DEL
   if (delivery.mode === 'foreground' && delivery.toolReturned && !evidence.tool) return { action:'final', status:'confirmed', via:'tool_result_unverified' };
   const settledAt = Math.max(terminal.completedAt ?? 0, delivery.returnedAt ?? 0);
   if (now - settledAt < graceMs) return { action:'wait' };
-  const reason = !delivery.toolReturned
+  const reason = delivery.parked
+    ? 'the handoff returned BLOCKED after a parked permission ask (park and yield); this is the child\'s later result for that generation'
+    : !delivery.toolReturned
     ? 'the handoff tool call was aborted or interrupted before it returned the result'
     : delivery.mode === 'foreground'
       ? `the returned tool result was not recorded; the tool part is ${evidence.tool?.status ?? 'missing'}${evidence.tool?.errorType ? ` (${evidence.tool.errorType})` : ''}`
@@ -75,7 +77,7 @@ export function deliveryDecision({ delivery, evidence, now, graceMs = RESULT_DEL
 
 export function createResultDelivery({ registry, workspace, ctx, loadEvidence, loadFinalText, onTerminalFailure, now = Date.now,
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; }, cancel = clearTimeout,
-  graceMs = RESULT_DELIVERY_GRACE_MS, maxAgeMs = RESULT_DELIVERY_MAX_AGE_MS, wakeHoldMs = ROUTER_WAKE_HOLD_MS, appendOutcome = defaultAppendOutcome }) {
+  graceMs = RESULT_DELIVERY_GRACE_MS, maxAgeMs = RESULT_DELIVERY_MAX_AGE_MS, wakeHoldMs = ROUTER_WAKE_HOLD_MS, loadSessions, appendOutcome = defaultAppendOutcome }) {
   const timers = new Map(), running = new Map();
   let disposed = false;
   const finish = async (key, generation, patch, extra, terminal) => {
@@ -118,7 +120,8 @@ export function createResultDelivery({ registry, workspace, ctx, loadEvidence, l
     // r20 item 8: while sibling background children still run, hold a waking delivery (bounded) so the parent wakes once.
     if (decision.resume && delivery.mode === 'background') {
       const settledAt = Math.max(terminal.completedAt ?? 0, delivery.returnedAt ?? 0) || delivery.since;
-      const held = await registry(workspace, async state => holdWake({ records:state.records, key, parentID:delivery.parentID, settledAt, now:now(), holdMs:wakeHoldMs }));
+      const sessions = typeof loadSessions === 'function' ? await loadSessions().catch(() => undefined) : undefined;
+      const held = sessions && await registry(workspace, async state => holdWake({ records:state.records, key, parentID:delivery.parentID, settledAt, now:now(), sessions, holdMs:wakeHoldMs }));
       if (held) return 'pending';
     }
     let report = '', truncated = false, length = 0;

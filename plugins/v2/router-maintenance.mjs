@@ -18,10 +18,14 @@ export function routerCompactionTokens(env = process.env) {
   return value ?? ROUTER_COMPACTION_TOKENS;
 }
 
-export function holdWake({ records, key, parentID, settledAt, now, holdMs = ROUTER_WAKE_HOLD_MS }) {
-  if (!(holdMs > 0) || !Number.isFinite(settledAt) || now - settledAt >= holdMs) return false;
+// A sibling counts as running only while its native child session is active (a finished
+// background child keeps state 'running' until collected, so the record state alone would
+// make finished siblings hold each other). Without native session evidence nothing is held.
+export function holdWake({ records, key, parentID, settledAt, now, sessions, holdMs = ROUTER_WAKE_HOLD_MS }) {
+  if (!(holdMs > 0) || !Number.isFinite(settledAt) || now - settledAt >= holdMs || !Array.isArray(sessions)) return false;
+  const active = new Set(sessions.filter(s => s?.active).map(s => s.id));
   return (records ?? []).some(r => r?.key !== key && r?.parentID === parentID && ['running', 'starting'].includes(r?.state) &&
-    r?.resultDelivery?.mode === 'background' && r?.resultDelivery?.status === 'pending');
+    r?.resultDelivery?.mode === 'background' && r?.resultDelivery?.status === 'pending' && active.has(r.childID));
 }
 
 export function routerCompactionDue(session, { threshold = routerCompactionTokens(), lastMessageID } = {}) {

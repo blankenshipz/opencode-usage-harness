@@ -1289,9 +1289,9 @@ test('park and yield: a foreground child parked on an ask returns blocked to the
  const result = await h.call(base);
  assert.equal(result.metadata.status, 'blocked'); assert.match(result.content, /BLOCKED/); assert.match(result.content, /NOT a pass/);
  assert.equal(result.metadata.parked.requestID, 'per_x');
- await h.registry('/project', async state => { const r = state.records.find(r => r.childID === 'ses_parked'); assert.equal(r.parked.requestID, 'per_x'); assert.notEqual(r.state, 'completed'); });
+ await h.registry('/project', async state => { const r = state.records.find(r => r.childID === 'ses_parked'); assert.equal(r.parked.requestID, 'per_x'); assert.notEqual(r.state, 'completed'); assert.equal(r.resultDelivery.parked, true); assert.equal(r.resultDelivery.toolReturned, false); });
  release(); await new Promise(r => setTimeout(r, 50));
- await h.registry('/project', async state => { const r = state.records.find(r => r.childID === 'ses_parked'); assert.equal(r.state, 'completed'); assert.equal(r.foregroundResult.output, 'LATE'); });
+ await h.registry('/project', async state => { const r = state.records.find(r => r.childID === 'ses_parked'); assert.equal(r.state, 'completed'); assert.equal(r.foregroundResult.output, 'LATE'); assert.equal(r.inFlight, null); assert.equal(r.deliveredIntentRevision, 1); });
 });
 test('quota pace ahead throttles a third concurrently active new child but not continuations', async t => {
  const now = new Date().toISOString();
