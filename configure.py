@@ -86,8 +86,7 @@ CANCEL_GUIDANCE = ("\nTo stop a child you dispatched (e.g. after a rule change),
 
 NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','deep-debugger','deep-debugger-high','architect','reviewer','verifier','maximum','maximum-max')
 ROLES = {
-    # Dispatch/polling only: Sonnet-tier. Deep work stays on STRONG roles.
-    'router': ('BALANCED', True, True),
+    'router': ('STRONG', True, True),
     'coordinator': ('BALANCED', True, True),
     'scout': ('FAST', False, True),
     'quick-builder': ('FAST', False, False),

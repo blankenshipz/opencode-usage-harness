@@ -43,12 +43,14 @@ class ConfigureTests(unittest.TestCase):
         self.assertIn(('subagent', 'builder'), router_children)
         self.assertIn(('subagent', 'harness-builder'), router_children)
 
-    def test_router_dispatches_on_balanced_and_deep_roles_stay_strong(self):
+    def test_router_and_deep_roles_on_strong_quick_builder_on_fast(self):
         tiers=('FAST','BALANCED','STRONG','MAXIMUM')
         p=profile({k:f'anthropic/{k.lower()}#medium' for k in tiers})
         a=p['agents']
-        for role in ('router','harness-router','coordinator','builder'):
+        for role in ('coordinator','builder'):
             self.assertEqual(a[role]['model'], 'anthropic/balanced#medium', role)
+        for role in ('router','harness-router'):
+            self.assertEqual(a[role]['model'], 'anthropic/strong#medium', role)
         for role in ('deep-debugger','verifier','reviewer','architect'):
             self.assertEqual(a[f'harness-{role}']['model'], 'anthropic/strong#medium', role)
         self.assertEqual(a['harness-quick-builder']['model'], 'anthropic/fast#medium')

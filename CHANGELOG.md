@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — router back on Opus
+
+- `harness-router` returns to the strong tier (Opus), reverting only the router model change from 064ae04. The Haiku quick-builder routing (prompt guidance and the `routine_mechanical` dispatch path), timed-reminder cache fix, full-auto and agent commit identity are unchanged. Takes effect after `configure.py --replace`.
+
 ## Unreleased — router on Sonnet, Haiku quick-builder for mechanical work, agent commit identity
 
 - `harness-router` uses the balanced tier (Sonnet) instead of strong (Opus); deep-debugger, verifier, reviewer and architect stay strong. Router/coordinator prompts name `harness-quick-builder` for routine, normal-risk mechanical edits.
