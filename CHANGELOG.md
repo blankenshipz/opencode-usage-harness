@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — byte-stable system prompt
+
+- Live cache-drift telemetry (2026-11-19): all 18 `drift_observed` rows were `system` drift, in add/remove pairs. The root-progress (router/coordinator) and work-checkpoint (children) reminders were pushed onto `event.system` when due and dropped a turn later, so each one rewrote the whole cached history twice (50–270k tokens).
+- These timed reminders now go in a system-role update appended after the last message (`appendTailUpdate`), as native Plan-mode reminders do. The system block stays byte-stable. The mid-run continuation stays in system: it changes only at a completed compaction, where history is rewritten anyway.
+- New test: generating the profile twice (and in another state dir) gives byte-identical agent prompts with no timestamps or state paths.
+- Remaining between-session drift is per deploy (agent prompt edits, the native CodeMode tool catalog) or per workspace (native environment/date blocks).
+
 ## Unreleased — compression coverage
 
 - Live telemetry (2026-11-19): 0 of 1,252 candidates compressed, 57% `protected_tool`, 37% `below_minimum`. The protected bucket was almost entirely `read`/`edit`/`write`.

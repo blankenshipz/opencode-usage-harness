@@ -557,14 +557,15 @@ test('sustained work defaults to native background and retains ownership on dupl
 
 test('context checkpoint is cooperative, durable and excludes unrelated or legacy owners', async t => {
  const h=await harness(t);const id=(await h.call({...base,background:true})).metadata.sessionID;
- const context=()=>({sessionID:id,system:[]});
- for(let n=0;n<29;n++){const e=context();await h.hooks.get('context')(e);assert.equal(e.system.length,0);}
- const e=context();await h.hooks.get('context')(e);assert.match(e.system[0].text,/Progress checkpoint due/);
+ const context=()=>({sessionID:id,system:[],messages:[{role:'user',content:[{type:'text',text:'go'}]}]});
+ for(let n=0;n<29;n++){const e=context();await h.hooks.get('context')(e);assert.equal(e.system.length,0);assert.equal(e.messages.length,1);}
+ const e=context();await h.hooks.get('context')(e);assert.deepEqual(e.system,[]);
+ assert.equal(e.messages.at(-1).role,'system');assert.match(e.messages.at(-1).content[0].text,/Progress checkpoint due/);
  assert.equal(h.calls.length,1);assert.equal(h.sessions.find(s=>s.id===id).active,true);
- const unrelated={sessionID:'root',system:[]};await h.hooks.get('context')(unrelated);assert.deepEqual(unrelated.system,[]);
+ const unrelated={sessionID:'root',system:[],messages:[]};await h.hooks.get('context')(unrelated);assert.deepEqual([unrelated.system,unrelated.messages],[[],[]]);
  const status=JSON.parse((await h.call({taskId:'release'},'task_dispatch_status')).content);
  assert.equal(status.owners[0].workCheckpoint.due,true);assert.equal(status.owners[0].workCheckpoint.preparedSteps,30);
- await h.call({...base,background:true,sessionID:id});const resumed=context();await h.hooks.get('context')(resumed);assert.deepEqual(resumed.system,[]);
+ await h.call({...base,background:true,sessionID:id});const resumed=context();await h.hooks.get('context')(resumed);assert.deepEqual(resumed.system,[]);assert.equal(resumed.messages.length,1);
 });
 
 test('accepted outcomes record durable semantic evidence; rejected outcomes do not', async t => {
@@ -770,12 +771,13 @@ test('root progress advice uses native visible text and never changes execution 
  const at=2*ROOT_PROGRESS_MS;const h=await harness(t,undefined,undefined,{now:()=>at});
  Object.assign(h.sessions[0],{executionStartedAt:1,lastVisibleTextAt:1});
  let before;await h.registry('/project',async state=>{before=JSON.stringify(state);});
- const event={sessionID:'root',agent:'router',system:[],tools:{}};
- await h.hooks.get('context')(event);assert.equal(event.system.filter(p=>p.text===rootProgressReminder).length,1);
- await h.hooks.get('context')(event);assert.equal(event.system.length,1);
+ const event={sessionID:'root',agent:'router',system:[],messages:[],tools:{}};
+ await h.hooks.get('context')(event);assert.deepEqual(event.system,[]);
+ assert.deepEqual(event.messages,[{role:'system',content:[{type:'text',text:rootProgressReminder}]}]);
+ await h.hooks.get('context')(event);assert.equal(event.messages.length,1);
  h.sessions[0].lastVisibleTextAt=at-100;
- const recent={sessionID:'root',agent:'router',system:[],tools:{}};await h.hooks.get('context')(recent);assert.deepEqual(recent.system,[]);
- const native={sessionID:'root',agent:'build',system:[],tools:{}};await h.hooks.get('context')(native);assert.deepEqual(native.system,[]);
+ const recent={sessionID:'root',agent:'router',system:[],messages:[],tools:{}};await h.hooks.get('context')(recent);assert.deepEqual([recent.system,recent.messages],[[],[]]);
+ const native={sessionID:'root',agent:'build',system:[],messages:[],tools:{}};await h.hooks.get('context')(native);assert.deepEqual([native.system,native.messages],[[],[]]);
  await h.registry('/project',async state=>assert.equal(JSON.stringify(state),before));assert.equal(h.calls.length,0);
 });
 test('background collection rejects foreign parent, active descendants, and legacy bindings',async t=>{

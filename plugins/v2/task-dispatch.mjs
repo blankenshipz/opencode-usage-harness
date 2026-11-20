@@ -29,6 +29,21 @@ import { createResultDelivery } from './result-delivery.mjs';
 import { createStaleReconciler } from './dispatch-reconcile.mjs';
 import { midRunCompactionEnabled, midRunCompactionDecision, settleMidRunCompaction, admitMidRunCompaction, recordAdmitted, recordAdmissionFailure, recordBaseline, buildContinuation, activeContinuation, midRunCompactionStatus, pendingCompactionPreservation, BRIEF_LIMIT } from './mid-run-compaction.mjs';
 
+// Append volatile per-request text after the last message so the system block
+// and earlier history stay byte-stable. Reuses the runtime's message class when
+// one is present (plain objects are accepted by the request lowering too).
+export function appendTailUpdate(event, text) {
+  if (!Array.isArray(event?.messages)) return false;
+  const last = event.messages.at(-1);
+  if (last?.role === 'system' && Array.isArray(last.content) && last.content.some(p => p?.text === text)) return false;
+  const input = { role: 'system', content: [{ type: 'text', text }] };
+  const Message = last && last.constructor !== Object ? last.constructor : undefined;
+  let message = input;
+  if (Message) try { message = new Message(input); } catch { message = input; }
+  event.messages.push(message);
+  return true;
+}
+
 const readContextCatalog = async ctx => {
   try { return (await ctx.model?.list())?.data; } catch { return undefined; }
 };
@@ -448,16 +463,21 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
   // Native context is prepared only for primary model steps, not titles/compaction.
   // Inject a stable reminder on an existing request; never interrupt a tool or
   // manufacture a request just to observe elapsed time.
+  // Timed reminders come and go, so they never enter event.system: the system
+  // block precedes every message and changing it rewrites the whole cached
+  // history. They ride as a system-role update after the last message instead
+  // (the Anthropic adapter folds it into the current user turn), like native
+  // Plan-mode reminders. The mid-run continuation stays in system: it changes
+  // only at a completed compaction, where history is rewritten anyway.
   if (ctx.session?.hook) await ctx.session.hook('context', async event => {
+    const tail = [];
     const checkpoint = await registry(workspace, async (state, save) => {
       const owner = state.records.find(r => r.childID === event.sessionID && r.workCheckpoint);
       if (!owner && ['router','coordinator'].includes(canonicalHarnessRole(event.agent))) {
         const self = (await loadSessions()).find(s => s.id === event.sessionID);
         const managed = state.records.some(r => r.rootID === event.sessionID) ||
           Object.values(state.intents ?? {}).some(intent => intent.rootID === event.sessionID);
-        if (managed && rootProgressStatus(self, now())?.due && Array.isArray(event.system) &&
-            !event.system.some(p => p.text === rootProgressReminder))
-          event.system.push({ type: 'text', text: rootProgressReminder });
+        if (managed && rootProgressStatus(self, now())?.due) tail.push(rootProgressReminder);
       }
       if (!owner || !['starting', 'running'].includes(owner.state) ||
           getIntent(state, owner.rootID, owner.taskId)?.revision !== owner.intentRevision) return;
@@ -465,9 +485,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
       await save();
       return { status, key: owner.key };
     });
-    if (checkpoint?.status?.due && Array.isArray(event.system) && !event.system.some(p => p.text === checkpointReminder)) {
-      event.system.push({ type: 'text', text: checkpointReminder });
-    }
+    if (checkpoint?.status?.due) tail.push(checkpointReminder);
+    for (const text of tail) appendTailUpdate(event, text);
     // Mid-run compaction is optional maintenance: any failure leaves the step untouched.
     let continuation;
     if (checkpoint?.key) try { continuation = await midRunCompaction(event.sessionID, checkpoint.key); } catch { /* never block a model step */ }

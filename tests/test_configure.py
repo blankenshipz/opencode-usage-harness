@@ -462,4 +462,29 @@ class ConfigureTests(unittest.TestCase):
             self.assertEqual(oct(target.stat().st_mode & 0o777),'0o600')
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()),['opencode.json'])
 
+    def test_generating_twice_gives_byte_identical_prompts(self):
+        # Agent system prompts are the cached prefix of every request: they must
+        # not depend on time, run order or the state directory.
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        models_value={'FAST':'anthropic/claude-haiku-5-5#low','BALANCED':'anthropic/claude-sonnet-5-5#medium','STRONG':'anthropic/claude-opus-5-5#high','MAXIMUM':'anthropic/claude-opus-5-5#max'}
+        first=json.dumps(profile(models_value),sort_keys=False)
+        second=json.dumps(profile(copy.deepcopy(models_value)),sort_keys=False)
+        self.assertEqual(first,second)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); models=root/'models.json'; models.write_text(json.dumps(models_value))
+            outputs=[]
+            for state, extra in ((root/'a',[]),(root/'a',['--replace']),(root/'b',[])):
+                subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(state),*extra],check=True,capture_output=True)
+                outputs.append((state/'config'/'opencode.json').read_bytes())
+            self.assertEqual(outputs[0],outputs[1])
+            prompts=[{name:agent.get('system') for name,agent in json.loads(raw)['agents'].items()} for raw in outputs]
+            self.assertEqual(prompts[0],prompts[2])
+            harness=[name for name in prompts[0] if name.startswith('harness-')]
+            self.assertIn('harness-router',harness)
+            for name in harness:
+                text=prompts[0][name]
+                self.assertIsInstance(text,str,name)
+                self.assertNotIn(tmp,text,name)
+                self.assertIsNone(re.search(r'\b20\d\d-\d\d-\d\d(?:T|\b)|\b1[67]\d{11}\b',text),name)
+
 if __name__=='__main__':unittest.main()
