@@ -497,10 +497,10 @@ class ConfigureTests(unittest.TestCase):
                 if fnmatch.fnmatchcase(command,rule['resource']): out=rule['effect']
             return out
         for command in ('python3 check_receipt.py -- git push -f origin main','env X=1 git commit -m x','xargs git push --force','git push -f','git push origin +main','git push --delete origin x','git reset --hard','git rebase main','timeout 5 kill 1',
-                        'nohup git reset --hard','env X=1 sh -c y','xargs rm -rf','find . -name x -exec rm -rf {} +','git commit -m x','sudo ls'):
+                        'nohup git reset --hard','env X=1 sh -c y','xargs rm -rf','find . -name x -exec rm -rf {} +','git commit -m x','sudo ls','timeout 5 git add x','git add -A','git branch -d x','git commit --amend'):
             self.assertEqual(effect(command),'ask',command)
         for command in ('git log --oneline -5','git status','git diff --stat','python3 check_receipt.py run -- pytest -q','pytest -q tests',
-                        'npm run lint','ruff check .','timeout 60 pytest -q','timeout 5 git add x','env X=1 ssh host','xargs grep foo',
+                        'npm run lint','ruff check .','timeout 60 pytest -q','timeout 5 git status','env X=1 ssh host','xargs grep foo',
                         'git push','git push -u origin feature-fix','git push origin main','python3 check_receipt.py -- git push origin main'):
             self.assertEqual(effect(command),'allow',command)
 

@@ -155,11 +155,19 @@ GIT_PUSH_ASK = ('git push *--force*', 'git push *--mirror*', 'git push *--delete
                 'git push -f', 'git push -f *', 'git push * -f', 'git push * -f *',
                 'git push -d', 'git push -d *', 'git push * -d', 'git push * -d *',
                 'git push * +*', 'git push * :*', 'git push * "+*', "git push * '+*", 'git push * ":*', "git push * ':*")
+# Branch-gated: plain `git add`/`git stage`/`git commit` ask here, and shell-guard.mjs downgrades
+# that ask to allow when it has resolved every target repo's current branch to something other
+# than main/master (feature branches). Main/master, detached or unresolvable HEADs, branch switches
+# or cd tricks in the same command keep the ask; without the guard the ask stands (fail closed).
+# Must match shell-guard.mjs BRANCH_GATED_PATTERNS. Amend asks on every branch (listed after, so it wins).
+BRANCH_GATED_ASK = ('git add*', 'git stage*', 'git commit*')
+GIT_COMMIT_ASK = ('git commit *--am*',)
+GIT_BRANCH_DELETE_ASK = ('git branch -D*', 'git branch * -D*', 'git branch -d*', 'git branch * -d*', 'git branch *--d*')
 _RM_RECURSIVE = ('-r', '-R', '-rf', '-fr', '-Rf', '-fR', '-rF', '-Fr', '-rfv', '-vrf', '-frv', '-rvf', '-fvr', '-vfr', '--recursive')
 DANGEROUS_COMMAND_ASK = tuple(p for flag in _RM_RECURSIVE for p in (f'rm {flag} *', f'rm * {flag} *', f'rm * {flag}')) + (
     'sudo *', '* sudo *', 'doas *', 'su', 'su *',
     *GIT_PUSH_ASK, 'git reset *--hard*', 'git clean *-*f*', 'git checkout -- *', 'git checkout * -- *', 'git checkout .',
-    'git checkout -f*', 'git restore *', 'git rebase*', 'git commit*', 'git stash*', 'git branch -D*', 'git branch * -D*',
+    'git checkout -f*', 'git restore *', 'git rebase*', *BRANCH_GATED_ASK, *GIT_COMMIT_ASK, 'git stash*', *GIT_BRANCH_DELETE_ASK,
     'git * --force*', 'git * -f', 'git filter-branch*', 'git update-ref -d*',
     'chmod -R*', 'chmod * -R*', 'chown -R*', 'chown * -R*',
     'sh', 'bash', 'zsh', 'dash', 'sh -*', 'bash -*', 'zsh -*', 'dash -*', 'eval *', 'xargs *rm *', 'find *-delete*',
@@ -167,7 +175,7 @@ DANGEROUS_COMMAND_ASK = tuple(p for flag in _RM_RECURSIVE for p in (f'rm {flag} 
 # Wrappers run their argument as a command, so a dangerous command behind one would match only
 # the wrapper's prefix (allowed by `*` under permissive). Ask for the wrapped forms too, including
 # argv after `--` (check_receipt.py and similar runners) and find -exec/-ok.
-_WRAPPED_DANGEROUS = ('git commit', 'git reset', 'git rebase', 'git clean', 'git checkout --', 'git restore',
+_WRAPPED_DANGEROUS = ('git commit', 'git add', 'git stage', 'git branch -d', 'git branch -D', 'git reset', 'git rebase', 'git clean', 'git checkout --', 'git restore',
                       'git stash', 'git filter-branch', 'git update-ref', 'rm -r', 'rm -R', 'rm -f', 'rm --recursive', 'sudo', 'doas',
                       'kill', 'pkill', 'killall', 'dd', 'mkfs', 'shred', 'chmod -R', 'chown -R', 'sh', 'bash', 'zsh', 'dash', 'eval')
 _SHELL_WRAPPERS = ('env', 'xargs', 'timeout', 'nice', 'nohup', 'command', 'time', 'stdbuf', 'setsid', 'exec', 'builtin', 'flock', 'parallel')

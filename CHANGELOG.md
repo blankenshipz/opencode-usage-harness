@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — git add/commit allowed on feature branches under the permissive shell policy
+
+- Approved 2026-11-19: agents may `git add`/`git stage`/`git commit` without a prompt when the repo's current branch is not main/master. On main/master, a detached or unresolvable HEAD, or any branch/directory smuggling, the ask stays.
+- Fail closed: `configure.py` keeps a native ask (`BRANCH_GATED_ASK`: `git add*`, `git stage*`, `git commit*`), and `shell-guard.mjs` downgrades it to allow only for a call whose every add/commit it resolved (session dir + `workdir`, `cd dir &&`, `git -C`) to a feature branch with `git symbolic-ref -q HEAD` (2 s timeout). Without the guard, everything asks as before.
+- Smuggling asks: `git checkout/switch/symbolic-ref/worktree/...` or `git branch -m`/config writes in the same command, `GIT_DIR`/`GIT_WORK_TREE`/other `GIT_*` env, `--git-dir`/`--work-tree`, non-identity `-c`, writes to `.git/`, `cd` outside a plain top-level `&&` chain (`;`, `||`, `|`, subshells, functions, `$VAR`, `cd -`, `pushd`, `CDPATH`), `env -C`, `find -execdir`, `sh -c`.
+- Still ask on every branch: `git commit --amend` (also abbreviated: static `git commit *--am*`), wrapped add/commit, `git branch -d/-D/--delete` (newly also `-d`, `--del`, `-dr`; previously only `-D` asked), force/delete pushes (the guard now also catches abbreviations such as `--del`, `--mirr`), reset --hard, rebase, stash and the rest.
+- The guard now also checks `git -C dir <sub>` and wrapped git invocations against the rules in their canonical `git <sub>` form (`git -C x reset --hard` used to be allowed).
+- New `tests/v2-shell-guard-commit.test.mjs` (real main/master/feature/detached repos, live configure rules, ~130 commands); `tests/test_configure.py` updated (`timeout 5 git add` now asks).
+
 ## Unreleased — plain git push allowed under the permissive shell policy
 
 - Approved 2026-11-19: harness agents may `git push` without a prompt. Plain `git push`, `-u`/`--set-upstream`, `origin <branch>`, `--tags`, also behind wrappers, are allowed.

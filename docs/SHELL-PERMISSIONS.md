@@ -8,7 +8,7 @@ a later `configure.py --replace` without the flag keeps it. New installs default
 | Policy | Generated global shell rules |
 |---|---|
 | `allowlist` (default) | Global `* ask`, then allows for exactly `pwd`, `git status*`, `git diff*`, `git log*`, `npm test*`, `npm run test*`, `pytest*`, `python3 -m pytest*`, `go test*`, `gofmt *`. Anything else asks. |
-| `permissive` | `shell *` allow, followed by the `DANGEROUS_SHELL_ASK` ask list in `configure.py`: recursive `rm`, `sudo`/`doas`/`su`, force/delete/mirror/prune `git push` (`--force*`, `-f`, `+refspec`, `:ref`, `--delete`/`-d`, `--mirror`, `--prune`; plain `git push`, `-u`, `origin <branch>` are allowed, and `plugins/v2/shell-guard.mjs` also asks for forms wildcards miss: `-uf`, quoted refspecs, `git -C d push -f`, `-c alias.*`/`remote.*.push`, `git config alias.*`, `GIT_CONFIG_*` env, and any wrapper or compound), `git reset --hard`, `git clean -f`, `git checkout -- …`/`.`/`-f`, `git restore`, `git rebase`, `git commit`, `git stash`, `git branch -D`, `--force`/`-f`, `filter-branch`, `update-ref -d`, `chmod`/`chown -R`, bare or flagged `sh`/`bash`/`zsh`/`dash` (pipe-to-shell, `-c`), `eval`, `xargs … rm`, `find -delete`, `dd`, `mkfs`, `shred`, `kill`/`pkill`/`killall`, and secret-looking paths (`*.env*`, `*auth.json*`, `*.pem*`, `*.key*`, `*credentials*`, `*secret*`, `*financial-policy*`, `*external-write-grants*`). Env templates (`.env.example`, `.env.sample`, `.env.template` as a whole word, any directory) are allowed after the secret asks and before the command asks, so `rm -rf .env.example` still asks. |
+| `permissive` | `shell *` allow, followed by the `DANGEROUS_SHELL_ASK` ask list in `configure.py`: recursive `rm`, `sudo`/`doas`/`su`, force/delete/mirror/prune `git push` (`--force*`, `-f`, `+refspec`, `:ref`, `--delete`/`-d`, `--mirror`, `--prune`; plain `git push`, `-u`, `origin <branch>` are allowed, and `plugins/v2/shell-guard.mjs` also asks for forms wildcards miss: `-uf`, quoted refspecs, `git -C d push -f`, `-c alias.*`/`remote.*.push`, `git config alias.*`, `GIT_CONFIG_*` env, and any wrapper or compound), `git reset --hard`, `git clean -f`, `git checkout -- …`/`.`/`-f`, `git restore`, `git rebase`, `git add`/`git stage`/`git commit` on main/master (branch-gated, see below), `git commit --amend`, `git stash`, `git branch -d`/`-D`/`--delete`, `--force`/`-f`, `filter-branch`, `update-ref -d`, `chmod`/`chown -R`, bare or flagged `sh`/`bash`/`zsh`/`dash` (pipe-to-shell, `-c`), `eval`, `xargs … rm`, `find -delete`, `dd`, `mkfs`, `shred`, `kill`/`pkill`/`killall`, and secret-looking paths (`*.env*`, `*auth.json*`, `*.pem*`, `*.key*`, `*credentials*`, `*secret*`, `*financial-policy*`, `*external-write-grants*`). Env templates (`.env.example`, `.env.sample`, `.env.template` as a whole word, any directory) are allowed after the secret asks and before the command asks, so `rm -rf .env.example` still asks. |
 
 The last matching rule wins. With either policy, the read-only roles (router,
 coordinator, scout, architect, reviewer) keep an agent-level `shell * deny`, and
@@ -45,6 +45,60 @@ human even under `shell *` allow. It is saved with `save: []`, so "always" does 
 persist it. If the permission API is missing, the guard blocks the call with an
 explanation instead. A guarded command can ask twice when the native rules also ask for
 a parsed segment. That is intentional.
+
+## Branch-gated git add/commit (permissive)
+
+Agents may `git add`, `git stage` and `git commit` without a prompt when the repository's
+current branch is not `main` or `master`. Static wildcards cannot see the branch, so this
+is split between `configure.py` and `shell-guard.mjs`, and it fails closed:
+
+- `configure.py` keeps a native ask for `BRANCH_GATED_ASK` (`git add*`, `git stage*`,
+  `git commit*`). Without the guard every add/commit asks, as before.
+- Before the shell runs, the guard resolves where each add/commit runs: the session
+  directory (`ctx.location.directory`) plus the tool's `workdir`, then `cd dir &&` prefixes
+  and `git -C dir` options. It reads the branch there with `git symbolic-ref -q HEAD`
+  (2 s timeout; the full `refs/heads/…` ref, so a tag named `main` cannot confuse it).
+- If every add/commit in the call targets a non-main/master branch, the guard records the
+  call (session + tool-call id, single use, 120 s). Its `evaluate` hook then downgrades the
+  native ask to allow, but only when each requested resource is allowed by the agent's rules
+  or asks solely because of a gated pattern (re-evaluated without the gated patterns, so
+  `git add .env` still hits the secret ask), and there are no more gated resources than
+  verified segments.
+- `main`/`master` (case-insensitive), a detached HEAD, a missing directory, a non-repository,
+  a git error or a timeout keep the ask. Forms the static rules allow (`git -C repo commit`,
+  `timeout 5 git -C repo add`) get a guard ask instead.
+
+Anything that could change the branch, repository or directory makes the guard give up, so the
+ask stands, even on a feature branch:
+
+- the same command also runs `git checkout`/`switch`/`symbolic-ref`/`worktree`/`bisect`/`init`/
+  `clone`/`rebase`/`update-ref`, `git branch -m/-M/-c/-C/-f`, a `git config` write, or
+  `gh pr checkout`/`clone` (anywhere in the command, before or after the commit);
+- `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` or any other `GIT_*` variable except
+  identity/editor/prompt/trace ones; `CDPATH`; a word or redirect touching `.git/…`;
+- `git --git-dir/--work-tree/--namespace/--bare/…` or `-c` other than identity, signing
+  and output keys (`user.*`, `author.*`, `committer.*`, `commit.gpgsign`, `core.quotepath`,
+  `color.*`, ...); `-c alias.*` already asks via the push check;
+- a `cd` that is not a plain top-level `cd <literal path>` in the same `&&` chain as the
+  commit, starting the list or after `;`/newline: `cd x; git commit`, `false || cd x &&`,
+  `(cd x && …)`, `cd x | …`, `cd $VAR`, `cd -`, `pushd`, `popd`, `builtin cd`, functions,
+  `if cd …`, `source`/`.`/`eval`/`exec`;
+- git behind anything other than a same-directory wrapper (`env` without `-C`/`-S`, `timeout`,
+  `nice`, `nohup`, `command`, `time`, `stdbuf`, `setsid`, `xargs`), e.g. `env -C dir`,
+  `find -execdir`, `echo git commit`, or `git-commit` run directly.
+
+Always asking, on any branch: `git commit --amend` (and abbreviations such as `--amen`;
+static `git commit *--am*`), wrapped add/commit (`timeout 60 git commit`, static
+`WRAPPED_COMMAND_ASK`), `git branch -d/-D/--delete` (and `--del`, `-dr`), force/delete
+pushes (the guard also catches long-option abbreviations like `--del`, `--mirr`), and every
+other configured ask. The guard also re-evaluates `git -C dir <sub> …` and wrapped git
+invocations in their canonical `git <sub> …` form, so `git -C x reset --hard` or
+`git -C x stash` ask like their plain forms.
+
+Known gaps: user- or system-level git aliases for commit (`git ci`) are not recognized as
+commits (they were not asked before either); `git merge`, `pull`, `cherry-pick`, `revert` and
+`am` create commits and are allowed as before; session-level permission rules are not visible
+to the guard, so a session-only ask for a gated pattern can be downgraded on a feature branch.
 
 ## Pending asks after a config reload
 
