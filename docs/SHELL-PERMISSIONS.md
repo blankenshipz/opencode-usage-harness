@@ -126,6 +126,14 @@ and `ssh` remote command):
 - force/delete/mirror/prune pushes (all `gitPushDanger` forms), `git branch -d/-D`, `git tag -d`;
 - history rewrites: `rebase`, `commit --amend`, `filter-branch`, `filter-repo`, `reset --hard`,
   `reflog expire|delete`, `gc --prune*`, `git prune`, `git replace`, `update-ref -d`;
+  `commit --amend` is the one exception (approved: "auto-approve amends of unpushed commits on
+  feature branches"): it is allowed when every amend in the command is a top-level `git commit`
+  (plain, `git -C dir`, `cd dir &&` or a same-directory wrapper such as `timeout 60`) in a repo
+  inside the project whose current branch is not main/master and whose HEAD is on no
+  remote-tracking branch (`git branch -r --contains HEAD` empty; errors and timeouts count as
+  pushed). Amends of pushed commits, on main/master or a detached HEAD, in `sh -c`/`eval`/heredoc/
+  `ssh` bodies, or with branch/repo changes in the same command (`checkout`, `GIT_DIR`,
+  `--git-dir`, `git config`, ...) still ask, as do force pushes and every other rewrite;
 - `rm`/`rmdir`/`unlink`, `find -delete|-exec rm`, `rsync --delete|--remove-source-files` and
   truncating redirects (`>`, `>|`, `&>`) whose target is not strictly inside the project or a data
   dir (`/tmp` included for deletes), is the project root, `*` at the root or `.git`, is non-literal

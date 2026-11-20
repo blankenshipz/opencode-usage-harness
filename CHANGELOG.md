@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — full-auto: amends of unpushed feature-branch commits
+
+- Full-auto projects no longer ask for `git commit --amend` when every amend in the command is a top-level git commit in a repo inside the project whose branch is not main/master and whose HEAD is on no remote-tracking branch (`git branch -r --contains HEAD` empty; errors count as pushed). Repo resolution reuses the branch-gated commit plan (`cd dir &&`, `git -C`, same-directory wrappers; branch/repo changes in the command keep the ask). Amends of pushed commits, on main/master or detached HEADs, nested in `sh -c`/`eval`/heredocs/`ssh`, force pushes, rebases and other rewrites still ask. The permissive policy outside full-auto is unchanged. Hot-reloads with the plugin; no configure change.
+
 ## Unreleased — router back on Opus
 
 - `harness-router` returns to the strong tier (Opus), reverting only the router model change from 064ae04. The Haiku quick-builder routing (prompt guidance and the `routine_mechanical` dispatch path), timed-reminder cache fix, full-auto and agent commit identity are unchanged. Takes effect after `configure.py --replace`.

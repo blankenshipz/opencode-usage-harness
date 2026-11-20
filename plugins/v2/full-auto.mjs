@@ -8,7 +8,9 @@
 //   - external_directory / read / edit: when every resource resolves inside the project or a
 //     configured data dir.
 // Still asking under full-auto (fullAutoShellCheck): force/delete/mirror pushes and branch or tag
-// deletes, history rewrites (rebase, commit --amend, filter-branch/filter-repo, reset --hard,
+// deletes, history rewrites (rebase, commit --amend unless every amend in the command is a top-level
+// git commit in a repo inside the project whose branch is not main/master and whose HEAD is on no
+// remote-tracking branch, filter-branch/filter-repo, reset --hard,
 // reflog expire/delete, gc --prune, git prune, update-ref -d), deletes (rm/rmdir/unlink, find
 // -delete/-exec rm, rsync --delete/--remove-source-files) whose targets are not strictly inside the
 // project or a data dir (or are the project root or .git), disk writes (dd, mkfs*, shred, wipefs,
@@ -157,14 +159,16 @@ const isGlob = component => /[*?[\]]/.test(component);
 
 const git = (words, k) => parseGitInvocation(words.slice(k + 1));
 
-function gitHistoryDanger(words) {
+// amendOk: skip `commit --amend` (the guard verified every amend in the command is on an unpushed
+// feature-branch HEAD; see checkFullAutoAmends in shell-guard.mjs).
+function gitHistoryDanger(words, { amendOk = false } = {}) {
   for (let k = 0; k < words.length; k++) {
     if (!isGitWord(words[k])) continue;
     const { sub, rest } = git(words, k);
     const args = []; for (const arg of rest) { if (arg === '--') break; args.push(arg); }
     const long = (arg, name, min = 3) => arg.startsWith('--') && arg.length >= min && name.startsWith(arg.slice(2).split('=')[0]);
     if (['rebase', 'filter-branch', 'filter-repo', 'prune', 'replace'].includes(sub)) return `git ${sub} rewrites history`;
-    if (sub === 'commit' && args.some(arg => /^--am/.test(arg))) return 'git commit --amend rewrites history';
+    if (sub === 'commit' && !amendOk && args.some(arg => /^--am/.test(arg))) return 'git commit --amend rewrites history';
     if (sub === 'reset' && args.some(arg => long(arg, 'hard'))) return 'git reset --hard discards history and work';
     if (sub === 'reflog' && ['expire', 'delete'].includes(args[0])) return `git reflog ${args[0]} drops history`;
     if (sub === 'gc' && args.some(arg => /^--prune/.test(arg))) return 'git gc --prune drops unreachable history';
@@ -329,7 +333,8 @@ function segmentCwds(segments, base, home) {
 // Returns the reasons a full-auto project must still ask for a raw command (empty: allow).
 // cwd: the shell's working directory; project: from fullAutoProjectFor. paths:false skips the
 // path-dependent checks (used to re-check parsed native resources in the evaluate hook).
-export function fullAutoShellCheck(command, cwd, project, { home = process.env.HOME || os.homedir(), remote = false, paths = true, depth = 0 } = {}) {
+// amendOk only applies to top-level local segments; amends in sh -c/eval/heredoc/ssh bodies still ask.
+export function fullAutoShellCheck(command, cwd, project, { home = process.env.HOME || os.homedir(), remote = false, paths = true, depth = 0, amendOk = false } = {}) {
   if (typeof command !== 'string') return ['command is not a string'];
   if (depth > 4) return ['commands nested too deeply to inspect'];
   const { segments } = scanShell(command);
@@ -342,7 +347,7 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     const text = JSON.stringify(segment.text.slice(0, 160));
     const push = gitPushDanger(words);
     if (push) reasons.push(`${text}: ${push}`);
-    const history = gitHistoryDanger(words);
+    const history = gitHistoryDanger(words, { amendOk: amendOk && depth === 0 && !remote });
     if (history) reasons.push(`${text}: ${history}`);
     const disk = words.find(word => DISK_COMMANDS.test(word) || BLOCK_DEVICE.test(word) || /^of=\/dev\//.test(word));
     if (disk) reasons.push(`${text}: ${disk} writes disks or devices`);
@@ -378,11 +383,12 @@ const VERIFIED = new Map();
 const TTL_MS = 120_000;
 const key = (sessionID, callID) => `${sessionID}\u0000${callID}`;
 
-export function rememberFullAuto(event) {
+// amendOk: the call's amends were verified (feature branch, HEAD on no remote-tracking branch).
+export function rememberFullAuto(event, { amendOk = false } = {}) {
   if (!event?.sessionID || !event?.id) return;
   const now = Date.now();
   for (const [k, entry] of VERIFIED) if (entry.expires <= now) VERIFIED.delete(k);
-  VERIFIED.set(key(event.sessionID, event.id), { expires: now + TTL_MS });
+  VERIFIED.set(key(event.sessionID, event.id), { expires: now + TTL_MS, amendOk });
 }
 
 // evaluate-hook half: shell asks for a verified call become allow unless a parsed resource is
@@ -392,7 +398,7 @@ export function downgradeFullAutoShell(event, project) {
   if (!entry || entry.expires <= Date.now() || !Array.isArray(event.resources) || !event.resources.length) return false;
   for (const resource of event.resources) {
     if (typeof resource !== 'string' || secretShellResource(resource)) return false;
-    if (fullAutoShellCheck(resource, undefined, project, { paths: false }).length) return false;
+    if (fullAutoShellCheck(resource, undefined, project, { paths: false, amendOk: entry.amendOk }).length) return false;
   }
   event.effect = 'allow';
   return true;

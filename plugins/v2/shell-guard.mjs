@@ -17,7 +17,7 @@
 import { execFile } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { fullAutoProjectFor, fullAutoShellCheck, rememberFullAuto, downgradeFullAutoShell, pathResourcesInside, PATH_ACTIONS } from './full-auto.mjs';
+import { fullAutoProjectFor, fullAutoShellCheck, rememberFullAuto, downgradeFullAutoShell, pathResourcesInside, PATH_ACTIONS, realish } from './full-auto.mjs';
 
 const SECRET_BASENAME = [
   /^\.env$/i, /^\.env\..+/i, /credentials/i, /\.pem$/i, /\.key$/i, /^auth\.json$/i,
@@ -346,7 +346,7 @@ export function gitCommitPlan(command, baseCwd, { home = process.env.HOME || os.
       if (COMMIT_SUBCOMMANDS.has(parsed.sub)) targets.push({ segment, k, parsed });
     }
   }
-  if (!targets.length) return { targets: [], unknown: undefined };
+  if (!targets.length) return { targets: [], unknown: undefined, segments };
   if (!baseCwd) flag('the working directory is unknown');
   // Anything in the same command that can switch branch, repo or directory makes the target unknown.
   for (const segment of segments) {
@@ -407,7 +407,7 @@ export function gitCommitPlan(command, baseCwd, { home = process.env.HOME || os.
       amend: parsed.sub === 'commit' && args.some(arg => /^--am/.test(arg)),
     });
   }
-  return { targets: out, unknown };
+  return { targets: out, unknown, segments };
 }
 
 // Reads the current branch of the repository containing cwd; undefined when detached, not a repo or on error.
@@ -422,6 +422,47 @@ export function gitBranchAt(cwd, { run = execFile, timeout = 2000 } = {}) {
       });
     } catch { resolve(undefined); }
   });
+}
+
+// True only when HEAD of the repository containing cwd is on no remote-tracking branch
+// (`git branch -r --contains HEAD` succeeds with empty output). Errors and timeouts count as pushed.
+export function gitHeadUnpushed(cwd, { run = execFile, timeout = 5000 } = {}) {
+  return new Promise(resolve => {
+    try {
+      run('git', ['branch', '-r', '--contains', 'HEAD'], { cwd, timeout, maxBuffer: 1 << 20,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' } },
+      (error, stdout) => resolve(!error && String(stdout ?? '').trim() === ''));
+    } catch { resolve(false); }
+  });
+}
+
+// Full-auto: `git commit --amend` is allowed when every amend in the command is a top-level git
+// commit (gitCommitPlan resolves its repo; same-directory wrappers only, no branch/repo changes in
+// the command) in a repo inside the project whose current branch is not main/master and whose HEAD
+// is on no remote-tracking branch. Returns { ok, reasons }; ok is false when there is no amend.
+export async function checkFullAutoAmends(command, baseCwd, project, { branchAt = gitBranchAt, headUnpushed = gitHeadUnpushed, home } = {}) {
+  const plan = gitCommitPlan(command, baseCwd, home ? { home } : undefined);
+  const amends = plan.targets.filter(target => target.amend);
+  if (!amends.length) return { ok: false, reasons: [] };
+  if (plan.unknown) return { ok: false, reasons: [`commit --amend cannot be checked (${plan.unknown})`] };
+  // A push/fetch/pull (or gh) that may run before an amend can make HEAD pushed after the check:
+  // only allow those after the last amend, at top level (`git commit --amend && git push`).
+  const lastAmend = Math.max(...amends.map(target => plan.segments.indexOf(target.segment)));
+  const remoteStep = plan.segments.findIndex((segment, index) => segment.words.some((word, k) =>
+    (isGitWord(word) && ['push', 'fetch', 'pull', 'remote', 'submodule'].includes(parseGitInvocation(segment.words.slice(k + 1)).sub))
+    || /(^|\/)gh$/.test(word)) && (index < lastAmend || segment.sub));
+  if (remoteStep >= 0) return { ok: false, reasons: [`${JSON.stringify(plan.segments[remoteStep].text.slice(0, 80))} may push or fetch before commit --amend runs`] };
+  const inside = dir => (project?.roots ?? []).some(root => [dir, realish(dir)].every(target => target === root || target.startsWith(root.endsWith('/') ? root : root + '/')));
+  const reasons = [];
+  for (const cwd of new Set(amends.map(target => target.cwd))) {
+    if (!cwd) { reasons.push('commit --amend runs in an unknown directory'); continue; }
+    if (!inside(cwd)) { reasons.push(`commit --amend runs outside the project (${cwd})`); continue; }
+    const [branch, unpushed] = await Promise.all([branchAt(cwd), headUnpushed(cwd)]);
+    if (branch === undefined) reasons.push(`commit --amend: cannot resolve the branch of ${cwd} (detached, not a repository or error)`);
+    else if (PROTECTED_BRANCH.test(branch)) reasons.push(`commit --amend on protected branch ${branch} in ${cwd}`);
+    if (!unpushed) reasons.push(`commit --amend: HEAD in ${cwd} is on a remote-tracking branch (pushed) or could not be checked`);
+  }
+  return { ok: !reasons.length, reasons };
 }
 
 // Async half of the guard for git add/commit. Returns { reasons, verified }: reasons force an ask (only
@@ -601,9 +642,18 @@ export async function installShellGuard(ctx, { tools = ['shell', 'bash'], fullAu
     if (project) {
       // Full-auto: no branch gating and no ask-rule re-checks; only the still-dangerous forms ask.
       const fullAuto = analyzeShellCommand(command, rules, { fullAuto: true });
-      const reasons = [...fullAuto.reasons, ...fullAutoShellCheck(command, base, project)];
+      let reasons = [...fullAuto.reasons, ...fullAutoShellCheck(command, base, project)];
       if (fullAuto.action === 'deny') throw new Error(`Harness shell guard denied this command: ${reasons.join('; ')}. Split it into separate commands or use the edit/write tools.`);
-      if (!reasons.length) { if (canAsk) rememberFullAuto(event); return; }
+      let amendOk = false;
+      if (reasons.length) {
+        // The only remaining asks are top-level amends: allow them on unpushed feature-branch HEADs.
+        const withoutAmend = [...fullAuto.reasons, ...fullAutoShellCheck(command, base, project, { amendOk: true })];
+        if (!withoutAmend.length) {
+          const amend = await checkFullAutoAmends(command, base, project, options);
+          if (amend.ok) { reasons = withoutAmend; amendOk = true; } else reasons.push(...amend.reasons);
+        }
+      }
+      if (!reasons.length) { if (canAsk) rememberFullAuto(event, { amendOk }); return; }
       const reason = `full-auto project ${project.directory}: ${reasons.join('; ')}`;
       if (!canAsk) throw new Error(`Harness shell guard blocked this command because approval cannot be requested here: ${reason}.`);
       await permission.assert({

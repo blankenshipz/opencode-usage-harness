@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { explicitShellEffect, installShellGuard, scanShell } from '../plugins/v2/shell-guard.mjs';
+import { checkFullAutoAmends, explicitShellEffect, gitHeadUnpushed, installShellGuard, scanShell } from '../plugins/v2/shell-guard.mjs';
 import { fullAutoProjectFor, fullAutoShellCheck, loadFullAutoProjects, pathResourcesInside, SECRET_SHELL_PATTERNS } from '../plugins/v2/full-auto.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -25,7 +25,17 @@ git(OTHER, 'init', '-q', '-b', 'main');
 git(OTHER, 'commit', '-q', '--allow-empty', '-m', 'init');
 fs.symlinkSync(OTHER, path.join(P, 'escape'));
 const choices = path.join(tmp, 'configure-choices.json');
-fs.writeFileSync(choices, JSON.stringify({ shell_policy: 'permissive', full_auto_projects: [{ directory: P, data_dirs: [] }] }));
+// F: a second full-auto project on a feature branch with an origin remote (amend checks).
+const F = path.join(tmp, 'feat'), REMOTE = path.join(tmp, 'remote.git');
+fs.mkdirSync(F);
+execFileSync('git', ['init', '-q', '--bare', REMOTE]);
+git(F, 'init', '-q', '-b', 'main');
+git(F, 'commit', '-q', '--allow-empty', '-m', 'init');
+git(F, 'remote', 'add', 'origin', REMOTE);
+git(F, 'push', '-q', 'origin', 'main');
+git(F, 'checkout', '-q', '-b', 'feat/x');
+git(F, 'commit', '-q', '--allow-empty', '-m', 'local');
+fs.writeFileSync(choices, JSON.stringify({ shell_policy: 'permissive', full_auto_projects: [{ directory: P, data_dirs: [] }, { directory: F, data_dirs: [] }] }));
 const PROJECTS = () => loadFullAutoProjects({ choicesPath: choices });
 test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -142,6 +152,57 @@ test('full-auto exempts only the value of docker --env-file from the secret-path
   for (const command of asked) assert.notEqual(await decide(command), 'allow', command);
   // Today's behaviour for other docker arguments is kept (volume specs are not path-checked).
   assert.equal(await decide('docker run -v ./id_rsa:/k img'), 'allow');
+});
+
+test('full-auto allows amends of unpushed commits on feature branches only', async () => {
+  const amends = ['git commit --amend --no-edit', 'git commit --amend -m "fix: msg"', 'git commit --amen --no-edit', 'git add -A && git commit --amend --no-edit',
+    'timeout 60 git commit --amend --no-edit', `git -C ${F} commit --amend --no-edit`, `cd ${F} && git commit --amend --no-edit`];
+  amends.push('git commit --amend --no-edit && git push', 'git commit --amend --no-edit && git push -u origin HEAD');
+  for (const command of amends) assert.equal(await decide(command, F), 'allow', command);
+  // Other history rewrites, force pushes and smuggled or unresolvable amends still ask on the same unpushed feature branch.
+  for (const command of ['git commit --amend --no-edit && git push -f', 'git commit --amend --no-edit && git push --force-with-lease', 'git rebase main',
+    'git rebase -i HEAD~2', 'git reset --hard HEAD~1', 'git filter-branch --tree-filter x', 'sh -c "git commit --amend --no-edit"',
+    'bash <<EOF\ngit commit --amend --no-edit\nEOF', 'eval "git commit --amend --no-edit"', 'ssh garage-server "cd /srv/r && git commit --amend --no-edit"',
+    'git checkout main && git commit --amend --no-edit', 'git switch feat/y && git commit --amend --no-edit', 'GIT_DIR=../x/.git git commit --amend --no-edit',
+    'git --git-dir=/x/.git commit --amend --no-edit', `git -C ${P} commit --amend --no-edit`, `git -C ${OTHER} commit --amend --no-edit`,
+    'cd .. && git commit --amend --no-edit', 'git push && git commit --amend --no-edit', 'git push; git commit --amend --no-edit', 'git push & git commit --amend --no-edit',
+    'git fetch origin && git commit --amend --no-edit', 'gh pr create --fill && git commit --amend --no-edit', 'git commit --amend -m "$(git push)"', 'git -C "$D" commit --amend --no-edit', 'sudo git commit --amend --no-edit', 'git config core.hooksPath x && git commit --amend --no-edit'])
+    assert.notEqual(await decide(command, F), 'allow', command);
+  // Main/master (P is on main without a remote) still asks.
+  assert.notEqual(await decide('git commit --amend --no-edit', P), 'allow');
+  // Once HEAD is on a remote-tracking branch the amend asks again; a new local commit is amendable.
+  git(F, 'push', '-q', '-u', 'origin', 'feat/x');
+  assert.notEqual(await decide('git commit --amend --no-edit', F), 'allow');
+  git(F, 'commit', '-q', '--allow-empty', '-m', 'local 2');
+  assert.equal(await decide('git commit --amend --no-edit', F), 'allow');
+  // A pushed HEAD reachable from another remote branch (e.g. merged elsewhere) still counts as pushed.
+  git(F, 'push', '-q', 'origin', 'HEAD:refs/heads/other');
+  git(F, 'fetch', '-q', 'origin');
+  assert.notEqual(await decide('git commit --amend --no-edit', F), 'allow');
+  git(F, 'commit', '-q', '--allow-empty', '-m', 'local 3');
+  // Detached HEAD and main in the same repo ask.
+  git(F, 'checkout', '-q', '--detach');
+  assert.notEqual(await decide('git commit --amend --no-edit', F), 'allow');
+  git(F, 'checkout', '-q', 'main');
+  git(F, 'commit', '-q', '--allow-empty', '-m', 'unpushed on main');
+  assert.notEqual(await decide('git commit --amend --no-edit', F), 'allow');
+  git(F, 'checkout', '-q', 'feat/x');
+  assert.equal(await decide('git commit --amend --no-edit', F), 'allow');
+});
+
+test('amend checks treat git errors as pushed', async () => {
+  const project = fullAutoProjectFor(F, PROJECTS());
+  assert.equal(await gitHeadUnpushed(F), true);
+  assert.equal(await gitHeadUnpushed(tmp), false); // not a repository
+  assert.equal(await gitHeadUnpushed(F, { run: (cmd, args, opts, cb) => cb(new Error('boom'), '') }), false);
+  assert.equal(await gitHeadUnpushed(F, { run: () => { throw new Error('spawn'); } }), false);
+  const stubs = { branchAt: async () => 'feat/x' };
+  assert.equal((await checkFullAutoAmends('git commit --amend', F, project, { ...stubs, headUnpushed: async () => true })).ok, true);
+  assert.equal((await checkFullAutoAmends('git commit --amend', F, project, { ...stubs, headUnpushed: async () => false })).ok, false);
+  assert.equal((await checkFullAutoAmends('git commit --amend', F, project, { branchAt: async () => 'master', headUnpushed: async () => true })).ok, false);
+  assert.equal((await checkFullAutoAmends('git commit --amend', F, project, { branchAt: async () => undefined, headUnpushed: async () => true })).ok, false);
+  assert.equal((await checkFullAutoAmends('git commit -m x', F, project, { ...stubs, headUnpushed: async () => true })).ok, false);
+  assert.equal((await checkFullAutoAmends('git commit --amend', undefined, project, { ...stubs, headUnpushed: async () => true })).ok, false);
 });
 
 test('other projects keep the normal permissive policy', async () => {
