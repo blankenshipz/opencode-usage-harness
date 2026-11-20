@@ -28,6 +28,7 @@ import { createDispatchCanceller, cancelInputSchema } from './task-dispatch-canc
 import { createResultDelivery } from './result-delivery.mjs';
 import { parkMonitor as defaultParkMonitor, parkedResult } from './park-yield.mjs';
 import { createRouterCompactor } from './router-maintenance.mjs';
+import { dispatchThrottle } from './quota-throttle.mjs';
 import { createStaleReconciler } from './dispatch-reconcile.mjs';
 import { midRunCompactionEnabled, midRunCompactionDecision, settleMidRunCompaction, admitMidRunCompaction, recordAdmitted, recordAdmissionFailure, recordBaseline, buildContinuation, activeContinuation, midRunCompactionStatus, pendingCompactionPreservation, BRIEF_LIMIT } from './mid-run-compaction.mjs';
 
@@ -850,6 +851,9 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           hasActiveDescendant:Boolean(requested && sessions.some(session=>session.active&&descendant(sessions,session.id,requested)))});
         if (routedInput.routing?.reviewProvenance) routing.reviewProvenance=routedInput.routing.reviewProvenance;
         if (routedInput.routing?.reviewIndependence) routing.reviewIndependence=routedInput.routing.reviewIndependence;
+        // r20 item 4: while quota pace is ahead, cap concurrently active new children per root.
+        const throttled=dispatchThrottle({pace:routing.pace,newChild:!requested,compact:!!input.compact,review:routedInput.routing?.reviewIndependence==='required',rootID,records:state.records,sessions});
+        if (throttled) throw Object.assign(new Error(throttled.message),{code:'QUOTA_PACE_THROTTLED'});
         let retainedCompactionEvidence;
         if (input.compact) {
           if (staleRebind) throw new Error('task-dispatch: deliver the current intent to this same child before compaction; compaction cannot rebind stale intent');

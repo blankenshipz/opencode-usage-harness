@@ -1293,3 +1293,12 @@ test('park and yield: a foreground child parked on an ask returns blocked to the
  release(); await new Promise(r => setTimeout(r, 50));
  await h.registry('/project', async state => { const r = state.records.find(r => r.childID === 'ses_parked'); assert.equal(r.state, 'completed'); assert.equal(r.foregroundResult.output, 'LATE'); });
 });
+test('quota pace ahead throttles a third concurrently active new child but not continuations', async t => {
+ const now = new Date().toISOString();
+ const quota = { version:1, checked_at:now, pools:{ openai:{ checked_at:now, windows:[{ scope:'account', pace_delta:50, remaining_percent:40, duration_minutes:300 }] } } };
+ const h = await harness(t, undefined, undefined, { loadQuota: async () => quota });
+ const routing = { complexity:'standard', risk:'normal' };
+ await h.call({ ...base, background:true, routing });
+ await h.call({ ...base, background:true, routing, workKey:'two', writePaths:['two'] });
+ await assert.rejects(h.call({ ...base, background:true, routing, workKey:'three', writePaths:['three'] }), /QUOTA_PACE_THROTTLED/);
+});
