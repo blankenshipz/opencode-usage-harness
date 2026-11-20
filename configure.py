@@ -380,13 +380,38 @@ def compaction_tokens_arg(text):
         raise argparse.ArgumentTypeError(f'must be between {MIN_COMPACTION_TOKENS} and {MAX_COMPACTION_TOKENS}')
     return value
 
+# Per-project full-auto permission profile (--full-auto-project DIR; persisted as full_auto_projects,
+# [{"directory": abs, "data_dirs": [abs, ...]}]). Read at runtime by plugins/v2/full-auto.mjs from
+# configure-choices.json (hot reload, no profile change): inside those directories the shell guard
+# allows native shell asks it inspected and found safe, and external_directory/read/edit asks inside
+# the project or its data dirs. Force pushes, history rewrites, branch deletes, deletes outside the
+# project, disk writes and secret paths still ask; deny rules are unchanged. See docs/SHELL-PERMISSIONS.md.
+def valid_full_auto_projects(value):
+    return isinstance(value,list) and all(isinstance(entry,dict) and isinstance(entry.get('directory'),str) and os.path.isabs(entry['directory'])
+        and Path(entry['directory']).resolve()!=Path('/') and isinstance(entry.get('data_dirs',[]),list)
+        and all(isinstance(d,str) and os.path.isabs(d) for d in entry.get('data_dirs',[])) for entry in value)
+
+def update_full_auto_projects(current,add=(),remove=()):
+    projects=[dict(entry) for entry in current]
+    for directory in remove:
+        resolved=str(Path(directory).expanduser().resolve())
+        projects=[entry for entry in projects if entry['directory']!=resolved]
+    for directory in add:
+        resolved=Path(directory).expanduser().resolve()
+        if resolved==Path('/') or not resolved.is_dir():
+            raise ValueError(f'--full-auto-project {directory}: not an existing project directory')
+        if not any(entry['directory']==str(resolved) for entry in projects):
+            projects.append({'directory':str(resolved),'data_dirs':[]})
+    return projects
+
 def load_choices(path):
     try:
         value=json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     if not isinstance(value,dict) or value.get('shell_policy',DEFAULT_SHELL_POLICY) not in SHELL_POLICIES or not isinstance(value.get('tmp_scratch',False),bool) \
-            or not valid_compaction_tokens(value.get('compaction_tokens',DEFAULT_COMPACTION_TOKENS)):
+            or not valid_compaction_tokens(value.get('compaction_tokens',DEFAULT_COMPACTION_TOKENS)) \
+            or not valid_full_auto_projects(value.get('full_auto_projects',[])):
         raise SystemExit(f'{path}: invalid persisted configure choices')
     return value
 
@@ -412,6 +437,8 @@ def main():
     p.add_argument('--claude-auth-plugin',type=Path,help='Built, patched opencode-claude-auth 3.0.0 plugin directory (persisted). Default: previously persisted path, else <release>/plugins/v2/claude-auth, else <prefix>/vendor/claude-auth')
     p.add_argument('--allow-tmp-scratch',action=argparse.BooleanOptionalAction,default=None,help='Allow agents to use /tmp/* outside the workspace without an external_directory prompt (persisted; --no-allow-tmp-scratch turns it off). Default: previously persisted choice, else off')
     p.add_argument('--compaction-tokens',type=compaction_tokens_arg,default=None,metavar='N',help=f'Absolute context tokens that mark a session high-pressure and eligible for compaction, even when a larger model window is known (effective trigger: min(N, 80%% of the window)); persisted. HARNESS_COMPACTION_TOKENS overrides it at runtime. Default: previously persisted choice, else {DEFAULT_COMPACTION_TOKENS}')
+    p.add_argument('--full-auto-project',action='append',default=[],metavar='DIR',help='Enable the full-auto permission profile for this project directory (repeatable; persisted in full_auto_projects): shell, external_directory, read and edit asks inside it are allowed except force pushes, history rewrites, branch deletes, deletes outside the project, disk writes and secret paths')
+    p.add_argument('--no-full-auto-project',action='append',default=[],metavar='DIR',help='Remove a directory from the persisted full-auto projects (repeatable)')
     a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
     state_dir=a.state_dir.expanduser().resolve();directory=state_dir/'config';target=directory/'opencode.json'
     choices_path=directory/'configure-choices.json'
@@ -419,6 +446,8 @@ def main():
     shell_policy=a.shell_policy or choices.get('shell_policy') or DEFAULT_SHELL_POLICY
     tmp_scratch=a.allow_tmp_scratch if a.allow_tmp_scratch is not None else choices.get('tmp_scratch',False)
     compaction_tokens=a.compaction_tokens if a.compaction_tokens is not None else choices.get('compaction_tokens',DEFAULT_COMPACTION_TOKENS)
+    try: full_auto=update_full_auto_projects(choices.get('full_auto_projects',[]),a.full_auto_project,a.no_full_auto_project)
+    except ValueError as error: p.error(str(error))
     claude_auth=None
     if a.claude_auth_plugin is not None:
         claude_auth=verified_claude_auth_plugin(a.claude_auth_plugin)
@@ -440,6 +469,7 @@ def main():
     atomic_write_text(target,json.dumps(result,indent=2)+'\n')
     new_choices={**choices,'shell_policy':shell_policy,'tmp_scratch':tmp_scratch}
     if a.compaction_tokens is not None or 'compaction_tokens' in choices: new_choices['compaction_tokens']=compaction_tokens
+    if full_auto or 'full_auto_projects' in choices: new_choices['full_auto_projects']=full_auto
     if a.claude_auth_plugin is not None: new_choices['claude_auth_plugin']=str(claude_auth)
     atomic_write_text(choices_path,json.dumps(new_choices,indent=2)+'\n')
     policy_path=directory/'routing-policy.json'
@@ -459,6 +489,7 @@ def main():
     print(f'Shell policy: {shell_policy}.')
     print(f'/tmp scratch (external_directory /tmp/*): {"allowed" if tmp_scratch else "ask"}.')
     print(f'Check receipts (external_directory {state_dir}/check-receipts/*): allowed.')
+    print(f'Full-auto projects: {", ".join(entry["directory"] for entry in full_auto) or "none"}.')
     print(f'Compaction token threshold: {compaction_tokens} (or 80% of a smaller known window).')
     if 'anthropic' in result['enabled_providers']:
         if claude_auth is not None: print(f'Claude auth plugin: {claude_auth}.')

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — per-project full-auto permission profile
+
+- Approved 2026-11-19 for wncscanner ("basically full auto approve on most actions"). `configure.py --full-auto-project DIR` (repeatable; `--no-full-auto-project DIR` removes) persists `full_auto_projects` (`[{directory, data_dirs}]`) in `configure-choices.json`. The generated profile does not change; `plugins/v2/full-auto.mjs` reads the list at runtime (mtime-cached, so edits hot-reload). Other projects keep the normal policy.
+- Inside a full-auto project the shell guard's evaluate hook downgrades native asks to allow: shell asks for calls it inspected in `execute.before` and found safe (session + tool-call id; fail closed), and `external_directory`/`read`/`edit` asks whose resources resolve inside the project or a data dir. Deny rules (secret read/edit denials, read-only roles) are untouched; reevaluation probes are not downgraded, so already-pending asks stay with a human.
+- Allowed there: git add/commit on main/master (no branch gate), stash, reset (soft/mixed), checkout/switch/merge/pull/restore, plain push, ssh/scp/rsync deploys, docker/compose, kill, sudo, chmod/chown -R, `sh`/`bash -c`, eval, wrapped commands, and rm/find -delete/rsync --delete whose targets resolve strictly inside the project or a data dir.
+- Still ask there (`fullAutoShellCheck`, on every segment, wrapper, `$(...)`, `sh -c`/`eval` body, heredoc or here-string fed to a shell or ssh, and ssh remote command): force/delete/mirror/prune pushes and branch/tag deletes; rebase, `commit --amend`, filter-branch/filter-repo, `reset --hard`, `reflog expire/delete`, `gc --prune`, `git prune`, `update-ref -d`; deletes whose targets are outside the project (symlinks resolved), the project root itself, `.git`, non-literal (`$VAR`, `{}`), from `xargs`, or `--no-preserve-root`; remote deletes of `/`, a top-level dir or the remote home; dd/mkfs/shred/wipefs/partitioners and `/dev` block devices; secret-looking paths; truncating redirects outside the project (except /tmp, /dev/null); pipes into a shell; `ssh -o ProxyCommand/LocalCommand`.
+- New `tests/v2-full-auto.test.mjs` (~150 commands through the plugin with the live permissive rules, path actions, config reload) and a configure test.
+
 ## Unreleased — git add/commit allowed on feature branches under the permissive shell policy
 
 - Approved 2026-11-19: agents may `git add`/`git stage`/`git commit` without a prompt when the repo's current branch is not main/master. On main/master, a detached or unresolvable HEAD, or any branch/directory smuggling, the ask stays.

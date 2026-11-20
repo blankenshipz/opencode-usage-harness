@@ -17,6 +17,7 @@
 import { execFile } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { fullAutoProjectFor, fullAutoShellCheck, rememberFullAuto, downgradeFullAutoShell, pathResourcesInside, PATH_ACTIONS } from './full-auto.mjs';
 
 const SECRET_BASENAME = [
   /^\.env$/i, /^\.env\..+/i, /credentials/i, /\.pem$/i, /\.key$/i, /^auth\.json$/i,
@@ -107,7 +108,8 @@ export function scanShell(command) {
       i++;
       // Consume pending heredoc bodies after the line that introduced them.
       while (heredocs.length) {
-        const { delimiter, stripTabs } = heredocs.shift();
+        const { delimiter, stripTabs, redirect } = heredocs.shift();
+        const body = [];
         for (;;) {
           if (i >= command.length) break;
           const lineEnd = command.indexOf('\n', i);
@@ -116,7 +118,10 @@ export function scanShell(command) {
           if (stripTabs) line = line.replace(/^\t+/, '');
           i = stop + 1;
           if (line === delimiter) break;
+          body.push(line);
         }
+        // Kept for checks that must see what a shell or ssh reads from the heredoc (full-auto).
+        if (redirect) redirect.body = body.join('\n');
       }
       open(i); continue;
     }
@@ -141,10 +146,11 @@ export function scanShell(command) {
       const raw = command.slice(i, word.end);
       current.parts.push(raw);
       if (op === '<<' || op === '<<-') {
-        heredocs.push({ delimiter: word.value, stripTabs: op === '<<-' });
-        current.redirects.push({ op, target: undefined, heredoc: true });
+        const heredoc = { op, target: undefined, heredoc: true };
+        heredocs.push({ delimiter: word.value, stripTabs: op === '<<-', redirect: heredoc });
+        current.redirects.push(heredoc);
       } else if (op === '<<<') {
-        current.redirects.push({ op, target: undefined, herestring: true });
+        current.redirects.push({ op, target: undefined, herestring: true, body: word.value });
       } else if ((op === '>&' || op === '<&') && /^(\d+-?|-)$/.test(word.value)) {
         current.redirects.push({ op, target: undefined, fd: word.value });
       } else {
@@ -277,12 +283,12 @@ const SAFE_GIT_ENV = /^GIT_(TERMINAL_PROMPT|EDITOR|SEQUENCE_EDITOR|PAGER|AUTHOR_
 // Wrappers that run their argument in the same directory. env -C/--chdir and -S/--split-string are excluded below.
 const SAME_DIR_WRAPPERS = new Set(['env', 'timeout', 'nice', 'nohup', 'command', 'time', 'stdbuf', 'setsid', 'xargs']);
 const BRANCH_CHANGING = new Set(['checkout', 'switch', 'symbolic-ref', 'worktree', 'bisect', 'init', 'clone', 'rebase', 'update-ref']);
-const isGitWord = word => /(^|\/)git$/.test(word);
-const literalPath = value => typeof value === 'string' && value !== '' && !/[$`*?[\]{}]/.test(value) && !/^~[^/]/.test(value);
+export const isGitWord = word => /(^|\/)git$/.test(word);
+export const literalPath = value => typeof value === 'string' && value !== '' && !/[$`*?[\]{}]/.test(value) && !/^~[^/]/.test(value);
 
 // Parses one git invocation (words after `git`): -C dirs, anything that makes the target repo unknown,
 // the subcommand and its arguments.
-function parseGitInvocation(args) {
+export function parseGitInvocation(args) {
   const chdirs = [];
   let unsafe;
   let i = 0;
@@ -313,7 +319,7 @@ function sameDirPrefix(prefix) {
   return true;
 }
 
-function cdTarget(cwd, words, home) {
+export function cdTarget(cwd, words, home) {
   const args = words.slice(1).filter(word => !/^-[LPe@]+$/.test(word) && word !== '--');
   if (args.length > 1) return undefined;
   const target = args[0] ?? '~';
@@ -445,7 +451,9 @@ export async function checkCommitBranches(command, baseCwd, rules = [], { branch
   return { reasons: [...new Set(reasons)], verified: blocked ? 0 : verified };
 }
 
-export function analyzeShellCommand(command, rules = []) {
+// fullAuto: keep secret, env-template and push checks plus deny rules, but drop re-checks of ask
+// rules (full-auto projects allow those; full-auto.mjs decides what still asks).
+export function analyzeShellCommand(command, rules = [], { fullAuto = false } = {}) {
   if (typeof command !== 'string' || !command.trim()) return { action: 'allow', reasons: [] };
   const { segments, compound } = scanShell(command);
   const reasons = [];
@@ -479,7 +487,7 @@ export function analyzeShellCommand(command, rules = []) {
     // `git -C d reset --hard`, `timeout 5 git -c x=y stash` and other wrapped/global-option forms
     // slip past wildcards written for `git <sub> ...`: evaluate the canonical form too. Branch-gated
     // add/commit are left to checkCommitBranches.
-    if (rules.length && explicitShellEffect(segment.text, rules)?.effect === 'allow') {
+    if (rules.length && !fullAuto && explicitShellEffect(segment.text, rules)?.effect === 'allow') {
       for (let k = 0; k < segment.words.length; k++) {
         if (!isGitWord(segment.words[k])) continue;
         const { sub, rest } = parseGitInvocation(segment.words.slice(k + 1));
@@ -492,11 +500,11 @@ export function analyzeShellCommand(command, rules = []) {
         }
       }
     }
-    if (!segment.hasCommand && segment.redirects.some(redirect => redirect.file))
+    if (!fullAuto && !segment.hasCommand && segment.redirects.some(redirect => redirect.file))
       reasons.push(`bare redirection ${JSON.stringify(segment.text)} has no command, so OpenCode would not check it`);
     if (compound && segment.redirects.length) {
       const matched = explicitShellEffect(segment.text, rules);
-      if (matched && matched.effect !== 'allow') {
+      if (matched && (fullAuto ? matched.effect === 'deny' : matched.effect !== 'allow')) {
         reasons.push(`segment ${JSON.stringify(segment.text.slice(0, 200))} matches shell ${matched.effect} rule ${JSON.stringify(matched.pattern)} that the native parser drops`);
         if (matched.effect === 'deny') action = 'deny';
       }
@@ -549,8 +557,9 @@ export function downgradeVerifiedCommit(event) {
 
 const listData = value => Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
 
-export async function installShellGuard(ctx, { tools = ['shell', 'bash'], ...options } = {}) {
+export async function installShellGuard(ctx, { tools = ['shell', 'bash'], fullAutoProjects, ...options } = {}) {
   if (typeof ctx?.tool?.hook !== 'function') return;
+  const fullAutoProject = directory => fullAutoProjectFor(directory, ...(fullAutoProjects ? [fullAutoProjects()] : []));
   const permission = ctx.permission;
   const canAsk = typeof permission?.assert === 'function' && typeof permission?.hook === 'function';
   if (canAsk) {
@@ -562,7 +571,15 @@ export async function installShellGuard(ctx, { tools = ['shell', 'bash'], ...opt
         event.message = `Harness shell guard: ${metadata[GUARD_MARKER]}`;
         return;
       }
-      if (event?.action === 'shell' && event.effect === 'ask' && !metadata?.[GUARD_MARKER]) downgradeVerifiedCommit(event);
+      if (event?.effect !== 'ask' || metadata?.[GUARD_MARKER]) return;
+      if (event.action === 'shell' && downgradeVerifiedCommit(event)) return;
+      // Full-auto projects (configure.py --full-auto-project). Reevaluation probes are left alone,
+      // so asks already pending when the profile changes stay with a human.
+      if (metadata?.[PROBE_MARKER]) return;
+      const project = fullAutoProject(ctx.location?.directory);
+      if (!project) return;
+      if (event.action === 'shell') downgradeFullAutoShell(event, project);
+      else if (PATH_ACTIONS.has(event.action) && pathResourcesInside(event.resources, project, ctx.location?.directory)) event.effect = 'allow';
     });
   }
   const rulesFor = async agentID => {
@@ -576,12 +593,27 @@ export async function installShellGuard(ctx, { tools = ['shell', 'bash'], ...opt
     const command = event.input?.command;
     if (typeof command !== 'string') return;
     const rules = await rulesFor(event.agent);
+    const directory = ctx.location?.directory;
+    const workdir = event.input?.workdir;
+    const base = typeof directory === 'string' && directory
+      ? (typeof workdir === 'string' && workdir ? resolveWorkdir(directory, workdir) : directory) : undefined;
+    const project = fullAutoProject(directory);
+    if (project) {
+      // Full-auto: no branch gating and no ask-rule re-checks; only the still-dangerous forms ask.
+      const fullAuto = analyzeShellCommand(command, rules, { fullAuto: true });
+      const reasons = [...fullAuto.reasons, ...fullAutoShellCheck(command, base, project)];
+      if (fullAuto.action === 'deny') throw new Error(`Harness shell guard denied this command: ${reasons.join('; ')}. Split it into separate commands or use the edit/write tools.`);
+      if (!reasons.length) { if (canAsk) rememberFullAuto(event); return; }
+      const reason = `full-auto project ${project.directory}: ${reasons.join('; ')}`;
+      if (!canAsk) throw new Error(`Harness shell guard blocked this command because approval cannot be requested here: ${reason}.`);
+      await permission.assert({
+        sessionID: event.sessionID, agent: event.agent, action: 'shell', resources: [command], save: [],
+        metadata: { [GUARD_MARKER]: reason }, source: { type: 'tool', messageID: event.messageID, id: event.id },
+      });
+      return;
+    }
     const result = analyzeShellCommand(command, rules);
     if (result.action !== 'deny') {
-      const directory = ctx.location?.directory;
-      const workdir = event.input?.workdir;
-      const base = typeof directory === 'string' && directory
-        ? (typeof workdir === 'string' && workdir ? resolveWorkdir(directory, workdir) : directory) : undefined;
       const branch = await checkCommitBranches(command, base, rules, options);
       if (branch.reasons.length) { result.action = 'ask'; result.reasons.push(...branch.reasons); }
       else if (result.action === 'allow' && branch.verified && canAsk) rememberVerifiedCommit(event, rules, branch.verified);

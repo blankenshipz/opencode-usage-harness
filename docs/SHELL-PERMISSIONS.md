@@ -100,6 +100,45 @@ commits (they were not asked before either); `git merge`, `pull`, `cherry-pick`,
 `am` create commits and are allowed as before; session-level permission rules are not visible
 to the guard, so a session-only ask for a gated pattern can be downgraded on a feature branch.
 
+## Per-project full-auto profile
+
+`configure.py --full-auto-project DIR` (repeatable, persisted as `full_auto_projects` in
+`config/configure-choices.json`; `--no-full-auto-project DIR` removes one) enables a near
+full-auto profile for sessions whose location is inside `DIR`. Entries may list extra absolute
+`data_dirs`. The generated profile is unchanged: `plugins/v2/full-auto.mjs` reads the list at
+runtime (cached by mtime, so edits apply without a restart once the plugin is loaded).
+
+Inside such a project the shell guard's `evaluate` hook turns asks into allows:
+
+- `shell`: only for a call the guard inspected in `execute.before` (session + tool-call id) and
+  found free of the forms below; each parsed resource is re-checked (secret patterns, pushes,
+  history rewrites, disks). No inspection, no downgrade. The main/master branch gate does not apply.
+- `external_directory`, `read`, `edit`: when every resource resolves (lexically and through
+  symlinks) inside the project or a data dir.
+
+Deny rules (secret read/edit denials, read-only roles' `shell`/`edit` denies) are never changed.
+Reevaluation probes are not downgraded, so asks already pending stay for a human.
+
+Still asking in a full-auto project (`fullAutoShellCheck`, applied to every segment, wrapped
+command, `$(...)`, `sh/bash -c` and `eval` body, heredoc or here-string fed to a shell or `ssh`,
+and `ssh` remote command):
+
+- force/delete/mirror/prune pushes (all `gitPushDanger` forms), `git branch -d/-D`, `git tag -d`;
+- history rewrites: `rebase`, `commit --amend`, `filter-branch`, `filter-repo`, `reset --hard`,
+  `reflog expire|delete`, `gc --prune*`, `git prune`, `git replace`, `update-ref -d`;
+- `rm`/`rmdir`/`unlink`, `find -delete|-exec rm`, `rsync --delete|--remove-source-files` and
+  truncating redirects (`>`, `>|`, `&>`) whose target is not strictly inside the project or a data
+  dir (`/tmp` included for deletes), is the project root, `*` at the root or `.git`, is non-literal
+  (`$VAR`, braces), comes from `xargs`, or uses `--no-preserve-root`. Remote (`ssh`) deletes ask
+  for `/`, a top-level directory or the remote home (and globs over them). `docker rm`,
+  `compose rm`, `git rm` and similar are not file deletes;
+- `dd`, `mkfs*`, `mkswap`, `shred`, `wipefs`, partitioners, `/dev` block devices;
+- secret-looking paths (words, redirects, and the native `SECRET_SHELL_ASK` patterns);
+- `curl … | bash` (a shell reading piped input), `ssh -o ProxyCommand|LocalCommand`.
+
+Known gaps: script files (`bash deploy.sh`, `python x.py`, `make`) and interpreters (`python -c`,
+`node -e`) run unseen; remote paths are judged lexically; anything not listed above is allowed.
+
 ## Pending asks after a config reload
 
 OpenCode 2.0.30 re-evaluates pending asks only after an "always" reply. An ask raised

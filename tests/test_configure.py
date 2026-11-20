@@ -349,6 +349,32 @@ class ConfigureTests(unittest.TestCase):
         self.assertIn('repo_identity',router['system'])
         self.assertNotIn('repo_identity',p['agents']['harness-builder']['system'])
 
+    def test_full_auto_projects_are_persisted_validated_and_leave_the_profile_alone(self):
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve(); models=root/'models.json'; models.write_text(json.dumps({k:'anthropic/fixture#medium' for k in tiers}))
+            state=root/'state'; config=state/'config'; project=root/'wnc'; project.mkdir(); other=root/'other'; other.mkdir()
+            run=lambda *extra,check=True: subprocess.run([sys.executable,'configure.py','--models',str(models),'--state-dir',str(state),*extra],check=check,capture_output=True,text=True)
+            run('--shell-policy','permissive')
+            before=(config/'opencode.json').read_text()
+            out=run('--replace','--full-auto-project',str(project/'.'))
+            self.assertIn(f'Full-auto projects: {project}.',out.stdout)
+            choices=json.loads((config/'configure-choices.json').read_text())
+            self.assertEqual(choices['full_auto_projects'],[{'directory':str(project),'data_dirs':[]}])
+            self.assertEqual(choices['shell_policy'],'permissive')
+            # Runtime-only: the generated profile does not change.
+            self.assertEqual((config/'opencode.json').read_text(),before)
+            run('--replace','--full-auto-project',str(project),'--full-auto-project',str(other))  # idempotent per directory
+            self.assertEqual([e['directory'] for e in json.loads((config/'configure-choices.json').read_text())['full_auto_projects']],[str(project),str(other)])
+            run('--replace')  # persisted
+            self.assertEqual(len(json.loads((config/'configure-choices.json').read_text())['full_auto_projects']),2)
+            run('--replace','--no-full-auto-project',str(other))
+            self.assertEqual(json.loads((config/'configure-choices.json').read_text())['full_auto_projects'],[{'directory':str(project),'data_dirs':[]}])
+            for bad in ('/', str(root/'missing')):
+                self.assertNotEqual(run('--replace','--full-auto-project',bad,check=False).returncode,0)
+            (config/'configure-choices.json').write_text(json.dumps({'shell_policy':'permissive','full_auto_projects':[{'directory':'relative'}]}))
+            self.assertIn('invalid persisted configure choices',run('--replace',check=False).stderr)
+
     def test_shell_policy_choice_is_persisted_across_replace(self):
         tiers=('FAST','BALANCED','STRONG','MAXIMUM')
         with tempfile.TemporaryDirectory() as tmp:
