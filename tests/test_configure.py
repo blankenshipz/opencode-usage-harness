@@ -487,4 +487,20 @@ class ConfigureTests(unittest.TestCase):
                 self.assertNotIn(tmp,text,name)
                 self.assertIsNone(re.search(r'\b20\d\d-\d\d-\d\d(?:T|\b)|\b1[67]\d{11}\b',text),name)
 
+    def test_permissive_asks_for_dangerous_commands_behind_wrappers(self):
+        import fnmatch
+        p=profile({k:'openai/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')},shell_policy='permissive')
+        rules=[r for r in p['permissions'] if r['action']=='shell']
+        def effect(command):
+            out=None
+            for rule in rules:
+                if fnmatch.fnmatchcase(command,rule['resource']): out=rule['effect']
+            return out
+        for command in ('python3 check_receipt.py -- git push origin main','env X=1 git commit -m x','xargs git push','timeout 5 kill 1',
+                        'nohup git reset --hard','env X=1 sh -c y','xargs rm -rf','find . -name x -exec rm -rf {} +','git commit -m x','sudo ls'):
+            self.assertEqual(effect(command),'ask',command)
+        for command in ('git log --oneline -5','git status','git diff --stat','python3 check_receipt.py run -- pytest -q','pytest -q tests',
+                        'npm run lint','ruff check .','timeout 60 pytest -q','timeout 5 git add x','env X=1 ssh host','xargs grep foo'):
+            self.assertEqual(effect(command),'allow',command)
+
 if __name__=='__main__':unittest.main()

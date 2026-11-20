@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — wrapped dangerous commands ask under the permissive shell policy
+
+- Permissive (`shell *` allow) already allows read-only git, check_receipt.py-wrapped test/lint commands, test runners and linters. The 2026-11-19 asks for those came from the earlier allowlist policy, /tmp and receipts, all fixed since.
+- Hole closed: dangerous commands behind a wrapper matched only the wrapper's prefix and were allowed. Examples: `check_receipt.py -- git push`, `env X=1 git commit`, `xargs git push`, `timeout 5 kill`, `nohup git reset --hard`, `find -exec rm`.
+- `WRAPPED_COMMAND_ASK` now asks for push/commit/reset/rebase/clean/restore/stash, recursive or forced rm, sudo/doas, kill, dd, mkfs, shred, chmod/chown -R and shells. It covers them after env/xargs/timeout/nice/nohup/command/time/stdbuf/setsid/exec/builtin/flock/parallel, after `--`, and for `find -exec/-ok/-execdir/-okdir`. The patterns are word-delimited (`timeout 5 git add` stays allowed).
+
 ## Unreleased — byte-stable system prompt
 
 - Live cache-drift telemetry (2026-11-19): all 18 `drift_observed` rows were `system` drift, in add/remove pairs. The root-progress (router/coordinator) and work-checkpoint (children) reminders were pushed onto `event.system` when due and dropped a turn later, so each one rewrote the whole cached history twice (50–270k tokens).

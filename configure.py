@@ -155,8 +155,19 @@ DANGEROUS_COMMAND_ASK = tuple(p for flag in _RM_RECURSIVE for p in (f'rm {flag} 
     'chmod -R*', 'chmod * -R*', 'chown -R*', 'chown * -R*',
     'sh', 'bash', 'zsh', 'dash', 'sh -*', 'bash -*', 'zsh -*', 'dash -*', 'eval *', 'xargs *rm *', 'find *-delete*',
     'dd *', 'mkfs*', 'shred *', 'kill *', 'pkill *', 'killall *')
+# Wrappers run their argument as a command, so a dangerous command behind one would match only
+# the wrapper's prefix (allowed by `*` under permissive). Ask for the wrapped forms too, including
+# argv after `--` (check_receipt.py and similar runners) and find -exec/-ok.
+_WRAPPED_DANGEROUS = ('git push', 'git commit', 'git reset', 'git rebase', 'git clean', 'git checkout --', 'git restore',
+                      'git stash', 'git filter-branch', 'git update-ref', 'rm -r', 'rm -R', 'rm -f', 'rm --recursive', 'sudo', 'doas',
+                      'kill', 'pkill', 'killall', 'dd', 'mkfs', 'shred', 'chmod -R', 'chown -R', 'sh', 'bash', 'zsh', 'dash', 'eval')
+_SHELL_WRAPPERS = ('env', 'xargs', 'timeout', 'nice', 'nohup', 'command', 'time', 'stdbuf', 'setsid', 'exec', 'builtin', 'flock', 'parallel')
+WRAPPED_COMMAND_ASK = tuple(dict.fromkeys(
+    [f'{w} {f}{c}{t}' for w in _SHELL_WRAPPERS for c in _WRAPPED_DANGEROUS for f in ('', '* ') for t in ('', ' *')] +
+    [f'* -- {c} *' for c in _WRAPPED_DANGEROUS] + [f'* -- {c}' for c in _WRAPPED_DANGEROUS] +
+    ['find *-exec*', 'find *-ok*', 'find *-execdir*', 'find *-okdir*']))
 SECRET_SHELL_ASK = ('*.env*', '*auth.json*', '*.pem*', '*.key*', '*credentials*', '*secret*', '*financial-policy*', '*external-write-grants*')
-DANGEROUS_SHELL_ASK = DANGEROUS_COMMAND_ASK + SECRET_SHELL_ASK
+DANGEROUS_SHELL_ASK = DANGEROUS_COMMAND_ASK + WRAPPED_COMMAND_ASK + SECRET_SHELL_ASK
 # Committed env templates hold placeholder values, not secrets. Exceptions match the exact
 # basename (any directory) and follow the secret deny/ask rules they relax (last match wins).
 # Real .env, .env.local, .env.production, ... stay protected.
@@ -232,7 +243,7 @@ def shell_rules(shell_policy):
         return ([{'action':'shell','resource':'*','effect':'allow'}] +
                 [{'action':'shell','resource':p,'effect':'ask'} for p in SECRET_SHELL_ASK] +
                 [{'action':'shell','resource':p,'effect':'allow'} for p in ENV_TEMPLATE_SHELL_ALLOW] +
-                [{'action':'shell','resource':command,'effect':'ask'} for command in DANGEROUS_COMMAND_ASK])
+                [{'action':'shell','resource':command,'effect':'ask'} for command in DANGEROUS_COMMAND_ASK + WRAPPED_COMMAND_ASK])
     raise ValueError(f'shell_policy must be one of {", ".join(SHELL_POLICIES)}')
 
 # Opt-in scratch space outside the workspace (--allow-tmp-scratch; persisted). Only the native
