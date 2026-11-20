@@ -37,7 +37,16 @@ function normalizeCheck(value, name) {
   };
   if (!CHECK_MODES.includes(result.mode)) throw new Error(`task-intent: invalid ${name}.mode`);
   if (value.artifact !== undefined) result.artifact = text(value.artifact, `${name}.artifact`, 128);
-  if (Object.keys(value).some(key => !['id', 'description', 'mode', 'artifact'].includes(key))) throw new Error(`task-intent: invalid ${name}`);
+  if (value.argv !== undefined) {
+    if (!Array.isArray(value.argv) || value.argv.length < 1 || value.argv.length > 64 || value.argv.some(arg => typeof arg !== 'string' || arg.length > 1000 || arg.includes('\0')) || !value.argv[0]) throw new Error(`task-intent: invalid ${name}.argv`);
+    result.argv = [...value.argv];
+  }
+  if (value.cwd !== undefined) {
+    const cwd = text(value.cwd, `${name}.cwd`, 1000);
+    if (cwd.startsWith('/') || cwd.includes('\0') || cwd.split(/[\\/]/).includes('..')) throw new Error(`task-intent: invalid ${name}.cwd`);
+    result.cwd = cwd;
+  }
+  if (Object.keys(value).some(key => !['id', 'description', 'mode', 'artifact', 'argv', 'cwd'].includes(key))) throw new Error(`task-intent: invalid ${name}`);
   return result;
 }
 
@@ -82,7 +91,7 @@ export const intentSchema = {
     nonGoals: { type: 'array', maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 1000 } },
     authorizedEffects: { type: 'array', maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 1000 } },
     assumptions: { type: 'array', maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 1000 } },
-    checks: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', minLength: 1, maxLength: 128 }, description: { type: 'string', minLength: 1, maxLength: 1000 }, mode: { type: 'string', enum: CHECK_MODES }, artifact: { type: 'string', minLength: 1, maxLength: 128 } }, required: ['id', 'description', 'mode'] } },
+    checks: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', minLength: 1, maxLength: 128 }, description: { type: 'string', minLength: 1, maxLength: 1000 }, mode: { type: 'string', enum: CHECK_MODES }, artifact: { type: 'string', minLength: 1, maxLength: 128 }, argv: { type: 'array', minItems: 1, maxItems: 64, description: 'Optional exact command (no shell) the harness may rerun to verify this check, e.g. ["npm","test"].', items: { type: 'string', maxLength: 1000 } }, cwd: { type: 'string', minLength: 1, maxLength: 1000, description: 'Optional repo-relative working directory for argv (no "..").' } }, required: ['id', 'description', 'mode'] } },
     sourceMessageIDs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 128, pattern: '^msg_[^\\s]+$' } },
   },
   required: INTENT_FIELDS,

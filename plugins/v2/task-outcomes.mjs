@@ -21,6 +21,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { statePath } from './paths.mjs';
+import { recordReviewVerdict } from './review-verdicts.mjs';
 
 const statuses = ['in_progress', 'completed', 'blocked', 'failed'];
 const progressStates = ['working', 'waiting_dependency', 'needs_user_action'];
@@ -236,6 +237,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
         }
         const recorded = { schemaVersion: 2, recordedAt: new Date(timestamp).toISOString(), elapsedScope: 'process_observation', sessionId: sessionID, taskId: taskID, scope: args.scope, messageId: call.messageID, status: args.status, progressState: args.progressState, progressEvidence, attempt, dependencySessionIDs: args.dependencySessionIDs, elapsedMs: startedAt === undefined ? undefined : Math.max(0, timestamp - startedAt), attribution: { intended: selected, recordingActor: actor ? { ...actor, agent: call.agent ?? null, source: 'message.updated', agentSource: 'tool.context', effortSource: actor.effort ? 'message.updated.variant' : 'unavailable', messageId: call.messageID } : undefined, actualKnown: !!actor }, escalationReason: args.escalationReason, validationEvidence: args.validationEvidence, results, blocker, repairs: args.repairs, userCorrections: args.userCorrections, observedArtifactGenerations: observedArtifactGenerations.length ? observedArtifactGenerations : undefined, selfReported: true };
         await append(recorded);
+        void recordReviewVerdict({ agent: call.agent ?? actor?.agent, scope: args.scope, status: args.status, sessionId: sessionID, directory: call.directory ?? ctx.directory ?? ctx.location?.directory, now: timestamp });
         try { await milestoneStore.record(recorded); } catch { /* UI reporting must not affect checkpoint acceptance. */ }
         return observedArtifactGenerations;
       };
