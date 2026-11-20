@@ -153,6 +153,7 @@ export function quotaPace(quota, now=Date.now(), provider='openai') {
   return 'normal';
 }
 // Model selection does not grant provider access or bypass the subscription guard.
+export const ROUTINE_MECHANICAL_DEMOTION=false;
 export function selectDispatchModel({input,agent,agents,record,child,quota,hasActiveDescendant=false}) {
   const configured=modelReference(agent.model), observed=modelReference(child?.model);
   const explicit=modelReference(input.model);
@@ -218,9 +219,9 @@ export function selectDispatchModel({input,agent,agents,record,child,quota,hasAc
   if (fitContext?.strict && !fitContext.supportedPreferred.includes(configured)) throw taskFitError();
   const role=canonicalHarnessRole(input.agent);
   const routineNormal=!override && input.routing?.complexity==='routine' && input.routing?.risk==='normal';
-  // Routine normal-risk mechanical builder work is quick-builder work whatever
-  // the pace: routers often hand it to harness-builder, leaving FAST idle.
-  const mechanical=routineNormal && role==='builder' && input.routing?.taskType==='mechanical';
+  // The any-pace routine_mechanical demotion to quick-builder is disabled (r20: it never
+  // matched in practice; routers tag dispatches standard/complex). Pace demotion remains.
+  const mechanical=ROUTINE_MECHANICAL_DEMOTION && routineNormal && role==='builder' && input.routing?.taskType==='mechanical';
   if (routineNormal && (mechanical || (pace==='ahead' && ['builder','deep-debugger'].includes(role)))) {
     const fast=modelReference(agents.find(a=>harnessRoleIDs('quick-builder').includes(a.id??a.name))?.model);
     // Never cross providers as a pacing fallback. The worker retains its role,

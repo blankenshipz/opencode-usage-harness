@@ -22,12 +22,12 @@ test('only explicitly routine normal risk work is paced down within provider',()
  for (const routing of [{complexity:'complex',risk:'normal'},{complexity:'routine',risk:'high'}]) assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing}}).selected,'openai/balanced#medium');
  assert.equal(selectDispatchModel({...base,input:{agent:'builder',routing:{complexity:'routine',risk:'normal'}},agents:[agent,{id:'quick-builder',model:'other/fast#low'}]}).selected,'openai/balanced#medium');
 });
-test('routine normal-risk mechanical builder work uses quick-builder at any pace, same provider only',()=>{
+test('routine_mechanical any-pace demotion is disabled',()=>{
  const stale={checked_at:new Date(0).toISOString(),buckets:[]};
  const mech={complexity:'routine',risk:'normal',taskType:'mechanical'};
  let r=selectDispatchModel({...base,quota:stale,input:{agent:'builder',routing:mech}});
- assert.equal(r.selected,'openai/fast#low'); assert.equal(r.source,'routine_mechanical');
- assert.equal(selectDispatchModel({...base,quota:stale,input:{agent:'harness-builder',routing:mech}}).selected,'openai/fast#low');
+ assert.equal(r.selected,'openai/balanced#medium'); assert.notEqual(r.source,'routine_mechanical');
+ assert.equal(selectDispatchModel({...base,quota:stale,input:{agent:'harness-builder',routing:mech}}).selected,'openai/balanced#medium');
  // Not mechanical, not routine, high risk, other roles, explicit model, other provider: unchanged.
  for (const routing of [{...mech,taskType:'implementation'},{...mech,complexity:'standard'},{...mech,risk:'high'}])
   assert.equal(selectDispatchModel({...base,quota:stale,input:{agent:'builder',routing}}).selected,'openai/balanced#medium');
