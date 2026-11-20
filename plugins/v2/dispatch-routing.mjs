@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { burnAhead } from './burn-pacing.mjs';
 import path from 'node:path';
 import { managedConfigRoot } from './paths.mjs';
 import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
@@ -147,6 +148,8 @@ export function quotaPace(quota, now=Date.now(), provider='openai') {
   if (!Number.isFinite(checked) || now-checked>120000 || checked>now+5000) return 'unknown';
   const windows=(quota.pools ? quota.pools[provider]?.windows?.filter(w=>w.scope==='account')??[] : provider==='openai' ? (quota.buckets??[]).flatMap(b=>b.windows??[]) : []).filter(w=>Number.isFinite(w.pace_delta));
   if (!windows.length) return 'unknown';
+  // r20 item 4: a trailing weekly burn above the sustainable rate to reset also counts as ahead.
+  if (burnAhead(provider,windows,now)) return 'ahead';
   if (windows.some(w=>w.pace_delta>10
     || (w.remaining_percent<=10 && (!Number.isFinite(w.duration_minutes) || w.duration_minutes<10080)))) return 'ahead';
   if (windows.every(w=>w.pace_delta < -10)) return 'behind';
