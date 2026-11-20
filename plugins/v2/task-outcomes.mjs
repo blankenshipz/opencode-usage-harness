@@ -159,6 +159,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
     const readScope = await installReadScope(ctx);
     const reevaluation = await installPermissionReevaluation(ctx);
     const parkYield = installParkYield(ctx);
+    const envCard = await (await import('./env-card.mjs')).installEnvCard(ctx); void envCard;
     const quotaSampler = installQuotaSampler(ctx, { read: dispatchOptions?.loadQuota ?? (ctx?.location?.directory ? readRoutingQuota : undefined) });
     await installRepoIdentity(ctx);
     const shared = await installTaskDispatch(ctx,dispatchOptions);
