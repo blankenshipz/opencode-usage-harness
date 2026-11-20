@@ -347,7 +347,11 @@ def _native_recovery(item, message_id):
     if error.get("type") not in ("provider.internal", "provider.transport") or retry.get("error") != error:
         return None
     status = error.get("status")
-    if status is not None and (not isinstance(status, int) or isinstance(status, bool) or not 500 <= status < 600):
+    # r26: a transport reset in the middle of a streamed response keeps the
+    # HTTP 200 of the opened stream (13:41 EST Nov 20 ECONNRESET); native
+    # retry evidence is still required below.
+    transport_mid_stream = error.get("type") == "provider.transport" and status == 200
+    if status is not None and not transport_mid_stream and (not isinstance(status, int) or isinstance(status, bool) or not 500 <= status < 600):
         return None
     attempt, at = retry.get("attempt"), retry.get("at")
     if not isinstance(attempt, int) or isinstance(attempt, bool) or not 2 <= attempt <= 1000000:
@@ -411,8 +415,20 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
         assistant = None
         receipt = None
         recoveries, pending_recovery, recovered_identity = [], None, None
+        # r26: an interrupted generation that the same child resumes (one
+        # interrupted idle, then a plain user "continue" that is not another
+        # dispatch) stays bound to its admitted prompt; only the final
+        # stop+succeeded chain after the last resume is the receipt.
+        aborted, awaiting_resume, resumes = False, False, []
         harness_compactions = mid_run_compaction_ids(marker)
         for ident, seq, kind, data in after:
+            if awaiting_resume:
+                if kind != "user" or len(resumes) >= 8: return None
+                try: resume_text = json.loads(data).get("text")
+                except (TypeError, json.JSONDecodeError, AttributeError): resume_text = None
+                if isinstance(resume_text, str) and "task-dispatch-generation-" in resume_text: return None
+                resumes.append(str(ident)); awaiting_resume = False
+                continue
             # A completed harness mid-run compaction runs at a step boundary
             # (possibly right after the final answer); it neither extends nor
             # supersedes the result.
@@ -448,7 +464,13 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
                     return None
                 if item.get("error") or finish in ("error", "cancelled", "aborted"):
                     pending_recovery = _native_recovery(item, ident)
-                    if pending_recovery is None or len(recoveries) >= 8: return None
+                    if pending_recovery is None:
+                        # A user/system abort: acceptable only if the next row
+                        # is an interrupted idle that is later resumed.
+                        if aborted: return None
+                        aborted, assistant = True, None
+                        continue
+                    if len(recoveries) >= 8: return None
                     recovered_identity = _assistant_identity(item)
                     continue
                 if finish == "stop":
@@ -457,11 +479,14 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
                 elif finish not in ("tool-calls", "tool_calls", None):
                     return None
             elif kind == "idle":
-                if assistant is None: return None
                 try:
                     idle = json.loads(data)
                     outcome = idle.get("outcome")
                 except (TypeError, json.JSONDecodeError): return None
+                if outcome == "interrupted" and receipt is None:
+                    aborted, assistant, recovered_identity, awaiting_resume = False, None, None, True
+                    continue
+                if aborted or assistant is None: return None
                 if outcome != "succeeded": return None
                 receipt = {"promptID": prompt_id, "assistantID": assistant[0], "assistantSeq": assistant[1], "idleID": str(ident), "idleSeq": int(seq)}
                 timing = idle.get("time")
@@ -470,7 +495,9 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
                     receipt["completedAt"] = completed_at
                 if recoveries:
                     receipt["recoveredProviderErrors"] = recoveries
-        return None if pending_recovery is not None else receipt
+                if resumes:
+                    receipt["resumedAfterInterrupt"] = resumes
+        return None if (pending_recovery is not None or awaiting_resume or aborted) else receipt
 
 
 def _terminal_prompt(connection, session_id: str, marker: str, prompt_hash: str):

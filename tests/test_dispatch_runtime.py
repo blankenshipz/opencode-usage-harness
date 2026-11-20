@@ -258,6 +258,11 @@ class DispatchRuntimeTest(unittest.TestCase):
         self.assertEqual(receipt["assistantID"],"answer")
         self.assertEqual(receipt["recoveredProviderErrors"],[{"errorID":"failed","recoveryID":"recovery","type":"provider.transport","attempt":2}])
         self.assertNotIn("PRIVATE",json.dumps(receipt))
+        # r26: mid-stream transport reset keeps the opened stream's HTTP 200
+        reset=deepcopy(failed); reset["error"]["status"]=200; reset["retry"]["error"]["status"]=200
+        self.assertEqual(read([("failed","assistant",reset)]+base[1:])["assistantID"],"answer")
+        internal=deepcopy(reset); internal["error"]["type"]=internal["retry"]["error"]["type"]="provider.internal"
+        self.assertIsNone(read([("failed","assistant",internal)]+base[1:]))
         internal=deepcopy(base);internal[0][2]["error"]["type"]="provider.internal";internal[0][2]["retry"]["error"]=deepcopy(internal[0][2]["error"])
         self.assertIsNotNone(read(internal))
         shell=deepcopy(base);shell.insert(2,("shell","synthetic",{"text":"retained shell result"}));self.assertIsNotNone(read(shell))
@@ -300,6 +305,33 @@ class DispatchRuntimeTest(unittest.TestCase):
             for n in range(count):repeated.extend([(f"error-{n}","assistant",deepcopy(failed)),(f"recovery-{n}","synthetic",synthetic)])
             result=read(repeated+base[2:])
             self.assertEqual(result is not None,count==8)
+
+    def test_completion_receipt_accepts_interrupted_then_resumed_generation(self):
+        marker="marker-r26"; text=f"work\nDispatch completion marker: {marker}"; digest=__import__('hashlib').sha256(text.encode()).hexdigest()
+        aborted={"finish":"aborted","time":{"completed":2},"error":{"name":"MessageAbortedError"},"content":[]}
+        good={"finish":"stop","time":{"completed":5},"content":[{"type":"text","text":"done"}]}
+        def read(rows):
+            tmp=tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup); db=Path(tmp.name)/"opencode.db"
+            with sqlite3.connect(db) as c:
+                c.executescript("create table session_v2 (id text, idle_outcome text); create table session_message (id text,session_id text,type text,seq integer,data text); create table session_inbox (id text,session_id text,type text,payload text,delivery text,enqueued_seq integer,time_created integer);")
+                c.execute("insert into session_v2 values ('child','succeeded')")
+                c.execute("insert into session_message values ('prompt','child','user',1,?)",(json.dumps({"text":text}),))
+                c.executemany("insert into session_message values (?,'child',?,?,?)",[(i,k,n+2,json.dumps(d)) for n,(i,k,d) in enumerate(rows)])
+            return completion_receipt("child",marker,digest,db_path=db)
+        base=[("a1","assistant",aborted),("i1","idle",{"outcome":"interrupted"}),("resume","user",{"text":"continue"}),("answer","assistant",good),("idle","idle",{"outcome":"succeeded"})]
+        r=read(base)
+        self.assertEqual((r["assistantID"],r["idleID"],r["resumedAfterInterrupt"]),("answer","idle",["resume"]))
+        # interrupted idle directly after a tool step, then resumed
+        self.assertEqual(read(base[1:])["assistantID"],"answer")
+        # still interrupted, not resumed: no receipt
+        self.assertIsNone(read(base[:2]))
+        self.assertIsNone(read(base[:3]))
+        # resume that is another dispatch is never folded in
+        self.assertIsNone(read(base[:2]+[("resume","user",{"text":"x task-dispatch-generation-other"})]+base[3:]))
+        # abort followed by a succeeded idle (no interrupt) stays rejected
+        self.assertIsNone(read([("a1","assistant",aborted),("idle","idle",{"outcome":"succeeded"})]))
+        # user message without a preceding interrupt stays rejected
+        self.assertIsNone(read([("resume","user",{"text":"continue"}),("answer","assistant",good),("idle","idle",{"outcome":"succeeded"})]))
 
     def test_completion_receipt_rejects_tool_error_cancel_compaction_pending_and_ambiguous_prompt(self):
         marker="marker-2"; text=f"work\nDispatch completion marker: {marker}"; digest=__import__('hashlib').sha256(text.encode()).hexdigest()

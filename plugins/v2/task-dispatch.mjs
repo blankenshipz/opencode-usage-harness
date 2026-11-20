@@ -16,6 +16,7 @@ import { reserveWriterLease, finishWriterLease, writerPathsOverlap } from './glo
 import { intentSchema, getIntent, setIntent, inferIntent, resolveIntentBinding, renderIntent, renderIntentReference } from './task-intent.mjs';
 import { packageRoot, statePath } from './paths.mjs';
 import { createWorkerProgress } from './worker-progress.mjs';
+import { recordReviewGate, pendingReviewGate, mainLandingCommand, gateMessage } from './review-gate.mjs';
 import { admissionDenial, denialAdvice, receipt, suppression } from './denial-recovery.mjs';
 import { quotaRecoveryReceipt, enqueueQuotaRecovery, deliverQuotaRecovery, pendingQuotaRecovery, quotaRecoverySyntheticInput } from './quota-recovery.mjs';
 import { guardNativeDispatch, isHarnessDispatchInput, isNativeAgent, canonicalHarnessRole } from './agent-mode.mjs';
@@ -409,8 +410,22 @@ export function taskWorkStatus(state,rootID,taskId) {
   const review=(state.workReviews??[]).find(r=>r.rootID===rootID&&r.taskId===taskId);
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
+const gitBranch = directory => new Promise((resolve,reject)=>execFile('git',['-C',directory,'rev-parse','--abbrev-ref','HEAD'],{timeout:3000},(error,stdout)=>error?reject(error):resolve(String(stdout))));
 export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, loadDeliveryEvidence = runtimeDeliveryEvidence, deliverySchedule, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot, parkMonitor = defaultParkMonitor, appendOutcome } = {}) {
   if (!ctx.agent?.list) return;
+  if (typeof ctx.tool?.hook==='function') await ctx.tool.hook('execute.before', async event => {
+    if (event?.tool!=='bash' && event?.tool!=='shell') return;
+    const command=event.input?.command;
+    if (typeof command!=='string' || !/\bgit\b/.test(command) || !/\b(push|merge)\b/.test(command)) return;
+    const directory=ctx.location?.directory ?? workspace;
+    let branch;
+    try { branch=(await gitBranch(directory)).trim(); } catch { branch=undefined; }
+    if (!mainLandingCommand(command,branch)) return;
+    const sessions=await loadSessions(); const rootID=lineage(sessions,event.sessionID);
+    if (!rootID) return;
+    const gates=await registry(workspace,async state=>pendingReviewGate(state,rootID));
+    if (gates?.length) throw new Error(gateMessage(gates));
+  });
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
   const workspace = path.resolve(ctx.location?.directory ?? packageRoot);
   const settleTerminal = createTerminalSettler({ registry, globalRegistry, workspace,
@@ -846,7 +861,12 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           state.workReviews=(state.workReviews??[]).filter(r=>r.rootID!==rootID||r.taskId!==input.taskId);
           state.workReviews.push({rootID,taskId:input.taskId,steps:total.steps,continuations:total.continuations,...review,at:now()});
         }
-        const routedInput=await resolveReviewProvenance({input,state,sessions,rootID,record,requested,loadCompletionReceipt});
+        let routedInput;
+        try { routedInput=await resolveReviewProvenance({input,state,sessions,rootID,record,requested,loadCompletionReceipt}); }
+        catch (error) {
+          if (input.routing?.reviewIndependence==='required' || input.routing?.reviewOfChildID || record?.routing?.reviewIndependence==='required') { recordReviewGate(state,{rootID,taskId:input.taskId,reason:error?.message,at:now()}); await save(); }
+          throw error;
+        }
         const routing=selectDispatchModel({input:routedInput,agent,agents,record,child,quota,
           hasActiveDescendant:Boolean(requested && sessions.some(session=>session.active&&descendant(sessions,session.id,requested)))});
         if (routedInput.routing?.reviewProvenance) routing.reviewProvenance=routedInput.routing.reviewProvenance;
@@ -1159,6 +1179,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     if(args.scope==='task'&&args.status==='completed') {
       const busy=state.records.some(r=>r.rootID===rootID&&r.taskId===args.taskId&&(r.inFlight||sessions.some(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID)))));
       if(busy) throw new Error('task-intent: collect active workers before completing the full user outcome');
+      const gates=pendingReviewGate(state,rootID);
+      if(gates.length) throw new Error(gateMessage(gates));
     }
     const progressEvidence = normalizeProgressEvidence(args.progressEvidence);
     // Validate on a copy before accepting/recording an outcome. A rejected outcome
