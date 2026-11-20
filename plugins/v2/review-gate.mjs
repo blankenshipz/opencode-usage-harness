@@ -18,33 +18,39 @@ export function recordReviewGate(state, { rootID, taskId, reason, at }) {
   if (state.reviewGates.length > 200) state.reviewGates = state.reviewGates.slice(-200);
 }
 
-export function pendingReviewGate(state, rootID) {
-  const records = (state.records ?? []).filter(r => r.rootID === rootID);
-  const pending = records.filter(r => isRequiredReview(r) && !reviewDone(r) && !['denied', 'cancelled', 'superseded', 'not_started'].includes(r.state))
+export const GATE_TTL_MS = 24 * 3600_000;
+const LIVE = new Set(['starting', 'running', 'awaiting_continuation', 'awaiting_recovery']);
+// taskId: limit to one task (completion); omitted: any task of the root (git landing).
+export function pendingReviewGate(state, rootID, { taskId, now = Date.now() } = {}) {
+  const records = (state.records ?? []).filter(r => r.rootID === rootID && (taskId === undefined || r.taskId === taskId));
+  const pending = records.filter(r => isRequiredReview(r) && !reviewDone(r) && (LIVE.has(r.state) || r.inFlight))
     .map(r => ({ kind: 'pending', taskId: r.taskId, workKey: r.workKey, childID: r.childID, state: r.state }));
-  const gated = (state.reviewGates ?? []).filter(g => g.rootID === rootID)
+  const gated = (state.reviewGates ?? []).filter(g => g.rootID === rootID && (taskId === undefined || g.taskId === taskId) && now - g.at < GATE_TTL_MS)
     .filter(g => !records.some(r => isRequiredReview(r) && r.taskId === g.taskId && reviewDone(r) && (r.updatedAt ?? 0) >= g.at))
     .map(g => ({ kind: 'gated', taskId: g.taskId, reason: g.reason, at: g.at }));
   return [...pending, ...gated];
 }
 
-const segments = command => command.split(/&&|\|\||;|\n|\|/).map(s => s.trim()).filter(Boolean);
-// Returns true when a command segment is a git push/merge that can land on main.
+const segments = command => command.replace(/["'\\]/g, ' ').split(/&&|\|\||;|\n|\||\(|\)|`|\$\(/).map(s => s.trim()).filter(Boolean);
+const MAIN = /(^|[:/+])(main|master)$/;
+// True when a command segment is a git push/merge that can land on main. Quotes and
+// nested shells (bash -c "...") are flattened; an unknown branch counts as main.
 export function mainLandingCommand(command, currentBranch) {
+  const onMain = currentBranch === undefined || ['main', 'master', 'HEAD'].includes(currentBranch);
   for (const seg of segments(command)) {
     const words = seg.split(/\s+/);
-    const g = words.findIndex(w => w === 'git' || w.endsWith('/git'));
-    if (g < 0) continue;
-    let i = g + 1;
-    while (i < words.length && words[i].startsWith('-')) i += (['-C', '-c'].includes(words[i]) ? 2 : 1);
-    const sub = words[i], rest = words.slice(i + 1);
-    if (sub !== 'push' && sub !== 'merge') continue;
-    const mentionsMain = rest.some(w => /(^|[:/+])(main|master)$/.test(w) || /^(HEAD:)?refs\/heads\/(main|master)$/.test(w));
-    if (sub === 'push' && mentionsMain) return true;
-    const positional = rest.filter(w => !w.startsWith('-'));
-    if (sub === 'push' && positional.length <= 1 && ['main', 'master'].includes(currentBranch)) return true;
-    if (sub === 'merge' && ['main', 'master'].includes(currentBranch)) return true;
-    if (sub === 'push' && rest.includes('--all')) return true;
+    for (let g = 0; g < words.length; g++) {
+      if (!(words[g] === 'git' || words[g].endsWith('/git'))) continue;
+      let i = g + 1;
+      while (i < words.length && words[i].startsWith('-')) i += (['-C', '-c', '--git-dir', '--work-tree'].includes(words[i]) ? 2 : 1);
+      const sub = words[i], rest = words.slice(i + 1);
+      if (sub === 'push') {
+        if (rest.some(w => ['--all', '--mirror'].includes(w))) return true;
+        const positional = rest.filter(w => !w.startsWith('-'));
+        if (positional.slice(1).some(w => MAIN.test(w) || /^\+?(HEAD:)?refs\/heads\/(main|master)$/.test(w))) return true;
+        if (onMain && (positional.length <= 1 || positional.slice(1).some(w => /^\+?HEAD(:|$)/.test(w) || w === '@'))) return true;
+      } else if (sub === 'merge' && onMain && !rest.some(w => ['--abort', '--quit'].includes(w))) return true;
+    }
   }
   return false;
 }

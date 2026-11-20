@@ -17,14 +17,22 @@ const envMs = (name, fallback) => { const raw = process.env[name]; return typeof
 export const NOTIFY_AFTER_MS = envMs('HARNESS_PARK_NOTIFY_MS', 3 * 60_000);
 export const PARK_AFTER_MS = envMs('HARNESS_PARK_AFTER_MS', 5 * 60_000);
 export const PENDING_ASKS_FILE = statePath('asks', 'pending.json');
-const SECRETISH = /((?:token|secret|password|passwd|api[_-]?key|authorization|bearer|hmac|header_value)\S*\s*[=:]?\s*)\S+/gi;
+const REDACTIONS = [
+  [/\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|KEY|AUTH|CREDENTIAL|HMAC|COOKIE)[A-Za-z0-9_]*)=\S+/gi, '$1=[redacted]'],
+  [/\b(authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie|header_value)\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?\S+/gi, '$1: [redacted]'],
+  [/\b(bearer|basic)\s+\S+/gi, '$1 [redacted]'],
+  [/(--?(?:token|password|passwd|api-key|apikey|key|secret|auth|hmac)(?:=|\s+))\S+/gi, '$1[redacted]'],
+  [/(:\/\/[^\s:@/]+:)[^\s@/]+@/g, '$1[redacted]@'],
+  [/\b[A-Za-z0-9_\-+/=]{24,}\b/g, '[redacted]'],
+];
 // A short, redacted, single-line description of what the ask wants.
 export function askSummary(data = {}) {
   const kind = String(data.permission ?? data.type ?? data.action ?? 'unknown').slice(0, 40);
   const patterns = Array.isArray(data.patterns) ? data.patterns : (typeof data.pattern === 'string' ? [data.pattern] : []);
   const subject = patterns.length ? patterns.join(' ') : String(data.title ?? data.metadata?.command ?? '');
-  const text = `${kind}: ${subject}`.replace(/[\r\n\t]+/g, ' ').replace(SECRETISH, '$1[redacted]').replace(/\b[A-Za-z0-9_\-]{32,}\b/g, '[redacted]');
-  return text.length > 160 ? text.slice(0, 157) + '...' : text;
+  const text = `${kind}: ${subject}`.replace(/[\r\n\t]+/g, ' ');
+  const redacted = REDACTIONS.reduce((t, [re, to]) => t.replace(re, to), text);
+  return redacted.length > 160 ? redacted.slice(0, 157) + '...' : redacted;
 }
 // Stable, documented file for other tools (workrelay queued_behind):
 // {schemaVersion:1, updatedAt, asks:[{requestID, sessionID, since, summary, stalled, parked}]}

@@ -38,9 +38,12 @@ test('weekly projection and fail-open on missing data', () => {
   assert.equal(Math.round(weeklyProjection(q(50, 2), 'openai', NOW).projected), 98);
   assert.equal(weeklyProjection({}, 'openai', NOW), undefined);
   const nob = { pools: { openai: { windows: [{ scope: 'account', duration_minutes: 10080, used_percent: 99, resets_at: NOW + 3600_000 }] } } };
-  assert.equal(budgetBrake({ quota: nob, now: NOW, newChild: true, env, burn: () => undefined }), undefined);
+  const noReset = { pools: { openai: { windows: [{ scope: 'account', duration_minutes: 10080, used_percent: 99 }] } } };
+  assert.equal(budgetBrake({ quota: noReset, now: NOW, newChild: true, env, agent: 'builder', burn: () => ({ ratePerHour: 5 }) }), undefined);
+  assert.equal(budgetBrake({ quota: nob, now: NOW, newChild: true, env, agent: 'builder', burn: () => undefined }), undefined); // week avg keeps it < 100%
   assert.equal(budgetBrake({ quota: undefined, now: NOW, newChild: true, env }), undefined);
-  assert.ok(budgetBrake({ quota: nob, now: NOW, newChild: true, env, burn: () => ({ ratePerHour: 2 }) }));
+  const hot = { pools: { openai: { windows: [{ scope: 'account', duration_minutes: 10080, used_percent: 30, resets_at: NOW + 24 * 3600_000 }] } } };
+  assert.equal(budgetBrake({ quota: { pools: { openai: { windows: [{ ...hot.pools.openai.windows[0], used_percent: 99.8 }] } } }, now: NOW, newChild: true, env, agent: 'builder' }).level, 2);
 });
 test('level 1 caps builders to one active child per root; user priority allowed', () => {
   const base = { quota: q(60, 2), now: NOW, newChild: true, rootID: 'root', records, sessions, env, agent: 'builder' }; // 108%
@@ -62,4 +65,12 @@ test('level 2 refuses builders unless user-requested; exemptions and env overrid
   assert.equal(budgetBrake({ ...base, newChild: false }), undefined);
   assert.equal(budgetBrake({ ...base, env: { HARNESS_BUDGET_BRAKE: 'off' } }), undefined);
   assert.equal(budgetBrake({ ...base, quota: q(50, 1) }), undefined); // 74%
+});
+
+test('r26 fable: a short burst is not extrapolated over the week; non-builders are never braked', () => {
+  // 30% used after 48 h (avg 0.625/h, 120 h left -> 105%); trailing burst 3/h would project 390%.
+  const quota = { pools: { openai: { windows: [{ scope: 'account', duration_minutes: 10080, used_percent: 30, resets_at: new Date(NOW + 120 * 3600_000).toISOString() }] } } };
+  const p = weeklyProjection(quota, 'openai', NOW, () => ({ ratePerHour: 3 }));
+  assert.equal(Math.round(p.projected), 105);
+  for (const agent of ['router', 'explorer', undefined]) assert.equal(budgetBrake({ quota: q(60, 3), now: NOW, newChild: true, rootID: 'root', records: [], sessions, env, agent }), undefined);
 });

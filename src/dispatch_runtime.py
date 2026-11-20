@@ -383,6 +383,9 @@ def _harness_compaction(kind: str, ident: object, data: object, allowed: set[str
     return isinstance(item, dict) and item.get("reason") == "manual" and item.get("status") in statuses
 
 
+_RESUME_TEXT = re.compile(r"^\s*(continue|resume|go on|keep going|proceed|please continue|continue where you left off)[\s.!]*$", re.I)
+
+
 def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_path: str | Path | None = None) -> dict[str, object] | None:
     """Return only a terminal chain bound to one exact dispatched prompt."""
     accepted = set(prompt_hash.split(","))
@@ -426,7 +429,9 @@ def completion_receipt(session_id: str, marker: str, prompt_hash: str, *, db_pat
                 if kind != "user" or len(resumes) >= 8: return None
                 try: resume_text = json.loads(data).get("text")
                 except (TypeError, json.JSONDecodeError, AttributeError): resume_text = None
-                if isinstance(resume_text, str) and "task-dispatch-generation-" in resume_text: return None
+                # Only a plain resume instruction continues the same assignment; any other
+                # message is a different instruction and never binds to this prompt.
+                if not isinstance(resume_text, str) or not _RESUME_TEXT.match(resume_text): return None
                 resumes.append(str(ident)); awaiting_resume = False
                 continue
             # A completed harness mid-run compaction runs at a step boundary

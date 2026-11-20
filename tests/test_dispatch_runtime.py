@@ -332,6 +332,9 @@ class DispatchRuntimeTest(unittest.TestCase):
         self.assertIsNone(read([("a1","assistant",aborted),("idle","idle",{"outcome":"succeeded"})]))
         # user message without a preceding interrupt stays rejected
         self.assertIsNone(read([("resume","user",{"text":"continue"}),("answer","assistant",good),("idle","idle",{"outcome":"succeeded"})]))
+        # a different instruction after the interrupt is not a resume
+        self.assertIsNone(read(base[:2]+[("resume","user",{"text":"stop, just summarise"})]+base[3:]))
+        self.assertEqual(read(base[:2]+[("resume","user",{"text":"Continue."})]+base[3:])["assistantID"],"answer")
 
     def test_completion_receipt_rejects_tool_error_cancel_compaction_pending_and_ambiguous_prompt(self):
         marker="marker-2"; text=f"work\nDispatch completion marker: {marker}"; digest=__import__('hashlib').sha256(text.encode()).hexdigest()

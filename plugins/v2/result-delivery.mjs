@@ -101,11 +101,16 @@ export function createResultDelivery({ registry, workspace, ctx, loadEvidence, l
       record.updatedAt = Date.now(); await save();
       return patch.status;
     });
-    if (ended && verify) {
-      const verification = await verifySessionEnd({ record:verify.record, intent:verify.intent, directory:workspace }).catch(() => undefined);
-      if (verification) ended = sessionEndOutcome({ record:verify.record, receipt:verify.receipt, verification });
-    }
     if (ended) await Promise.resolve().then(() => appendOutcome(ended)).catch(() => {});
+    // r26 item 3: the session-end line above is written first (checksVerified:false). The declared
+    // check argv are then rerun in the child's own directory without blocking delivery, and a
+    // second line records the real exit codes.
+    if (ended && verify) void (async () => {
+      let directory = workspace;
+      try { const child = (await loadSessions?.())?.find(s => s.id === verify.record.childID); if (typeof child?.directory === 'string' && child.directory) directory = child.directory; } catch { /* fall back to workspace */ }
+      const verification = await verifySessionEnd({ record:verify.record, intent:verify.intent, directory }).catch(() => undefined);
+      if (verification) await appendOutcome({ ...sessionEndOutcome({ record:verify.record, receipt:verify.receipt, verification }), scope:'session_end_checks', directory }).catch(() => {});
+    })();
     return status;
   };
   const run = async (key, generation) => {

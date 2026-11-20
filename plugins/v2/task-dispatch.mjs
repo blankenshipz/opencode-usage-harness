@@ -423,7 +423,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     if (!mainLandingCommand(command,branch)) return;
     const sessions=await loadSessions(); const rootID=lineage(sessions,event.sessionID);
     if (!rootID) return;
-    const gates=await registry(workspace,async state=>pendingReviewGate(state,rootID));
+    const gates=await registry(workspace,async state=>pendingReviewGate(state,rootID,{now:now()}));
     if (gates?.length) throw new Error(gateMessage(gates));
   });
   const workerProgress = createWorkerProgress(ctx, { loadSessions });
@@ -878,7 +878,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
         let routedInput;
         try { routedInput=await resolveReviewProvenance({input,state,sessions,rootID,record,requested,loadCompletionReceipt}); }
         catch (error) {
-          if (input.routing?.reviewIndependence==='required' || input.routing?.reviewOfChildID || record?.routing?.reviewIndependence==='required') { recordReviewGate(state,{rootID,taskId:input.taskId,reason:error?.message,at:now()}); await save(); }
+          if (input.routing?.reviewIndependence==='required' || record?.routing?.reviewIndependence==='required') { recordReviewGate(state,{rootID,taskId:input.taskId,reason:error?.message,at:now()}); await save(); }
           throw error;
         }
         const routing=selectDispatchModel({input:routedInput,agent,agents,record,child,quota,
@@ -1193,7 +1193,7 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     if(args.scope==='task'&&args.status==='completed') {
       const busy=state.records.some(r=>r.rootID===rootID&&r.taskId===args.taskId&&(r.inFlight||sessions.some(s=>s.active&&(s.id===r.childID||descendant(sessions,s.id,r.childID)))));
       if(busy) throw new Error('task-intent: collect active workers before completing the full user outcome');
-      const gates=pendingReviewGate(state,rootID);
+      const gates=pendingReviewGate(state,rootID,{taskId:args.taskId,now:now()});
       if(gates.length) throw new Error(gateMessage(gates));
     }
     const progressEvidence = normalizeProgressEvidence(args.progressEvidence);

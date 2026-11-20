@@ -32,7 +32,7 @@ test('skips non-allowlisted runners, escaping cwd and bash outside the repo; ski
     { id: 'curl', argv: ['curl', 'x'] }, { id: 'abs', argv: ['/usr/bin/node', '-v'] }, { id: 'up', argv: ['node', '-v'], cwd: '../' },
     { id: 'bashc', argv: ['bash', '-c', 'true'] }, { id: 'bashout', argv: ['bash', '/etc/profile'] }, { id: 'bashok', argv: ['bash', 'check.sh'] }, { id: 'noargv' },
   ] });
-  assert.deepEqual(r.skipped, ['curl', 'abs', 'up', 'bashc', 'bashout']);
+  assert.deepEqual(r.skipped, ['curl', 'abs', 'up', 'bashc', 'bashout', 'noargv']);
   assert.deepEqual(calls.map(c => c.file), ['bash']);
   assert.equal(calls[0].options.shell, false);
   assert.equal(calls[0].options.maxBuffer, 1024 * 1024);
@@ -80,4 +80,17 @@ test('r26: inline code and package fetchers are never rerun', async () => {
   assert.equal(ran.length, 0);
   const ok = await rerunChecks({ checks: [{ id: 't', argv: ['python3', '-m', 'pytest', '-q'] }, { id: 'n', argv: ['npm', 'test'] }], directory: dir, run });
   assert.equal(ok.checksVerified, true);
+});
+
+test('r26 fable: scratch, absolute and indirect scripts are never rerun', async () => {
+  const { rerunChecks } = await import('../plugins/v2/check-rerun.mjs');
+  const dir = await fs.realpath(await fs.mkdtemp(path.join((await import('node:os')).tmpdir(), 'cr-')));
+  await fs.mkdir(path.join(dir, '.review')); await fs.writeFile(path.join(dir, '.review', 'x.js'), ''); await fs.writeFile(path.join(dir, 'ok.js'), '');
+  const ran = []; const run = async (f, a) => { ran.push([f, ...a]); return { exitCode: 0, timedOut: false }; };
+  for (const argv of [['node', '.review/x.js'], ['node', path.join(dir, 'ok.js')], ['deno', 'run', 'ok.js'], ['make', '-f', '.review/x.js'], ['bun', '.review/x.js'], ['bash', '.review/x.js'], ['python3', '/etc/x.py']]) {
+    const r = await rerunChecks({ checks: [{ id: 'c', argv }], directory: dir, run });
+    assert.equal(r.checksVerified, false, argv.join(' '));
+  }
+  assert.equal(ran.length, 0);
+  assert.equal((await rerunChecks({ checks: [{ id: 'c', argv: ['node', 'ok.js'] }], directory: dir, run })).checksVerified, true);
 });

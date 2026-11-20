@@ -64,3 +64,11 @@ test('r26: ask summary is redacted and pending asks are published', async () => 
   assert.equal(published.at(-1)[0].parked, true);
   m.replied('per_1'); assert.deepEqual(published.at(-1), []);
 });
+
+test('r26 fable: redaction covers env assignments, auth headers and flags', async () => {
+  const { askSummary } = await import('../plugins/v2/park-yield.mjs');
+  for (const [cmd, secret] of [['PGPASSWORD=hunter2 psql -h db', 'hunter2'], ['curl -H "Authorization: Bearer abc123def"', 'abc123def'], ['API_KEY=abc123 run', 'abc123'], ['tool --token s3cr3t', 's3cr3t'], ['psql postgres://u:pw1@h/db', 'pw1']]) {
+    const s = askSummary({ permission: 'bash', patterns: [cmd] });
+    assert.ok(!s.includes(secret), s);
+  }
+});

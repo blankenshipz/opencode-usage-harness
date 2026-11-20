@@ -42,8 +42,13 @@ export function decideAutoPermission({ action, resources, tool, input, directory
       if (contains(home, candidate) && !(repo && contains(repo, candidate))) return { decision: 'ask', reason: 'home_outside_repo' };
     }
   }
+  // Any shell-like tool or shell action only ever qualifies through the listing rule.
+  const shellLike = tool === 'bash' || tool === 'shell' || action === 'bash' || action === 'shell' || command !== undefined;
+  // Secret-looking or credential names anywhere in relative resources too.
+  for (const r of res) if (!path.isAbsolute(r) && (r.split('/').includes('..') || credentialPath(path.resolve(repo ?? '/', stripGlob(r)), home) || r.split('/').some(part => part && isSecretPath(part)))) return { decision: 'ask', reason: 'credential_or_dotdot_relative' };
   // 1. names-only listing of system binary dirs.
-  if (tool === 'bash' && command !== undefined) {
+  if (shellLike) {
+    if (command === undefined) return { decision: 'ask', reason: 'shell_without_command' };
     const match = LS.exec(command);
     if (!match || /[;|<>`$(){}*?\n]/.test(command)) return { decision: 'ask', reason: 'shell_not_listing' };
     const dir = match[2].replace(/\/$/, '') || '/';
@@ -59,7 +64,7 @@ export function decideAutoPermission({ action, resources, tool, input, directory
     return ok ? { decision: 'allow', reason: 'glob_system_bin' } : { decision: 'ask', reason: 'glob_recursive_or_nested' };
   }
   // 2. file operations inside <repo>/.review (never shell).
-  if (repo && tool !== 'bash' && res.length) {
+  if (repo && !shellLike && res.length) {
     const scratch = path.join(repo, '.review');
     let scratchReal;
     try { scratchReal = realpath(scratch); } catch { return { decision: 'ask', reason: 'no_scratch' }; }

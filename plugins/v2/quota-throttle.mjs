@@ -39,7 +39,11 @@ export function weeklyProjection(quota, provider = 'openai', now = Date.now(), b
     && Number.isFinite(msOf(w.resets_at)) && msOf(w.resets_at) > now);
   let worst;
   for (const w of windows) {
-    const rate = Number.isFinite(w.burn_rate_per_hour) ? w.burn_rate_per_hour : burn(provider, w, now)?.ratePerHour;
+    // r26 fable: a short trailing burst must not be extrapolated over the whole week.
+    // Prefer the week-to-date average (used / elapsed) once 12 h of the window elapsed.
+    const elapsedH = (w.duration_minutes * 60_000 - (msOf(w.resets_at) - now)) / 3600_000;
+    const average = elapsedH >= 12 ? w.used_percent / elapsedH : undefined;
+    const rate = Number.isFinite(w.burn_rate_per_hour) ? w.burn_rate_per_hour : Number.isFinite(average) ? average : burn(provider, w, now)?.ratePerHour;
     if (!Number.isFinite(rate)) continue;
     const resetMs = msOf(w.resets_at);
     const projected = w.used_percent + rate * (resetMs - now) / 3600_000;
@@ -51,7 +55,8 @@ export function weeklyProjection(quota, provider = 'openai', now = Date.now(), b
 export function budgetBrake({ quota, provider = 'openai', now = Date.now(), agent, newChild, compact = false, review = false, userRequested = false,
   rootID, records, sessions, callerID, env = process.env, burn } = {}) {
   if (String(env?.HARNESS_BUDGET_BRAKE ?? '').toLowerCase() === 'off') return undefined;
-  if (!newChild || compact || review || /verif|review/i.test(String(agent ?? ''))) return undefined;
+  // Builders only: reviews, verifiers, routers and other roles are never braked.
+  if (!newChild || compact || review || /verif|review/i.test(String(agent ?? '')) || !/build|debug|implement/i.test(String(agent ?? ''))) return undefined;
   let p;
   try { p = weeklyProjection(quota, provider, now, burn); } catch { return undefined; }
   if (!p || !(p.projected > 100)) return undefined;

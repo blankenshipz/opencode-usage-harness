@@ -31,15 +31,31 @@ async function allowed(argv, root, cwd) {
   if (argv[0] !== runner || !RUNNERS.has(runner)) return false; // bare runner names only, resolved via PATH
   const args = argv.slice(1);
   if (args.some(a => INLINE.has(a) || /^-(e|c|p|r)\S+/.test(a) && ['node', 'python', 'python3', 'deno', 'bun'].includes(runner) || /^--(eval|print|require|import|loader)=/.test(a))) return false;
+  // Every path-like argument must be repo-relative, inside the repo and outside the
+  // auto-allowed .review/ scratch (which agents can write without an ask).
+  const scratch = path.join(root, '.review');
+  const pathArg = a => !a.startsWith('-') && (a.includes('/') || /\.(m?[jt]s|cjs|py|sh)$/.test(a));
+  const safePath = async a => {
+    if (path.isAbsolute(a) || hasDotDot(a)) return false;
+    let real; try { real = await fs.realpath(path.join(cwd, a)); } catch { return !a.includes('/') ? false : false; }
+    return inside(root, real) && !inside(scratch, real);
+  };
+  for (const a of args) {
+    const value = a.includes('=') && a.startsWith('-') ? a.slice(a.indexOf('=') + 1) : a;
+    if ((pathArg(value) || path.isAbsolute(value)) && !(await safePath(value))) return false;
+  }
+  if (runner === 'make' && args.some(a => /^(-f|--file|--makefile|-C|--directory)/.test(a))) return false;
+  if (runner === 'deno' && !['test', 'check', 'lint', 'fmt'].includes(args[0])) return false;
   if (['python', 'python3'].includes(runner)) {
     const m = args.indexOf('-m');
     if (m >= 0 && !PY_MODULES.has(args[m + 1])) return false;
-    if (m < 0) { const script = args.find(a => !a.startsWith('-')); if (!script || path.isAbsolute(script) || hasDotDot(script)) return false; }
+    if (m < 0) { const script = args.find(a => !a.startsWith('-')); if (!script || !(await safePath(script))) return false; }
   }
+  if (['node', 'bun'].includes(runner) && args[0] !== 'test') { const script = args.find(a => !a.startsWith('-')); if (!script || !(await safePath(script))) return false; }
   if (runner !== 'bash') return true;
   const script = argv[1];
-  if (typeof script !== 'string' || !script || path.isAbsolute(script) || script.startsWith('-') || hasDotDot(script)) return false;
-  try { const real = await fs.realpath(path.join(cwd, script)); return inside(root, real) && (await fs.stat(real)).isFile(); } catch { return false; }
+  if (typeof script !== 'string' || !script || script.startsWith('-')) return false;
+  return safePath(script);
 }
 
 const defaultRun = (file, args, options) => new Promise(resolve => {
@@ -54,7 +70,8 @@ export async function rerunChecks({ checks, directory, run = defaultRun, timeout
   let root;
   try { root = await fs.realpath(directory); } catch { root = undefined; }
   for (const check of Array.isArray(checks) ? checks : []) {
-    if (!Array.isArray(check?.argv) || check.argv.length < 1) continue;
+    // A check without argv cannot be verified deterministically: it makes the set unverified.
+    if (!Array.isArray(check?.argv) || check.argv.length < 1) { skipped.push(check?.id); continue; }
     const cwd = root && await resolveCwd(root, check.cwd);
     if (!cwd || !(await allowed(check.argv, root, cwd))) { skipped.push(check.id); continue; }
     const startedAt = now();

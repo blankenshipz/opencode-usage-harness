@@ -49,3 +49,14 @@ test('evaluate hook allows covered asks, never rejects, skips guard asks, logs e
   assert.deepEqual(logs.map(l => [l.tool, l.decision]), [['bash', 'allow'], ['bash', 'decline_to_auto']]);
   assert.deepEqual(Object.keys(logs[0]).sort(), ['decision', 'pattern', 'reason', 'sessionID', 'time', 'tool']);
 });
+
+test('r26 fable: shell tool and relative secret paths never auto-allow', async () => {
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const { decideAutoPermission } = await import('../plugins/v2/auto-permission.mjs');
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-')); fs.mkdirSync(path.join(repo, '.review'));
+  const real = fs.realpathSync(repo);
+  for (const tool of ['shell', 'bash']) assert.equal(decideAutoPermission({ tool, resources: ['.review/x.sh'], input: { command: '.review/x.sh /home/box/.ssh/id_rsa' }, directory: real, home: '/home/box' }).decision, 'ask');
+  assert.equal(decideAutoPermission({ tool: 'write', action: 'shell', resources: ['.review/x'], input: {}, directory: real, home: '/home/box' }).decision, 'ask');
+  assert.equal(decideAutoPermission({ tool: 'read', resources: ['.review/.env'], input: {}, directory: real, home: '/home/box' }).decision, 'ask');
+  assert.equal(decideAutoPermission({ tool: 'read', resources: ['.review/notes.txt'], input: {}, directory: real, home: '/home/box' }).decision, 'allow');
+});

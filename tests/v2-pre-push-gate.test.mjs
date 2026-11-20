@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { recordReviewVerdict, reviewVerdict } from '../plugins/v2/review-verdicts.mjs';
+import { recordReviewVerdict } from '../plugins/v2/review-verdicts.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const installer = path.join(root, 'scripts', 'install-git-hooks.sh');
@@ -41,7 +41,9 @@ test('pre-push gate: refuses main without verdict, allows with verdict, Unreview
   const tree = git(work, 'rev-parse', 'HEAD^{tree}');
   fs.writeFileSync(path.join(state, 'review-verdicts.jsonl'), JSON.stringify({ tree, verdict: 'fail' }) + '\n');
   assert.notEqual(push(work, state).status, 0, 'failing verdict refused');
-  const line = await recordReviewVerdict({ agent: 'reviewer', scope: 'task', status: 'completed', sessionId: 's', directory: work, file: path.join(state, 'review-verdicts.jsonl') });
+  await assert.rejects(recordReviewVerdict({ agent: 'builder', verdict: 'pass', reviewedHead: git(work, 'rev-parse', 'HEAD'), sessionId: 's', directory: work, file: path.join(state, 'review-verdicts.jsonl') }));
+  await assert.rejects(recordReviewVerdict({ agent: 'reviewer', verdict: 'pass', reviewedHead: '0000000', sessionId: 's', directory: work, file: path.join(state, 'review-verdicts.jsonl') }));
+  const line = await recordReviewVerdict({ agent: 'reviewer', verdict: 'pass', reviewedHead: git(work, 'rev-parse', 'HEAD'), sessionId: 's', directory: work, file: path.join(state, 'review-verdicts.jsonl') });
   assert.equal(line.tree, tree);
   assert.equal(push(work, state).status, 0);
 
@@ -61,9 +63,11 @@ test('installer refuses to overwrite a different existing hook', () => {
   assert.equal(fs.readFileSync(hook, 'utf8'), '#!/bin/sh\nexit 0\n');
 });
 
-test('reviewVerdict only passes completed task outcomes from reviewer/verifier agents', () => {
-  assert.equal(reviewVerdict({ agent: 'verifier', scope: 'task', status: 'completed' }), 'pass');
-  assert.equal(reviewVerdict({ agent: 'code-reviewer', scope: 'task', status: 'completed' }), 'pass');
-  assert.equal(reviewVerdict({ agent: 'builder', scope: 'task', status: 'completed' }), undefined);
-  assert.equal(reviewVerdict({ agent: 'reviewer', scope: 'task', status: 'failed' }), undefined);
+test('a dirty working tree verdict matches the tree of a later commit of exactly those files', async () => {
+  const { work, state } = setup();
+  fs.writeFileSync(path.join(work, 'new.txt'), 'n\n');
+  const line = await recordReviewVerdict({ agent: 'verifier', verdict: 'pass', reviewedHead: git(work, 'rev-parse', 'HEAD'), sessionId: 's', directory: work, file: path.join(state, 'v.jsonl') });
+  assert.equal(git(work, 'status', '--porcelain').includes('new.txt'), true, 'index untouched');
+  git(work, 'add', '-A'); git(work, 'commit', '-q', '-m', 'squash');
+  assert.equal(git(work, 'rev-parse', 'HEAD^{tree}'), line.tree);
 });
