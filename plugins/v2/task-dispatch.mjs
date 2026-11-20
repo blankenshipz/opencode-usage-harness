@@ -27,6 +27,7 @@ import { createTerminalSettler, terminalSettlementEligibility } from './terminal
 import { createDispatchCanceller, cancelInputSchema } from './task-dispatch-cancel.mjs';
 import { createResultDelivery } from './result-delivery.mjs';
 import { parkMonitor as defaultParkMonitor, parkedResult } from './park-yield.mjs';
+import { createRouterCompactor } from './router-maintenance.mjs';
 import { createStaleReconciler } from './dispatch-reconcile.mjs';
 import { midRunCompactionEnabled, midRunCompactionDecision, settleMidRunCompaction, admitMidRunCompaction, recordAdmitted, recordAdmissionFailure, recordBaseline, buildContinuation, activeContinuation, midRunCompactionStatus, pendingCompactionPreservation, BRIEF_LIMIT } from './mid-run-compaction.mjs';
 
@@ -501,6 +502,8 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
   // history. They are persisted once as a synthetic user message (see
   // deliverTimedReminder) so they join the stable cached prefix. The mid-run continuation stays in system: it changes
   // only at a completed compaction, where history is rewritten anyway.
+  const routerCompactor = createRouterCompactor({ compact: typeof ctx.session?.compact === 'function' ? input => ctx.session.compact(input) : undefined,
+    loadSessions, newID: () => 'msg_' + crypto.randomUUID().replaceAll('-', '') });
   if (ctx.session?.hook) await ctx.session.hook('context', async event => {
     const tail = [];
     const checkpoint = await registry(workspace, async (state, save) => {
@@ -519,6 +522,9 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
     });
     if (checkpoint?.status?.due) tail.push(checkpointReminder);
     for (const text of tail) await deliverTimedReminder(ctx, event, text);
+    // r20 item 8: compact a root router/coordinator at about 100k observed tokens (best effort).
+    if (!checkpoint?.key && ['router','coordinator'].includes(canonicalHarnessRole(event.agent)))
+      try { await routerCompactor(event.sessionID); } catch { /* never block a model step */ }
     // Mid-run compaction is optional maintenance: any failure leaves the step untouched.
     let continuation;
     if (checkpoint?.key) try { continuation = await midRunCompaction(event.sessionID, checkpoint.key); } catch { /* never block a model step */ }

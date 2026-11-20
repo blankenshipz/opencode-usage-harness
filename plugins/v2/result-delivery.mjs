@@ -17,6 +17,7 @@
 // natively, and the binding records the delivery so it is never repeated.
 import crypto from 'node:crypto';
 
+import { holdWake, ROUTER_WAKE_HOLD_MS } from './router-maintenance.mjs';
 export const RESULT_DELIVERY_GRACE_MS = 15000;
 export const RESULT_DELIVERY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const RESULT_DELIVERY_REPORT_LIMIT = 16000;
@@ -73,7 +74,7 @@ export function deliveryDecision({ delivery, evidence, now, graceMs = RESULT_DEL
 
 export function createResultDelivery({ registry, workspace, ctx, loadEvidence, loadFinalText, onTerminalFailure, now = Date.now,
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; }, cancel = clearTimeout,
-  graceMs = RESULT_DELIVERY_GRACE_MS, maxAgeMs = RESULT_DELIVERY_MAX_AGE_MS }) {
+  graceMs = RESULT_DELIVERY_GRACE_MS, maxAgeMs = RESULT_DELIVERY_MAX_AGE_MS, wakeHoldMs = ROUTER_WAKE_HOLD_MS }) {
   const timers = new Map(), running = new Map();
   let disposed = false;
   const finish = (key, generation, patch, extra) => registry(workspace, async (state, save) => {
@@ -105,6 +106,12 @@ export function createResultDelivery({ registry, workspace, ctx, loadEvidence, l
       await Promise.resolve().then(() => onTerminalFailure(key, generation, terminal.outcome)).catch(() => {});
     if (decision.action === 'final') return finish(key, generation, { status:decision.status, via:decision.via, outcome:terminal.outcome });
     if (typeof ctx?.session?.synthetic !== 'function') return 'pending';
+    // r20 item 8: while sibling background children still run, hold a waking delivery (bounded) so the parent wakes once.
+    if (decision.resume && delivery.mode === 'background') {
+      const settledAt = Math.max(terminal.completedAt ?? 0, delivery.returnedAt ?? 0) || delivery.since;
+      const held = await registry(workspace, async state => holdWake({ records:state.records, key, parentID:delivery.parentID, settledAt, now:now(), holdMs:wakeHoldMs }));
+      if (held) return 'pending';
+    }
     let report = '', truncated = false, length = 0;
     if (terminal.assistantID && typeof loadFinalText === 'function') {
       const final = await loadFinalText({ sessionID:record.childID, assistantID:terminal.assistantID }).catch(() => undefined);
