@@ -22,10 +22,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { managedConfigRoot } from './paths.mjs';
-import { scanShell, gitPushDanger, isSecretPath, isEnvTemplatePath, wildcardMatch, parseGitInvocation, isGitWord, cdTarget, literalPath } from './shell-guard.mjs';
+import { scanShell, gitPushDanger, isSecretPath, secretWords, secretLiterals, wildcardMatch, parseGitInvocation, isGitWord, cdTarget, literalPath } from './shell-guard.mjs';
 
-// Must match configure.py SECRET_SHELL_ASK (tests/v2-full-auto.test.mjs checks).
-export const SECRET_SHELL_PATTERNS = ['*.env*', '*auth.json*', '*.pem*', '*.key*', '*credentials*', '*secret*', '*financial-policy*', '*external-write-grants*'];
+// Must match configure.py SECRET_SHELL_ASK (tests/v2-full-auto.test.mjs checks). These native
+// wildcards match the whole command string (`*.key*` also hits `d.keys()`); the shell guard drops
+// an ask that only they raised when its argument-aware check finds no secret path.
+export { SECRET_SHELL_PATTERNS } from './shell-guard.mjs';
 export const PATH_ACTIONS = new Set(['external_directory', 'read', 'edit']);
 
 const contains = (root, target) => target === root || target.startsWith(root.endsWith('/') ? root : root + '/');
@@ -136,14 +138,33 @@ export function dockerEnvFileValues(words) {
   return values;
 }
 
-// True when a native shell resource still names a secret-looking path once env templates and
-// docker env-file values are removed.
-export function secretShellResource(resource) {
-  if (!SECRET_SHELL_PATTERNS.some(pattern => wildcardMatch(resource, pattern))) return false;
-  const words = String(resource).split(/\s+/);
-  const envFiles = dockerEnvFileValues(words);
-  const rest = words.filter((word, k) => !isEnvTemplatePath(word) && !envFiles.has(k)).join(' ');
-  return SECRET_SHELL_PATTERNS.some(pattern => wildcardMatch(rest, pattern));
+// Secret-path reasons for one scanned segment: file arguments (docker --env-file values excepted),
+// redirect targets, and quoted literals in heredoc/herestring bodies (python - <<EOF open('.env')).
+// The docker --env-file exemption is part of the full-auto profile only (envFiles:false elsewhere).
+function segmentSecretReasons(segment, text, { envFiles = true } = {}) {
+  const reasons = [];
+  const secret = secretWords(segment.words, envFiles ? dockerEnvFileValues(segment.words) : new Set())[0];
+  if (secret !== undefined) reasons.push(`${text}: names secret-looking path ${JSON.stringify(secret)}`);
+  for (const redirect of segment.redirects) {
+    if (redirect.file && isSecretPath(redirect.target)) reasons.push(`${text}: redirect to secret-looking path ${JSON.stringify(redirect.target)}`);
+    const literal = (redirect.heredoc || redirect.herestring) ? secretLiterals(redirect.body)[0] : undefined;
+    if (literal !== undefined) reasons.push(`${text}: input names secret-looking path ${JSON.stringify(literal)}`);
+  }
+  return reasons;
+}
+
+// Reasons a command reads, copies or writes a secret path, including sh -c/eval/heredoc-to-shell
+// and ssh remote commands (empty: none). Bare words in patterns, filters and code do not count.
+export function shellSecretReasons(command, { depth = 0, envFiles = true } = {}) {
+  if (typeof command !== 'string') return ['command is not a string'];
+  if (depth > 4) return ['commands nested too deeply to inspect'];
+  const reasons = [], nested = [];
+  for (const segment of scanShell(command).segments) {
+    reasons.push(...segmentSecretReasons(segment, JSON.stringify(segment.text.slice(0, 160)), { envFiles }));
+    nestedCommands(segment, nested, { remote: false });
+  }
+  for (const inner of nested) reasons.push(...shellSecretReasons(inner.command, { depth: depth + 1, envFiles }).map(why => `nested ${why}`));
+  return [...new Set(reasons)];
 }
 
 const DISK_COMMANDS = /^(dd|mkfs(\..+)?|mke2fs|mkswap|shred|wipefs|fdisk|sfdisk|cfdisk|gdisk|sgdisk|parted|blkdiscard|hdparm|badblocks)$/;
@@ -351,12 +372,9 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     if (history) reasons.push(`${text}: ${history}`);
     const disk = words.find(word => DISK_COMMANDS.test(word) || BLOCK_DEVICE.test(word) || /^of=\/dev\//.test(word));
     if (disk) reasons.push(`${text}: ${disk} writes disks or devices`);
-    const envFiles = dockerEnvFileValues(words);
-    const secret = words.find((word, k) => isSecretPath(word) && !isEnvTemplatePath(word) && !envFiles.has(k));
-    if (secret !== undefined) reasons.push(`${text}: names secret-looking path ${JSON.stringify(secret)}`);
+    reasons.push(...segmentSecretReasons(segment, text));
     for (const redirect of redirects) {
       if (!redirect.file) continue;
-      if (isSecretPath(redirect.target)) reasons.push(`${text}: redirect to secret-looking path ${JSON.stringify(redirect.target)}`);
       if (BLOCK_DEVICE.test(redirect.target ?? '')) reasons.push(`${text}: redirect writes device ${redirect.target}`);
       if (paths && !remote && (['>', '>|', '&>', '<>'].includes(redirect.op) || /^\d+>$/.test(redirect.op))) {
         if (!SAFE_WRITE_TARGET.test(redirect.target ?? '')) {
@@ -392,12 +410,12 @@ export function rememberFullAuto(event, { amendOk = false } = {}) {
 }
 
 // evaluate-hook half: shell asks for a verified call become allow unless a parsed resource is
-// still dangerous on its own (secrets, pushes, history rewrites, disks). Never touches deny.
+// still dangerous on its own (secret paths, pushes, history rewrites, disks). Never touches deny.
 export function downgradeFullAutoShell(event, project) {
   const entry = VERIFIED.get(key(event.sessionID, event.source?.id));
   if (!entry || entry.expires <= Date.now() || !Array.isArray(event.resources) || !event.resources.length) return false;
   for (const resource of event.resources) {
-    if (typeof resource !== 'string' || secretShellResource(resource)) return false;
+    if (typeof resource !== 'string') return false;
     if (fullAutoShellCheck(resource, undefined, project, { paths: false, amendOk: entry.amendOk }).length) return false;
   }
   event.effect = 'allow';

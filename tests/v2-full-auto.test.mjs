@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { checkFullAutoAmends, explicitShellEffect, gitHeadUnpushed, installShellGuard, scanShell } from '../plugins/v2/shell-guard.mjs';
-import { fullAutoProjectFor, fullAutoShellCheck, loadFullAutoProjects, pathResourcesInside, SECRET_SHELL_PATTERNS } from '../plugins/v2/full-auto.mjs';
+import { fullAutoProjectFor, fullAutoShellCheck, loadFullAutoProjects, pathResourcesInside, SECRET_SHELL_PATTERNS, shellSecretReasons } from '../plugins/v2/full-auto.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RULES = JSON.parse(execFileSync('python3', ['-c',
@@ -246,4 +246,43 @@ test('the profile reloads from configure-choices.json and fails closed on bad co
   const projects = loadFullAutoProjects({ choicesPath: file });
   assert.equal(projects.length, 1);
   assert.deepEqual(projects[0].roots, [P, '/srv/data']);
+});
+
+// r19: secret detection matches real file arguments, not bare words in patterns, filters or code.
+const SECRET_FALSE_POSITIVES = [
+  "ssh garage-server 'python3 - <<EOF\nimport json\nd = json.load(open(\"/opt/x/data.json\"))\nprint(list(d.keys()))\nEOF'",
+  'python3 -c "import json; d = json.load(open(\'data.json\')); print(d.keys())"', 'python3 -c "print(cfg.key)"',
+  'env | grep -viE "secret|token|key|pass"', 'docker compose config | grep -viE "secret|token|key|pass"', 'grep -rn "SECRET_KEY" src/',
+  'grep -ri secret src', 'grep -c token logs/app.log', 'rg -n "api_key|password" src', 'git grep -n secret', 'sed -n "/secret/p" notes.txt',
+  "sed 's/password=.*/password=***/' app.log", "awk '/key/ {print $1}' data.txt", 'git log --oneline | grep -i key', 'printenv | grep -c SECRET',
+  'echo $SECRET_KEY | wc -c', 'grep -n KEY .env.example', 'ssh -i ~/.ssh/id_ed25519 garage-server uptime', 'grep -e key -e token src/app.py',
+];
+const SECRET_TRUE_POSITIVES = [
+  'cat .env', 'cat ../.env', 'head foo.pem', 'cat server.key', "ssh host 'cat /opt/x/.env'", 'cp .env /tmp', 'less config/.env.local',
+  'tail -n 3 ~/.ssh/id_rsa', 'cat gateway/secrets/token.txt', 'cat ~/.aws/credentials', 'grep -i token .env', 'grep -e key -e token .env',
+  'grep secret config/client_secret.json', 'sed -n 1p .env.production', 'scp host:/opt/x/.env .', 'cat "$HOME/.env"', 'cat *.pem',
+  'python3 -c "print(open(\'.env\').read())"', "python3 - <<'EOF'\nprint(open('/opt/x/.env').read())\nEOF",
+  'ssh garage-server "grep -i key /opt/x/.env"', 'bash -c "cat ../.env"', 'git grep -n token -- .env', 'awk 1 server.key', 'base64 < server.key',
+  'cp -r gateway/secrets /tmp/x', 'tar czf /tmp/s.tgz secrets', 'ls gateway/secrets/',
+];
+
+test('secret detection ignores bare words in patterns, filters and code, and still asks for real secret files', async () => {
+  for (const command of SECRET_FALSE_POSITIVES) assert.deepEqual(shellSecretReasons(command), [], command);
+  for (const command of SECRET_TRUE_POSITIVES) assert.ok(shellSecretReasons(command).length, command);
+  // Through the plugin in a full-auto project.
+  for (const command of SECRET_FALSE_POSITIVES) assert.equal(await decide(command), 'allow', command);
+  for (const command of SECRET_TRUE_POSITIVES) assert.notEqual(await decide(command), 'allow', command);
+});
+
+test('other projects: native secret-wildcard asks drop for bare words, real secret paths still ask', async () => {
+  // Under the permissive rules these all raised a native `*.key*` / `*secret*` / `*.env*` ask before.
+  const wildcardOnly = SECRET_FALSE_POSITIVES.filter(command => !/^ssh -i/.test(command));
+  assert.ok(wildcardOnly.some(command => explicitShellEffect(command, RULES)?.effect === 'ask'));
+  for (const command of wildcardOnly) assert.equal(await decide(command, OTHER), 'allow', command);
+  for (const command of SECRET_TRUE_POSITIVES) assert.notEqual(await decide(command, OTHER), 'allow', command);
+  // Other asks are untouched: a bare secret word next to rm -rf, sudo or a commit on main still asks.
+  for (const command of ['rm -rf build | grep -v secret', 'sudo grep -i key /var/log/x', 'git stash && grep key x.txt'])
+    assert.notEqual(await decide(command, OTHER), 'allow', command);
+  // The docker --env-file exemption stays full-auto only.
+  assert.equal(await decide('docker compose --env-file ../.env up -d', OTHER), 'ask');
 });

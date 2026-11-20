@@ -26,13 +26,27 @@ command and therefore no permission check. The task-outcomes plugin
 It forces a native permission ask, using the full raw command as the resource, when:
 
 - an unquoted redirect (`>`, `>>`, `>|`, `&>`, `N>`, `<`, `>&file`) targets a secret-looking
-  path (`.env`, `.env.*`, `*credentials*`, `*.pem`, `*.key`, `auth.json`, `*secret*`,
+  path (see "Secret paths" below; `.env`, `.env.*`, `*.pem`, `*.key`, `auth.json`, secret dirs,
   `*financial-policy*`, `*external-write-grants*`). Env templates (`.env.example`,
   `.env.sample`, `.env.template`, case-insensitive basename) are not secret.
 - a segment that the configured rules allow only through an env-template exception still
   matches an ask/deny rule, or names a secret-looking path, once its template words are
   removed (`cp .env.example .env`, `diff .env.example .env.local`)
+- a command names a secret path that the native `SECRET_SHELL_ASK` wildcards miss
+  (`cat ~/.ssh/id_rsa`) while the configured rules would allow it.
 - a redirect has no command word (`> f`, `true; >> log`)
+
+Secret paths are path-shaped tokens only (no `|`, `(`, `)`, `\`, `^`, quotes or spaces):
+`.env`/`.env.*` (not templates), `*.pem`, `*.key` (final extension), `auth.json`, `credentials`,
+`id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`, dotted names containing `secret`/`credentials`
+(`client_secret.json`), anything under a `secret*`/`credentials*` directory, and non-public files
+under `.ssh/`. A token counts when it is a file argument (also `--opt=value`, `VAR=value`,
+`host:path`), not when it is a grep/rg/ag/ack/`git grep` pattern or `-e` value, a sed/awk script,
+or an `ssh`/`scp`/`sftp -i` identity. Quoted literals in code words and heredoc bodies are checked
+(`python3 -c "open('.env')"`). Bare words such as `MY_SECRET`, `token` or `secret|key|pass` never
+count. In every project, a native shell ask raised only by a `SECRET_SHELL_ASK` wildcard is
+dropped by the evaluate hook when the guard's check of the call and of that resource finds no
+secret path; any other ask on the same resource stands.
 - in a compound command (a list, a pipeline, a subshell or `$(…)`), a segment that carries
   a redirect matches an explicit `shell` ask rule. The parser would have dropped that
   redirect. An explicit `shell` deny rule blocks the call.
@@ -141,7 +155,9 @@ and `ssh` remote command):
   for `/`, a top-level directory or the remote home (and globs over them). `docker rm`,
   `compose rm`, `git rm` and similar are not file deletes;
 - `dd`, `mkfs*`, `mkswap`, `shred`, `wipefs`, partitioners, `/dev` block devices;
-- secret-looking paths (words, redirects, and the native `SECRET_SHELL_ASK` patterns). One
+- secret-looking paths (file arguments, redirects and quoted literals in code/heredocs, as
+  below; the native `SECRET_SHELL_ASK` wildcards are re-checked with the same argument-aware
+  test, so `d.keys()` or `grep -viE "secret|key"` do not ask). One
   exception: the value of docker's env-file option (`--env-file FILE` or `--env-file=FILE` after
   a `docker`/`docker-compose` word, e.g. `docker compose --env-file ../.env up -d`, also behind
   `sudo`, in `sh -c` bodies and `ssh` remote commands) is not checked, because docker loads it

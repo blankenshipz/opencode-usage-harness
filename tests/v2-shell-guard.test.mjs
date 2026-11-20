@@ -98,9 +98,12 @@ test('scanner keeps redirects with their own list segment and skips heredoc bodi
 });
 
 test('secret path classifier', () => {
-  for (const path of ['.env', 'a/.env.prod', 'id_rsa.key', 'cert.pem', 'auth.json', 'MY_SECRET', 'aws/credentials'])
+  for (const path of ['.env', 'a/.env.prod', 'id_rsa.key', 'cert.pem', 'auth.json', 'my_secret.txt', 'aws/credentials', 'credentials',
+    '~/.ssh/id_rsa', '/home/u/.ssh/id_ed25519', '.ssh/deploy_key', 'gateway/secrets/token.txt', 'client_secret.json', '.git-credentials', '*.pem'])
     assert.equal(isSecretPath(path), true, path);
-  for (const path of ['env.txt', 'environment.md', 'keys.txt', 'report.json', '/dev/null', 'authors.json'])
+  // Bare words (variable names, search terms) and code are not file paths.
+  for (const path of ['env.txt', 'environment.md', 'keys.txt', 'report.json', '/dev/null', 'authors.json', 'MY_SECRET', 'secret_key', 'token',
+    'secret|token|key|pass', 'd.keys()', '.keys()', 'd.keys', '~/.ssh/id_rsa.pub', '~/.ssh/known_hosts', '.ssh/config', '\\.env$'])
     assert.equal(isSecretPath(path), false, path);
 });
 
@@ -125,11 +128,11 @@ const PERMISSIVE_TEMPLATES = [
 ];
 
 test('env templates pass under permissive rules, other secrets beside them still ask', () => {
-  for (const command of ['cat .env.example', 'cp apps/api/.env.sample notes.txt', 'grep -n KEY .env.template',
+  for (const command of ['cat .env.example', 'cp apps/api/.env.sample notes.txt', 'grep -n KEY .env.template', 'grep secret .env.example',
     'echo A=1 >> .env.example', 'cd apps && cat config/.env.example'])
     assert.equal(analyzeShellCommand(command, PERMISSIVE_TEMPLATES).action, 'allow', command);
   for (const command of ['cp .env.example .env', 'diff .env.example .env.local', 'cat .env.example cert.pem',
-    'cat .env.example > .env', 'grep secret .env.example', 'cat .env.example .env.production'])
+    'cat .env.example > .env', 'grep -e secret .env.example .env', 'cat .env.example .env.production'])
     assert.equal(analyzeShellCommand(command, PERMISSIVE_TEMPLATES).action, 'ask', command);
   assert.equal(analyzeShellCommand('mkfs .env.example', PERMISSIVE_TEMPLATES).action, 'allow', 'native deny still applies');
   // Native evaluation (last match wins) of single commands under these rules.

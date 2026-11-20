@@ -17,12 +17,25 @@
 import { execFile } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { fullAutoProjectFor, fullAutoShellCheck, rememberFullAuto, downgradeFullAutoShell, pathResourcesInside, PATH_ACTIONS, realish } from './full-auto.mjs';
+import { fullAutoProjectFor, fullAutoShellCheck, rememberFullAuto, downgradeFullAutoShell, pathResourcesInside, PATH_ACTIONS, realish, shellSecretReasons } from './full-auto.mjs';
 
+// Native shell secret asks; must match configure.py SECRET_SHELL_ASK (tests/v2-full-auto.test.mjs
+// checks). They match the whole command string (`*.key*` also hits `d.keys()`); the guard drops an
+// ask that only they raised when its argument-aware check finds no secret path.
+export const SECRET_SHELL_PATTERNS = ['*.env*', '*auth.json*', '*.pem*', '*.key*', '*credentials*', '*secret*', '*financial-policy*', '*external-write-grants*'];
+const SECRET_PATTERNS = new Set(SECRET_SHELL_PATTERNS);
+// Secret files, matched against one path-shaped token's basename. Bare words such as
+// MY_SECRET, secret_key or `secret|token|key` are variable names or search terms, not files.
 const SECRET_BASENAME = [
-  /^\.env$/i, /^\.env\..+/i, /credentials/i, /\.pem$/i, /\.key$/i, /^auth\.json$/i,
-  /secret/i, /financial-policy/i, /external-write-grants/i,
+  /^\.env$/i, /^\.env\..+/i, /\.pem$/i, /\.key$/i, /^auth\.json$/i, /^\.?(credentials|secrets?)$/i,
+  /^id_(rsa|dsa|ecdsa|ed25519)(_sk)?$/i, /financial-policy/i, /external-write-grants/i,
 ];
+// Named like a secret only with a dot (client_secret.json, secrets.yaml, .git-credentials).
+const SECRET_NAMED_FILE = /secret|credentials/i;
+// Files under ~/.ssh that are not private keys.
+const SSH_PUBLIC = /(\.pub|^known_hosts.*|^authorized_keys.*|^config)$/i;
+// A token that can name a file: no regex/code punctuation such as | ( ) \ ^ ' " ; or spaces.
+const PATH_SHAPED = /^[\w.~/@+:%,=$*?{}[\]-]+$/;
 // Committed env templates hold placeholders, not secrets (exact basename, any directory).
 const ENV_TEMPLATE_BASENAME = /^\.env\.(example|sample|template)$/i;
 const GUARD_MARKER = 'harnessShellGuard';
@@ -34,14 +47,114 @@ export function isEnvTemplatePath(target) {
   return ENV_TEMPLATE_BASENAME.test(base);
 }
 
+// True when one path-shaped token names a secret file: .env/.env.* (not templates), *.pem,
+// *.key (extension at the end), auth.json, credentials, id_rsa/id_ed25519/..., dotted names
+// containing secret/credentials, anything in a secret*/credentials* directory, and private
+// files under .ssh/.
 export function isSecretPath(target) {
   if (typeof target !== 'string' || !target) return false;
   const normalized = target.replaceAll('\\', '/');
+  if (!PATH_SHAPED.test(normalized)) return false;
   const parts = normalized.split('/').filter(Boolean);
   const base = parts.at(-1) ?? '';
-  if (!isEnvTemplatePath(target) && SECRET_BASENAME.some(pattern => pattern.test(base))) return true;
-  // Directory components named like secrets (e.g. secrets/token.txt, .env.d/x).
-  return parts.slice(0, -1).some(part => /secret|credentials/i.test(part));
+  const dirs = parts.slice(0, -1);
+  if (!isEnvTemplatePath(target)) {
+    if (SECRET_BASENAME.some(pattern => pattern.test(base))) return true;
+    if (base.includes('.') && SECRET_NAMED_FILE.test(base)) return true;
+  }
+  if (dirs.includes('.ssh') && !SSH_PUBLIC.test(base)) return true;
+  // Directory components named like secrets (e.g. secrets/token.txt, gateway/secrets/x).
+  return dirs.some(part => /secret|credentials/i.test(part));
+}
+
+// Quoted literals inside code or text (python -c bodies, heredocs): open('.env') names a file,
+// d.keys() does not.
+export function secretLiterals(text) {
+  if (typeof text !== 'string') return [];
+  return [...text.matchAll(/(["'`])([^"'`\s]+)\1/g)].map(match => match[2]).filter(isSecretPath);
+}
+
+const WRAPPERS = /^(?:.*\/)?(sudo|env|timeout|nice|nohup|command|exec|time|stdbuf|ionice|xargs)$/;
+const PATTERN_COMMANDS = /^(?:.*\/)?(grep|egrep|fgrep|zgrep|rg|ag|ack|sed|awk|gawk|mawk|nawk)$/;
+// Short options that take a value, per pattern command. The pattern itself (-e) is skipped; a
+// script/pattern file (-f) is a real file argument and is checked.
+const PATTERN_VALUE_FLAGS = { grep: 'ABCDdefm', rg: 'ABCEefgjMmTt', ag: 'ABCGgmp', ack: 'ABCm', sed: 'efl', awk: 'efFv' };
+const ARG_FLAGS = { ssh: 'BbcDEeFIiJLlmOopQRSWw', scp: 'cFiJloPS', sftp: 'BbcDFiJloPRSs' };
+
+// Index of the command word of a segment: skips VAR=value assignments and simple wrappers with
+// their dash options and numeric arguments.
+function commandIndex(words) {
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i++;
+  while (i < words.length && WRAPPERS.test(words[i])) {
+    i++;
+    while (i < words.length && (words[i].startsWith('-') || /^\d+(\.\d+)?[smhd]?$/.test(words[i]) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]))) i++;
+  }
+  return i;
+}
+
+// Indexes of words that are patterns/programs (grep/rg/sed/awk patterns, -e values) or an
+// ssh/scp -i identity (the key is used, not read out); they are not file arguments.
+function nonFileWords(words) {
+  const skip = new Set();
+  const c = commandIndex(words);
+  let name = (words[c] ?? '').replace(/^.*\//, ''), start = c + 1;
+  if (name === 'git' && words[c + 1] === 'grep') { name = 'grep'; start = c + 2; }
+  if (['egrep', 'fgrep', 'zgrep'].includes(name)) name = 'grep';
+  if (['gawk', 'mawk', 'nawk'].includes(name)) name = 'awk';
+  if (ARG_FLAGS[name]) {
+    for (let k = start; k < words.length && words[k].startsWith('-') && words[k] !== '--'; k++) {
+      const flag = words[k];
+      for (let j = 1; j < flag.length; j++) {
+        if (!ARG_FLAGS[name].includes(flag[j])) continue;
+        const valueIndex = j + 1 < flag.length ? k : ++k;
+        if (flag[j] === 'i') skip.add(valueIndex);
+        break;
+      }
+    }
+    return skip;
+  }
+  if (!PATTERN_COMMANDS.test(name)) return skip;
+  const flags = PATTERN_VALUE_FLAGS[name] ?? '';
+  let explicit = false, positional = false, options = true;
+  for (let k = start; k < words.length; k++) {
+    const word = words[k];
+    if (options && word === '--') { options = false; continue; }
+    if (options && /^--(regexp|expression)(=|$)/.test(word)) { explicit = true; if (!word.includes('=')) skip.add(++k); else skip.add(k); continue; }
+    if (options && /^--(file)(=|$)/.test(word)) { explicit = true; if (!word.includes('=')) k++; continue; }
+    if (options && word.startsWith('--')) continue;
+    if (options && word.startsWith('-') && word.length > 1) {
+      for (let j = 1; j < word.length; j++) {
+        const flag = word[j];
+        if (name === 'sed' && flag === 'i') break; // -i[SUFFIX]
+        if (!flags.includes(flag)) continue;
+        const attached = j + 1 < word.length;
+        const valueIndex = attached ? k : k + 1;
+        if (!attached) k++;
+        if (flag === 'e' && name !== 'awk') { explicit = true; skip.add(valueIndex); }
+        else if (flag === 'f') explicit = true;
+        break;
+      }
+      continue;
+    }
+    if (!explicit && !positional) { skip.add(k); positional = true; }
+  }
+  return skip;
+}
+
+// Secret paths named by a segment's words: file arguments (also --opt=value and VAR=value
+// values, scp host: prefixes) and quoted literals inside code words. skip: indexes to ignore
+// (e.g. docker --env-file values).
+export function secretWords(words, skip = new Set()) {
+  const found = [];
+  const patterns = nonFileWords(words);
+  words.forEach((word, k) => {
+    if (skip.has(k) || patterns.has(k)) return;
+    const value = word.replace(/^(--?[\w-]+|[A-Za-z_][A-Za-z0-9_]*)=/, '');
+    if (isSecretPath(word) || isSecretPath(value) || isSecretPath(value.replace(/^[\w.-]+(@[\w.-]+)?:/, ''))) found.push(word);
+    else if (!PATH_SHAPED.test(word.replaceAll('\\', '/'))) found.push(...secretLiterals(word));
+  });
+  return found;
 }
 
 const isSpace = char => char === ' ' || char === '\t';
@@ -509,8 +622,11 @@ export function analyzeShellCommand(command, rules = [], { fullAuto = false } = 
     // when the rules would allow the segment, re-evaluate it without its template words.
     if (segment.words.some(isEnvTemplatePath) && explicitShellEffect(segment.text, rules)?.effect === 'allow') {
       const rest = segment.words.filter(word => !isEnvTemplatePath(word));
-      const matched = explicitShellEffect(rest.join(' '), rules);
-      const secretWord = rest.find(isSecretPath);
+      const secretWord = secretWords(segment.words)[0];
+      let matched = explicitShellEffect(rest.join(' '), rules);
+      // A secret wildcard on a leftover bare word (`grep secret .env.example`) is not a secret path.
+      if (matched?.effect === 'ask' && SECRET_PATTERNS.has(matched.pattern) && secretWord === undefined)
+        matched = explicitShellEffect(rest.join(' '), rules.filter(rule => !isShellRule(rule, SECRET_PATTERNS)));
       if (matched && matched.effect !== 'allow') {
         reasons.push(`segment ${JSON.stringify(segment.text.slice(0, 200))} names an env template together with input matching shell ${matched.effect} rule ${JSON.stringify(matched.pattern)}`);
         if (matched.effect === 'deny') action = 'deny';
@@ -558,24 +674,28 @@ export function analyzeShellCommand(command, rules = [], { fullAuto = false } = 
 const resolveWorkdir = (directory, workdir) => path.resolve(directory,
   workdir === '~' || workdir.startsWith('~/') ? path.join(process.env.HOME || os.homedir(), workdir.slice(2)) : workdir);
 
-// Shell calls whose gated add/commit segments were verified on a feature branch, keyed by session and
-// tool call. Module-level so per-directory plugin instances share it; entries are single use and expire.
+// Shell calls the guard verified, keyed by session and tool call: gated add/commit segments on a
+// feature branch (count) and/or no secret path anywhere in the command (secretsClear). Module-level
+// so per-directory plugin instances share it; entries are single use and expire.
 const VERIFIED_COMMITS = new Map();
 const VERIFIED_TTL_MS = 120_000;
 const callKey = (sessionID, callID) => `${sessionID}\u0000${callID}`;
+const isShellRule = (rule, patterns) => rule?.action === 'shell' && patterns.has(rule.resource);
 
-function rememberVerifiedCommit(event, rules, count) {
+function rememberVerifiedShell(event, rules, { count = 0, secretsClear = false } = {}) {
   if (!event?.sessionID || !event?.id) return;
   const now = Date.now();
   for (const [key, entry] of VERIFIED_COMMITS) if (entry.expires <= now) VERIFIED_COMMITS.delete(key);
-  VERIFIED_COMMITS.set(callKey(event.sessionID, event.id), { rules, count, expires: now + VERIFIED_TTL_MS,
-    ungated: rules.filter(rule => !(rule?.action === 'shell' && BRANCH_GATED_PATTERNS.has(rule.resource))) });
+  const relaxed = rules.filter(rule => !((count && isShellRule(rule, BRANCH_GATED_PATTERNS)) || (secretsClear && isShellRule(rule, SECRET_PATTERNS))));
+  VERIFIED_COMMITS.set(callKey(event.sessionID, event.id), { rules, count, secretsClear, relaxed, expires: now + VERIFIED_TTL_MS });
 }
 
 // Downgrades the native ask for a verified call only when every resource is allowed by the agent's
-// rules or asks solely because of a branch-gated pattern, and there are no more gated resources than
-// verified segments. Any other ask (amend, wrapped commit, secrets, rm -r, ...) stands.
-export function downgradeVerifiedCommit(event) {
+// rules, or asks solely because of a branch-gated pattern (verified commits) or a secret wildcard
+// (`*.key*` on `d.keys()`, `*secret*` on `grep -v secret`) of a command whose argument-aware check
+// found no secret path; and there are no more gated resources than verified segments. Any other ask
+// (amend, wrapped commit, real secret paths, rm -r, ...) stands.
+export function downgradeVerifiedShell(event) {
   const key = callKey(event.sessionID, event.source?.id);
   const entry = VERIFIED_COMMITS.get(key);
   if (!entry) return false;
@@ -585,16 +705,17 @@ export function downgradeVerifiedCommit(event) {
   for (const resource of event.resources) {
     const matched = explicitShellEffect(resource, entry.rules);
     if (matched?.effect === 'allow') continue;
-    // The gated pattern must be the only reason to ask: without it the resource must be allowed, so
-    // e.g. `git add .env` still hits the secret ask that `git add*` shadows (last match wins).
-    if (matched?.effect === 'ask' && BRANCH_GATED_PATTERNS.has(matched.pattern)
-        && explicitShellEffect(resource, entry.ungated)?.effect === 'allow') { gated++; continue; }
-    return false;
+    // The relaxed patterns must be the only reason to ask: without them the resource must be
+    // allowed, so e.g. `git add .env` still hits the secret ask that `git add*` shadows (last match wins).
+    if (matched?.effect !== 'ask' || explicitShellEffect(resource, entry.relaxed)?.effect !== 'allow') return false;
+    if (entry.secretsClear && shellSecretReasons(resource, { envFiles: false }).length) return false;
+    if (entry.rules.some(rule => isShellRule(rule, BRANCH_GATED_PATTERNS) && wildcardMatch(resource, rule.resource))) gated++;
   }
-  if (!gated || gated > entry.count) return false;
+  if (gated > entry.count) return false;
   event.effect = 'allow';
   return true;
 }
+export const downgradeVerifiedCommit = downgradeVerifiedShell;
 
 const listData = value => Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
 
@@ -613,7 +734,7 @@ export async function installShellGuard(ctx, { tools = ['shell', 'bash'], fullAu
         return;
       }
       if (event?.effect !== 'ask' || metadata?.[GUARD_MARKER]) return;
-      if (event.action === 'shell' && downgradeVerifiedCommit(event)) return;
+      if (event.action === 'shell' && downgradeVerifiedShell(event)) return;
       // Full-auto projects (configure.py --full-auto-project). Reevaluation probes are left alone,
       // so asks already pending when the profile changes stay with a human.
       if (metadata?.[PROBE_MARKER]) return;
@@ -663,10 +784,17 @@ export async function installShellGuard(ctx, { tools = ['shell', 'bash'], fullAu
       return;
     }
     const result = analyzeShellCommand(command, rules);
+    const secrets = shellSecretReasons(command, { envFiles: false });
+    // Secret paths the native wildcards miss (id_rsa, ~/.ssh/x) in a command the rules would allow.
+    if (secrets.length && result.action !== 'deny' && rules.length
+        && scanShell(command).segments.every(segment => !segment.hasCommand || explicitShellEffect(segment.text, rules)?.effect === 'allow')) {
+      result.action = 'ask'; result.reasons.push(...secrets);
+    }
     if (result.action !== 'deny') {
       const branch = await checkCommitBranches(command, base, rules, options);
       if (branch.reasons.length) { result.action = 'ask'; result.reasons.push(...branch.reasons); }
-      else if (result.action === 'allow' && branch.verified && canAsk) rememberVerifiedCommit(event, rules, branch.verified);
+      else if (result.action === 'allow' && canAsk && (branch.verified || !secrets.length))
+        rememberVerifiedShell(event, rules, { count: branch.verified, secretsClear: !secrets.length });
     }
     if (result.action === 'allow') return;
     const reason = result.reasons.join('; ');
