@@ -303,6 +303,44 @@ class ConfigureTests(unittest.TestCase):
             self.assertNotIn(rule,json.loads((config/'opencode.json').read_text())['permissions'])
             self.assertFalse(json.loads((config/'configure-choices.json').read_text())['tmp_scratch'])
 
+    def test_check_receipts_external_directory_is_always_allowed_narrow_and_absolute(self):
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        models={k:'anthropic/fixture#medium' for k in tiers}
+        ext=lambda p: [r for r in p['permissions'] if r['action']=='external_directory']
+        with tempfile.TemporaryDirectory(dir='.') as tmp:
+            rel=Path(os.path.relpath(tmp))/'state'; self.assertFalse(rel.is_absolute())
+            resolved=rel.resolve()
+            rule={'action':'external_directory','resource':f'{resolved}/check-receipts/*','effect':'allow'}
+            for scratch in (False,True):
+                p=profile(models,tmp_scratch=scratch,state_dir=rel)
+                self.assertEqual([r for r in ext(p) if r['resource']!='/tmp/*'],[rule])
+                self.assertEqual(any(r['resource']=='/tmp/*' for r in ext(p)),scratch)
+                self.assertTrue(Path(rule['resource'][:-2]).is_absolute())
+                for bad in (str(resolved),f'{resolved}/*',f'{resolved}/config/*',f'{resolved}/config'):
+                    self.assertFalse(any(r['resource']==bad for r in ext(p)))
+                for action in ('read','edit'):
+                    for secret in ('*.env','*auth.json'):
+                        self.assertIn({'action':action,'resource':secret,'effect':'deny'},p['permissions'])
+                self.assertFalse(any(r['action']=='external_directory' for a in p['agents'].values() for r in a.get('permissions',[])))
+            home=profile(models,state_dir=Path('~/st'))
+            self.assertIn({'action':'external_directory','resource':f'{Path.home().resolve()}/st/check-receipts/*','effect':'allow'},home['permissions'])
+            # Default (no state_dir) follows HARNESS_STATE_DIR like --state-dir does.
+            old=os.environ.get('HARNESS_STATE_DIR'); os.environ['HARNESS_STATE_DIR']=str(rel)
+            try: self.assertIn(rule,profile(models)['permissions'])
+            finally:
+                if old is None: del os.environ['HARNESS_STATE_DIR']
+                else: os.environ['HARNESS_STATE_DIR']=old
+            mfile=Path(tmp)/'models.json'; mfile.write_text(json.dumps(models)); config=resolved/'config'
+            run=lambda *extra: subprocess.run([sys.executable,'configure.py','--models',str(mfile),'--state-dir',str(rel),*extra],check=True,capture_output=True,text=True)
+            out=run()
+            self.assertIn(f'Check receipts (external_directory {resolved}/check-receipts/*): allowed.',out.stdout)
+            self.assertIn(rule,json.loads((config/'opencode.json').read_text())['permissions'])
+            self.assertEqual(json.loads((config/'configure-choices.json').read_text()),{'shell_policy':'allowlist','tmp_scratch':False})
+            run('--replace','--allow-tmp-scratch')
+            generated=json.loads((config/'opencode.json').read_text())
+            self.assertEqual([r for r in ext(generated) if r['resource']!='/tmp/*'],[rule])
+            self.assertEqual(set(json.loads((config/'configure-choices.json').read_text())),{'shell_policy','tmp_scratch'})
+
     def test_readonly_roles_get_repo_identity_instead_of_shell(self):
         p=profile({k:'anthropic/fixture#medium' for k in ('FAST','BALANCED','STRONG','MAXIMUM')})
         self.assertIn({'action':'repo_identity','resource':'*','effect':'allow'},p['permissions'])

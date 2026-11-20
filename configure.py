@@ -239,7 +239,16 @@ def shell_rules(shell_policy):
 # external_directory gate is relaxed for /tmp/*; read/edit secret denials and shell rules still apply.
 TMP_SCRATCH_RULES = ({'action':'external_directory','resource':'/tmp/*','effect':'allow'},)
 
-def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT_SHELL_POLICY, claude_auth_plugin=None, tmp_scratch=False):
+# Always on: agents must read the check receipts the harness writes under its own state dir, which
+# usually lies outside the project. Only <resolved state dir>/check-receipts/* is relaxed for the
+# external_directory gate; read/edit secret denials and shell rules still apply.
+def default_state_dir():
+    return Path(os.environ.get('HARNESS_STATE_DIR',str(Path.home()/'.local/state/opencode-usage-harness'))).expanduser().resolve()
+
+def check_receipts_rule(state_dir):
+    return {'action':'external_directory','resource':str(Path(state_dir).expanduser().resolve()/'check-receipts')+'/*','effect':'allow'}
+
+def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT_SHELL_POLICY, claude_auth_plugin=None, tmp_scratch=False, state_dir=None):
     shell_permissions = shell_rules(shell_policy)
     if not isinstance(models, dict):
         raise ValueError('models must be a tier-reference object')
@@ -316,6 +325,7 @@ def profile(models, package_root=ROOT, routing_policy=None, shell_policy=DEFAULT
         permissions += [{'action':action,'resource':p,'effect':'deny'} for p in SECRET_FILE_DENY]
         permissions += [{'action':action,'resource':p,'effect':'allow'} for p in ENV_TEMPLATE_FILE_ALLOW]
     permissions += shell_permissions
+    permissions.append(check_receipts_rule(default_state_dir() if state_dir is None else state_dir))
     if tmp_scratch:
         permissions += [dict(rule) for rule in TMP_SCRATCH_RULES]
     return {'$schema':'https://opencode.ai/v2/config.json','enabled_providers':providers,'experimental':{'policies':[{'effect':'deny','action':'provider.use','resource':'*'}]+[{'effect':'allow','action':'provider.use','resource':provider} for provider in providers]},'share':'disabled','update':'disable',
@@ -374,7 +384,7 @@ def main():
     p.add_argument('--allow-tmp-scratch',action=argparse.BooleanOptionalAction,default=None,help='Allow agents to use /tmp/* outside the workspace without an external_directory prompt (persisted; --no-allow-tmp-scratch turns it off). Default: previously persisted choice, else off')
     p.add_argument('--compaction-tokens',type=compaction_tokens_arg,default=None,metavar='N',help=f'Absolute context tokens that mark a session high-pressure and eligible for compaction, even when a larger model window is known (effective trigger: min(N, 80%% of the window)); persisted. HARNESS_COMPACTION_TOKENS overrides it at runtime. Default: previously persisted choice, else {DEFAULT_COMPACTION_TOKENS}')
     a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
-    directory=a.state_dir.expanduser().resolve()/'config';target=directory/'opencode.json'
+    state_dir=a.state_dir.expanduser().resolve();directory=state_dir/'config';target=directory/'opencode.json'
     choices_path=directory/'configure-choices.json'
     choices=load_choices(choices_path)
     shell_policy=a.shell_policy or choices.get('shell_policy') or DEFAULT_SHELL_POLICY
@@ -391,7 +401,7 @@ def main():
             p.error(f'persisted claude_auth_plugin {choices["claude_auth_plugin"]} is missing or invalid; pass --claude-auth-plugin')
     else:
         claude_auth=find_claude_auth_plugin() or previous_claude_auth_plugin(target)
-    result=profile(json.loads(a.models.read_text()),routing_policy=routing,shell_policy=shell_policy,claude_auth_plugin=claude_auth,tmp_scratch=tmp_scratch)
+    result=profile(json.loads(a.models.read_text()),routing_policy=routing,shell_policy=shell_policy,claude_auth_plugin=claude_auth,tmp_scratch=tmp_scratch,state_dir=state_dir)
     replacing = target.exists()
     if replacing and not a.replace:
         p.error('profile exists; use --replace only after reviewing changes')
@@ -419,6 +429,7 @@ def main():
     if 'anthropic' in result['enabled_providers']: requirements.append('reviewed Claude OAuth adapter and disabled usage credits or explicit local app-managed-credit policy')
     print(f'Shell policy: {shell_policy}.')
     print(f'/tmp scratch (external_directory /tmp/*): {"allowed" if tmp_scratch else "ask"}.')
+    print(f'Check receipts (external_directory {state_dir}/check-receipts/*): allowed.')
     print(f'Compaction token threshold: {compaction_tokens} (or 80% of a smaller known window).')
     if 'anthropic' in result['enabled_providers']:
         if claude_auth is not None: print(f'Claude auth plugin: {claude_auth}.')

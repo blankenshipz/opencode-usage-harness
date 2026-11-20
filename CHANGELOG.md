@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — check receipts readable outside the state dir
+
+- `configure.py` always emits a global `external_directory` allow for `<resolved state dir>/check-receipts/*`, so agents in a project outside the state dir can read check receipts without a prompt. It does not allow the rest of the state dir, it is not persisted, and secret denials still apply.
+
 ## Unreleased — mid-run compaction of a running child
 
 - A running managed child whose observed context reaches the absolute trigger (`min(HARNESS_COMPACTION_TOKENS or compaction_tokens, 80% of a known window)`) is compacted without waiting for it to finish and be collected. The harness admits one native steered compaction from the child's model-request `context` hook; OpenCode 2.0.30 runs it at the next step boundary, after the current step and its tool calls settle and before the next model request.

@@ -77,3 +77,7 @@ fsmonitor commands.
 ## /tmp scratch space
 
 `configure.py --allow-tmp-scratch` (persisted as `tmp_scratch` in `config/configure-choices.json`; `--no-allow-tmp-scratch` turns it off) adds a single global rule `{"action":"external_directory","resource":"/tmp/*","effect":"allow"}`. Without it, any access outside the workspace (including scratch files under `/tmp/opencode/...`) raises an `external_directory` prompt, which stalls headless runs. The rule does not relax read/edit secret denials, shell asks, or agent-level denies.
+
+## Check receipts
+
+`configure.py` always adds one global rule `{"action":"external_directory","resource":"<state-dir>/check-receipts/*","effect":"allow"}`, with `<state-dir>` the absolute, resolved `--state-dir` (default `HARNESS_STATE_DIR`, else `~/.local/state/opencode-usage-harness`). Agents can read the check receipts the harness writes even when the project lives outside the state dir. It is not a persisted choice. The rest of the state dir still prompts. Secret denials, shell asks and agent-level denies still apply.
