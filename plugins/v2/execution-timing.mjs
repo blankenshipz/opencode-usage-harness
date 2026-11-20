@@ -4,6 +4,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { statePath } from './paths.mjs';
+import { isSecretPath } from './shell-guard.mjs';
 
 const DEFAULT_FILE = statePath('telemetry', 'execution-timing.jsonl');
 const MAX_QUEUE = 256;
@@ -49,6 +50,22 @@ function destination(file) {
  * Subscribe passively to V2 execution boundaries. The returned cleanup function
  * only stops this observer; it never changes runtime execution or permissions.
  */
+// r20 item 7: which resource an ask was for and why, without logging command text or secret
+// paths. Shell asks keep only the command name and length; path asks keep the path unless any
+// component looks secret; the reason is the harness guard's own message, truncated.
+export function askSummary(data) {
+  const action = typeof data?.action === 'string' ? data.action.slice(0, 40) : undefined;
+  const resources = Array.isArray(data?.resources) ? data.resources.filter(r => typeof r === 'string') : [];
+  const summarize = resource => {
+    if (action === 'shell') return { command: (resource.trim().split(/\s+/)[0] ?? '').replace(/^.*\//, '').slice(0, 40), length: resource.length };
+    const parts = resource.split('/');
+    return parts.some(part => part && isSecretPath(part)) ? { path: '[redacted]' } : { path: resource.slice(0, 200) };
+  };
+  const reason = data?.metadata?.harnessShellGuard;
+  return { ...(action ? { action } : {}), ...(resources.length ? { resources: resources.slice(0, 4).map(summarize) } : {}),
+    ...(typeof reason === 'string' ? { reason: reason.replace(/\s+/g, ' ').slice(0, 200) } : {}) };
+}
+
 export function installExecutionTiming(ctx, options = {}) {
   const file = options.file ?? DEFAULT_FILE;
   const now = options.now ?? (() => Date.now());
@@ -142,7 +159,7 @@ export function installExecutionTiming(ctx, options = {}) {
     }
     if (event.type === 'permission.asked') {
       const id = `permission:${key(data.sessionID, data.id)}`;
-      interval(starts, startOrder, id, at); record(event, 'permission', at, { requestId: string(data.id), startedAt: at }); return;
+      interval(starts, startOrder, id, at); record(event, 'permission', at, { requestId: string(data.id), startedAt: at, ...askSummary(data) }); return;
     }
     if (event.type === 'permission.replied') {
       const id = `permission:${key(data.sessionID, data.requestID)}`, startedAt = starts.get(id);

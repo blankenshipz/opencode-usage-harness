@@ -89,3 +89,15 @@ test('provider-hosted tools are excluded and stalled storage cannot block dispos
   await tick();
   assert.equal(cleanup(),undefined,'cleanup is synchronous even with pending storage');
 });
+
+import { askSummary } from '../plugins/v2/execution-timing.mjs';
+test('ask records carry action, a safe resource summary and the guard reason', () => {
+  const shell = askSummary({ action: 'shell', resources: ['/usr/bin/ssh host "cat /opt/x/.env" TOKEN=abc123'], metadata: { harnessShellGuard: 'secret path /opt/x/.env' } });
+  assert.deepEqual(shell.resources, [{ command: 'ssh', length: 48 }]);
+  assert.equal(shell.action, 'shell'); assert.equal(shell.reason, 'secret path /opt/x/.env');
+  assert.equal(JSON.stringify(shell).includes('abc123'), false);
+  assert.deepEqual(askSummary({ action: 'external_directory', resources: ['/usr/lib/postgresql/*'] }).resources, [{ path: '/usr/lib/postgresql/*' }]);
+  assert.deepEqual(askSummary({ action: 'read', resources: ['/home/u/p/.env'] }).resources, [{ path: '[redacted]' }]);
+  assert.deepEqual(askSummary({ action: 'read', resources: ['/home/u/gateway/secrets/t.txt'] }).resources, [{ path: '[redacted]' }]);
+  assert.deepEqual(askSummary({}), {});
+});
