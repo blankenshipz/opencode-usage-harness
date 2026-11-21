@@ -88,8 +88,17 @@ export function placeholderText({ name, input, chars, chunksPath }) {
   return `[harness cleared old tool result: ${name} call ${digest}; ${chars} chars. Original: native read ${chunksPath} offset=1 limit=3; strip "N: " prefixes, JSON-decode each line, concatenate. Snapshot, not current state; re-run the tool for fresh output.]`;
 }
 
-export function createMaskStore(directory = statePath('tool-output-store', 'masked'), { io = fs, maxBytes = MAX_STORE_BYTES } = {}) {
-  let used;
+export function createMaskStore(directory = statePath('tool-output-store', 'masked'), { io = fs, maxBytes = MAX_STORE_BYTES, now = Date.now, recountMs = 10 * 60_000 } = {}) {
+  let used, countedAt = 0;
+  const count = async () => {
+    used = 0; countedAt = now();
+    for (const entry of await io.readdir(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      for (const file of await io.readdir(path.join(directory, entry.name)).catch(() => [])) {
+        try { used += (await io.lstat(path.join(directory, entry.name, file))).size; } catch {}
+      }
+    }
+  };
   const save = async ({ sessionID, id, text }) => {
     const reference = sha(JSON.stringify([sessionID, id, sha(text)]));
     const destination = path.join(directory, reference);
@@ -97,13 +106,7 @@ export function createMaskStore(directory = statePath('tool-output-store', 'mask
     await io.mkdir(directory, { recursive: true, mode: 0o700 });
     if ((await io.lstat(directory)).isSymbolicLink()) throw new Error('unsafe mask store');
     try { if ((await io.lstat(chunksPath)).isFile()) return chunksPath; } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (used === undefined) {
-      used = 0;
-      for (const entry of await io.readdir(directory, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        for (const file of await io.readdir(path.join(directory, entry.name))) used += (await io.lstat(path.join(directory, entry.name, file))).size;
-      }
-    }
+    if (used === undefined) await count();
     // Same chunk format as context-compression (lines below native read's clamp).
     const chunks = []; let chunk = '', encoded = 2;
     for (const character of text) {
@@ -115,6 +118,8 @@ export function createMaskStore(directory = statePath('tool-output-store', 'mask
     const chunkText = chunks.join('\n') + '\n';
     const metadata = JSON.stringify({ version: 1, kind: 'observation_mask', reference, session_id: sessionID, created_ms: Date.now(), digest: sha(text), original_chars: text.length });
     const bytes = Buffer.byteLength(text) + Buffer.byteLength(chunkText) + Buffer.byteLength(metadata);
+    // Fable r32 #2: a prune by another plugin instance frees space this count cannot see.
+    if (used + bytes > maxBytes && now() - countedAt >= recountMs) await count();
     if (used + bytes > maxBytes) throw new MaskStoreFullError();
     const temporary = await io.mkdtemp(path.join(directory, '.pending-'));
     try {
@@ -187,11 +192,19 @@ export async function pruneMaskStore({ maskDir = statePath('tool-output-store', 
     if (!groups.has(key)) groups.set(key, { owner, entries: [] });
     groups.get(key).entries.push({ dir, bytes, created });
   }
+  // Fable r32 #3: re-check activity right before evicting (a session may have resumed since the scan);
+  // remove the state file first so a resumed session never keeps pointers to deleted originals.
+  const stillIdle = async (group, idleMs) => {
+    if (!group.owner) return true;
+    try { const mtime = (await io.lstat(path.join(stateDir, group.owner))).mtimeMs; return mtime === states.get(group.owner) && now - mtime >= idleMs; }
+    catch (error) { return error?.code === 'ENOENT'; }
+  };
   const evict = async (key, group, reason) => {
+    if (group.owner) { try { await io.rm(path.join(stateDir, group.owner), { force: true }); } catch { return; } }
     for (const item of group.entries) {
       try { await io.rm(item.dir, { recursive: true, force: true }); result.originals++; result.freedBytes += item.bytes; total -= item.bytes; } catch {}
     }
-    if (group.owner) { try { await io.rm(path.join(stateDir, group.owner), { force: true }); } catch {} states.delete(group.owner); }
+    if (group.owner) states.delete(group.owner);
     if (group.owner || !group.entries.length) result.sessions++;
     groups.delete(key); count(reason);
   };
@@ -199,7 +212,7 @@ export async function pruneMaskStore({ maskDir = statePath('tool-output-store', 
   const activity = group => group.owner && states.has(group.owner) ? states.get(group.owner) : Math.max(...group.entries.map(e => e.created));
   for (const [key, group] of [...groups]) {
     const last = activity(group);
-    if (now - last > l.maxIdleMs) await evict(key, group, group.owner && states.has(group.owner) ? 'idle' : 'orphan');
+    if (now - last > l.maxIdleMs && await stillIdle(group, l.maxIdleMs)) await evict(key, group, group.owner && states.has(group.owner) ? 'idle' : 'orphan');
   }
   // Idle state files whose originals are already gone.
   for (const [name, mtime] of states) {
@@ -210,7 +223,7 @@ export async function pruneMaskStore({ maskDir = statePath('tool-output-store', 
   if (total > l.highWaterBytes) {
     const candidates = [...groups].map(([key, group]) => ({ key, group, last: activity(group) }))
       .filter(c => now - c.last >= l.minIdleMs).sort((a, b) => a.last - b.last);
-    for (const c of candidates) { if (total <= l.lowWaterBytes) break; await evict(c.key, c.group, 'size'); }
+    for (const c of candidates) { if (total <= l.lowWaterBytes) break; if (await stillIdle(c.group, l.minIdleMs)) await evict(c.key, c.group, 'size'); }
   }
   result.remainingBytes = Math.max(0, total);
   return result;
@@ -223,10 +236,18 @@ export function createStateStore(directory = statePath('observation-masking'), i
     // Keeps an in-use session from looking idle to the pruner.
     async touch(sessionID) { const at = new Date(); await io.utimes(file(sessionID), at, at); },
     async load(sessionID) {
+      let masked;
       try {
         const value = JSON.parse(await io.readFile(file(sessionID), 'utf8'));
-        return value?.version === 1 && value.masked && typeof value.masked === 'object' ? new Map(Object.entries(value.masked).filter(([, v]) => typeof v === 'string')) : new Map();
+        masked = value?.version === 1 && value.masked && typeof value.masked === 'object' ? new Map(Object.entries(value.masked).filter(([, v]) => typeof v === 'string')) : new Map();
       } catch { return new Map(); }
+      // Fable r32 #3: a mask whose original was pruned is dropped (the result shows verbatim again).
+      for (const [id, placeholder] of masked) {
+        const original = placeholder.match(/Original: native read (\S+) offset=1 limit=3;/)?.[1];
+        if (!original) continue;
+        try { await io.lstat(original); } catch (error) { if (error?.code === 'ENOENT') masked.delete(id); }
+      }
+      return masked;
     },
     async save(sessionID, masked) {
       await io.mkdir(directory, { recursive: true, mode: 0o700 });

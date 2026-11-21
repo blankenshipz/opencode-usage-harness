@@ -52,6 +52,7 @@ export async function installParentCacheTtl(ctx, { loadConfig = loadTokenSavingC
     return { stop() {}, state: () => ({ disabled: 'unsupported' }) };
   }
   let disabled, stopped = false;
+  const RESPONSE_WINDOW_MS = 120_000; // Fable r32 #6: only a 400 shortly after this session's rewrite counts
   const recent = new Map(); // sessionID -> last rewrite time (bounded)
   const register = async (name, fn) => {
     try { await ctx.session.hook(name, fn); return true; }
@@ -86,16 +87,20 @@ export async function installParentCacheTtl(ctx, { loadConfig = loadTokenSavingC
   // Circuit breaker: a 400 that names the TTL/cache_control right after a
   // rewrite for that session disables the rewrite for this process.
   await register('http.response', async event => {
-    if (stopped || disabled || !recent.has(event.sessionID)) return;
+    if (stopped || disabled || !recent.has(event.sessionID) || now() - recent.get(event.sessionID) > RESPONSE_WINDOW_MS) return;
     try { if (breaker?.state()) return; } catch {}
     const status = event.response?.status;
     if (status !== 400) return;
     try {
       const text = await event.response.clone().text();
-      if (/\bttl\b|cache_control/i.test(text)) {
-        disabled = 'provider_rejected_ttl';
-        log({ event: 'parent_cache_ttl_disabled', reason: disabled, session: event.sessionID });
-        try { breaker?.trip(disabled); } catch { /* local disable still applies */ }
+      if (/\bttl\b/i.test(text)) {
+        const reason = 'provider_rejected_ttl';
+        log({ event: 'parent_cache_ttl_disabled', reason, session: event.sessionID });
+        // Fable r32 #4: with a breaker, the breaker alone decides (it expires and can be reset);
+        // a local disable is only the fallback when no breaker exists or it cannot trip.
+        let tripped = false;
+        try { if (breaker) { breaker.trip(reason); tripped = Boolean(breaker.state()); } } catch {}
+        if (!tripped) disabled = reason;
       }
     } catch { /* leave the response untouched */ }
   });

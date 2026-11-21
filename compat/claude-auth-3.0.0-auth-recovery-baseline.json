@@ -8,28 +8,28 @@
     "src/provider.ts": "32dc63434f8934701ad914ad66da3c73f8f2383ac64e7495e833d91a466ea665",
     "src/vendor-hardening.test.ts": "8f28b6471a3d5196fad32acf7ef492f876e9739b6ab5ed2ab4032fba144aaaf5"
   },
-  "patch_sha256": "b0e68a84e143d178d9ffa4f5781cb5c8747e723080f240782c900411f3caf799",
+  "patch_sha256": "e8e8f9f4ae93eaeb467f1f1b18d86496061c055df4eb6222e963565c206873bc",
   "patched_sha256": {
-    "src/credentials.ts": "d644bc841ec80bac1fe5b3e785380bf15256ee0ca2860020514f5ed54259d703",
-    "src/provider.ts": "ff1e030a4f4e2b59f80e7475c63f522103ee80cade2bcecea2bd6f83fed5859a",
+    "src/credentials.ts": "1d8a4a71397886a195417600000db6e0d68c8c7862efe45da33dd0f75d4360b5",
+    "src/provider.ts": "6b2875f2df9b16a3eb5e0d5b4716836ae594bdd0aaee94d32049b22f8120cc6c",
     "src/vendor-hardening.test.ts": "a1dc7dce8fd1a6c82571e1923344dbabd8dd63b16e48ad165fdcf52bb552d7aa",
     "src/harness-telemetry.ts": "cf6ec55db3624830c624aeac0f3f13b84a05456a7a302f7a24e3515a67bab02a",
-    "src/harness-auth-recovery.test.ts": "cb2f486b8870e5892b81212709e447428ca591f56c9f17dc71bc20cccf236ae4"
+    "src/harness-auth-recovery.test.ts": "40575adeb23eab939c92e71a6c83ff2c8a05e564edcdadb5eca4645e38707d5c"
   },
   "built_dist_sha256": {
-    "dist/credentials.js": "9971567855719d619a35e77e2a56c63b234e3cc4a33fe485b2dbfaaafbe8905c",
-    "dist/provider.js": "020c8ebbd459d141f9cf0017dff9e83733ed4791ae965db58387bf7e67a67d32",
+    "dist/credentials.js": "f5609f8709ccf6c4a3ba3feb5de2df7c725f4f5468c728d9bb3bcdc1e3bc36e8",
+    "dist/provider.js": "76e18d5dbce21e16f417e2f0e68a59bc5203902d86aa2717b37fe79a7d6bebdd",
     "dist/harness-telemetry.js": "76bedc6fd67f3aa4e2c9c6ace3c98ae5bc7f4f8f77c3524131e3d11b0c9d04f1"
   },
   "scope": [
     "rotateAccountCredentials (the OpenCode credential refresh path) updates the request-path credential cache, so requests are no longer signed with the access token the rotation just revoked (root cause of the 2026-11-21T02:06:40Z 'OAuth access token has been revoked' errors).",
-    "A 401 response gets exactly one retry for the SAME account: re-read its own credential store, else one OAuth refresh with its own refresh token (single-flight per account). No other account, API key or CLI; never a second retry.",
+    "A 401 response gets exactly one retry for the SAME account: a newer token this process already holds, else a newer token in that account's own credential store (the rejected token is never adopted), else one refresh through the locked, single-flight, cooldown-aware rotateAccountCredentials path. No other account, API key or CLI; never a second retry.",
     "400, 429, 529 and every other failed response are still returned without retry.",
     "Each 401 recovery appends a claude_auth_recovery event (outcome, how, status, retry status, model) to <HARNESS_STATE_DIR>/telemetry/token-saving.jsonl; no token or header value is written."
   ],
   "validation": {
     "typescript": "passed",
-    "harness_auth_recovery_tests": "5 passed",
-    "full_suite": "327 tests; the only failures are the 13 that fail on the unpatched subscription-only baseline (borrowing/CLI tests for removed features) minus one ('recovers a 401 with its own refresh token') that now passes"
+    "harness_auth_recovery_tests": "6 passed",
+    "full_suite": "328 tests; the only failures are the 13 that fail on the unpatched subscription-only baseline (borrowing/CLI tests for removed features) minus one ('recovers a 401 with its own refresh token') that now passes"
   }
 }

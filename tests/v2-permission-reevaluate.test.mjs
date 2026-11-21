@@ -185,3 +185,15 @@ test('r32: install sweeps empty files once and logs the count', async () => {
   handle.stop();
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+test('Fable r32: a stranded .sweep file is restored (non-empty) or dropped (empty) on the next sweep', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'perm-pending-'));
+  const uuid = '123e4567-e89b-12d3-a456-426614174000';
+  const keep = path.join(root, `aaaaaaaaaaaaaaaaaaaaaaaa.json.42.${uuid}.sweep`), drop = path.join(root, `bbbbbbbbbbbbbbbbbbbbbbbb.json.42.${uuid}.sweep`);
+  fs.writeFileSync(keep, '{"pending":{"per_k":"ses_1"},"meta":{}}'); fs.writeFileSync(drop, '{"pending":{},"meta":{}}');
+  const old = new Date(Date.now() - 120_000); fs.utimesSync(keep, old, old); fs.utimesSync(drop, old, old);
+  sweepEmptyPending({ root });
+  assert.deepEqual(fs.readdirSync(root), ['aaaaaaaaaaaaaaaaaaaaaaaa.json']);
+  assert.match(fs.readFileSync(path.join(root, 'aaaaaaaaaaaaaaaaaaaaaaaa.json'), 'utf8'), /per_k/);
+  fs.rmSync(root, { recursive: true, force: true });
+});

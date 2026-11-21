@@ -25,6 +25,8 @@ export function readTokenSavingRecords(state) {
 }
 
 const num = v => (Number.isFinite(v) ? v : 0);
+// Reason/outcome strings come from a file: only short snake_case keys are kept as-is.
+const label = v => (typeof v === 'string' && /^[a-z0-9_.-]{1,48}$/i.test(v) ? v : 'other');
 const bump = (o, k, n = 1) => { o[k] = (o[k] ?? 0) + n; };
 function emptyDay() {
   return {
@@ -52,14 +54,14 @@ export function summarizeTokenSaving(records) {
         if (typeof r.session === 'string') (maskSessions[key] ??= new Set()).add(r.session);
         break;
       }
-      case 'observation_mask_stopped': bump(m.stopped, String(r.reason ?? 'unknown')); break;
+      case 'observation_mask_stopped': bump(m.stopped, label(r.reason)); break;
       case 'observation_mask_pruned': m.prunes++; m.prunedSessions += num(r.sessions); m.prunedOriginals += num(r.originals); m.prunedBytes += num(r.freedBytes); break;
       case 'observation_mask_error': case 'observation_mask_prune_error': m.errors++; break;
       case 'parent_cache_ttl_applied': p.applied++; if (typeof r.session === 'string') (ttlSessions[key] ??= new Set()).add(r.session); break;
-      case 'parent_cache_ttl_unsupported': bump(p.unsupported, String(r.reason ?? 'unknown')); break;
+      case 'parent_cache_ttl_unsupported': bump(p.unsupported, label(r.reason)); break;
       case 'parent_cache_ttl_disabled': p.breakerTrips++; break;
       case 'parent_cache_ttl_fallback': p.fallbacks++; break;
-      case 'claude_auth_recovery': bump(d.auth.recoveries, String(r.outcome ?? 'unknown')); break;
+      case 'claude_auth_recovery': bump(d.auth.recoveries, label(r.outcome)); break;
       default: break;
     }
   }

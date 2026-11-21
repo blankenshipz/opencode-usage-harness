@@ -55,6 +55,18 @@ export function sweepEmptyPending({ root = statePath('permission-pending'), io =
   const removed = [];
   let names;
   try { names = io.readdirSync(root); } catch { return removed; }
+  // Fable r32: a crash between the move-aside and the restore strands a file as `.sweep`;
+  // recover it (restore when no newer file exists, else drop it) once it is a minute old.
+  for (const name of names) {
+    const match = name.match(/^([a-f0-9]{24}\.json)\.\d+\.[0-9a-f-]{36}\.sweep$/);
+    if (!match) continue;
+    const aside = path.join(root, name), file = path.join(root, match[1]);
+    try {
+      if (Date.now() - io.lstatSync(aside).mtimeMs < 60_000) continue;
+      if (!isEmptyPendingText(io.readFileSync(aside, 'utf8'))) { try { io.linkSync(aside, file); } catch { /* a newer file exists */ } }
+      io.unlinkSync(aside);
+    } catch { /* leave it */ }
+  }
   for (const name of names) {
     if (!/^[a-f0-9]{24}\.json$/.test(name)) continue;
     const file = path.join(root, name);

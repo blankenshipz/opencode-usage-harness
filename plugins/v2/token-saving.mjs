@@ -133,7 +133,7 @@ export function resetTokenSavingState() { cache = undefined; once.clear(); }
 export const TTL_BREAKER_HOLD_MS = 24 * 3600_000;
 export function createTtlBreaker({ file = statePath('token-saving', 'ttl-breaker.json'), holdMs = TTL_BREAKER_HOLD_MS, now = Date.now,
   log = logTokenSaving, io = fs } = {}) {
-  let tripped, cacheKey, cacheValue, logged = false;
+  let tripped, persisted = false, cacheKey, cacheValue, logged = false;
   const read = () => {
     let key = 'absent';
     try { const info = io.statSync(file); key = `${info.mtimeMs}:${info.size}`; } catch {}
@@ -156,7 +156,10 @@ export function createTtlBreaker({ file = statePath('token-saving', 'ttl-breaker
   return {
     // The current trip, or undefined. Expired trips are ignored.
     state() {
-      const current = tripped ?? read();
+      const onDisk = read();
+      // Fable r32 #4: a persisted trip whose file was deleted is reset (operator reset).
+      if (tripped && persisted && !onDisk) { tripped = undefined; persisted = false; logged = false; }
+      const current = tripped ?? onDisk;
       if (!current || now() - current.at >= holdMs) { if (tripped && now() - tripped.at >= holdMs) { tripped = undefined; logged = false; } return undefined; }
       fallback(current); // a persisted trip seen by a new process also logs the fallback once
       return current;
@@ -164,12 +167,13 @@ export function createTtlBreaker({ file = statePath('token-saving', 'ttl-breaker
     trip(reason) {
       if (this.state()) return false;
       tripped = { at: now(), reason: String(reason).slice(0, 64) };
-      logged = false;
+      logged = false; persisted = false;
       try {
         io.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
         const temporary = `${file}.${process.pid}.tmp`;
         io.writeFileSync(temporary, JSON.stringify({ version: 1, ...tripped }), { mode: 0o600 });
         io.renameSync(temporary, file);
+        persisted = true;
       } catch { /* in-process trip still applies */ }
       fallback(tripped);
       return true;

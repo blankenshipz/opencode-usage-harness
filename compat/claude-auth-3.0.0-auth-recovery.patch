@@ -1,12 +1,17 @@
 diff --git a/src/credentials.ts b/src/credentials.ts
-index 5348388..41cd4e8 100644
+index 5348388..4bc999c 100644
 --- a/src/credentials.ts
 +++ b/src/credentials.ts
-@@ -554,10 +554,15 @@ export async function refreshIfNeeded(
+@@ -554,10 +554,20 @@ export async function refreshIfNeeded(
   * cross-process lock: OpenCode's own refresh callback and the request path
   * can't both spend the same refresh token.
   */
 -export function rotateAccountCredentials(
++/** Harness r32: make `creds` the request-path credentials for `account` (401 recovery). */
++export function primeCredentialCache(account: ClaudeAccount, creds: ClaudeCredentials): void {
++  accountCacheMap.set(account.source, { creds, cachedAt: Date.now() })
++}
++
 +export async function rotateAccountCredentials(
    account: ClaudeAccount,
  ): Promise<ClaudeCredentials | null> {
@@ -21,22 +26,24 @@ index 5348388..41cd4e8 100644
  
  /**
 diff --git a/src/provider.ts b/src/provider.ts
-index 57ae4dd..571f971 100644
+index 57ae4dd..c6649e3 100644
 --- a/src/provider.ts
 +++ b/src/provider.ts
-@@ -8,8 +8,11 @@ import {
+@@ -8,8 +8,13 @@ import {
    getActiveAccount,
    getCachedCredentials,
    getCredentialsWithBackoff,
-+  forceRefreshActiveAccount,
++  primeCredentialCache,
 +  reloadCredentialsFromSource,
++  rotateAccountCredentials,
    type ClaudeCredentials,
  } from "./credentials.ts"
 +import { recordHarnessAuthEvent } from "./harness-telemetry.ts"
++import { refreshAccount } from "./keychain.ts"
  import { log } from "./logger.ts"
  import { getUserAgent } from "./model-config.ts"
  import { transformBody, transformResponseStream } from "./transforms.ts"
-@@ -98,6 +101,13 @@ function modelFromBody(body: string): string {
+@@ -98,6 +103,13 @@ function modelFromBody(body: string): string {
    }
  }
  
@@ -50,7 +57,7 @@ index 57ae4dd..571f971 100644
  /** Prepare the native Anthropic request for Claude Code subscription billing. */
  export async function prepareClaudeRequest(
    request: Request,
-@@ -115,7 +125,8 @@ export async function prepareClaudeRequest(
+@@ -115,7 +127,8 @@ export async function prepareClaudeRequest(
      throw new Error(
        "Claude subscription credentials are unavailable. Run /connect in OpenCode 2.",
      )
@@ -60,7 +67,7 @@ index 57ae4dd..571f971 100644
      method: request.method,
      headers: buildRequestHeaders(
        request,
-@@ -124,9 +135,11 @@ export async function prepareClaudeRequest(
+@@ -124,9 +137,11 @@ export async function prepareClaudeRequest(
        modelID,
        getExcludedBetas(modelID),
      ),
@@ -73,13 +80,16 @@ index 57ae4dd..571f971 100644
  }
  
  async function sendRequest(request: Request, send: Fetch): Promise<Response> {
-@@ -148,11 +161,66 @@ export async function finishClaudeResponse(
+@@ -148,11 +163,80 @@ export async function finishClaudeResponse(
    source?: string,
    send: Fetch = fetch,
  ): Promise<Response> {
 +  if (initial.status === 401) {
 +    const recovered = await recoverUnauthorized(request, source, send)
-+    if (recovered) return recovered.ok ? transformResponseStream(recovered) : recovered
++    if (recovered) {
++      initial.body?.cancel().catch(() => {})
++      return recovered.ok ? transformResponseStream(recovered) : recovered
++    }
 +    return initial
 +  }
    if (!initial.ok) return initial
@@ -111,11 +121,22 @@ index 57ae4dd..571f971 100644
 +    let pending = recoveries.get(account.source)
 +    if (!pending) {
 +      pending = (async () => {
-+        const reloaded = reloadCredentialsFromSource(account)
-+        if (reloaded && reloaded.accessToken !== rejected) return { token: reloaded, how: "reloaded" }
-+        const current = await getCachedCredentials(account)
-+        if (current && current.accessToken !== rejected) return { token: current, how: "cached" }
-+        return { token: await forceRefreshActiveAccount(undefined, account), how: "refreshed" }
++        const fresh = (c: ClaudeCredentials | null | undefined) =>
++          !!c && !!c.accessToken && c.accessToken !== rejected && c.expiresAt > Date.now() + 60_000
++        // 1. This process already holds a newer token (e.g. a rotation): use it, fix the cache.
++        if (fresh(account.credentials)) {
++          primeCredentialCache(account, account.credentials)
++          return { token: account.credentials, how: "memory" }
++        }
++        // 2. Another process or the CLI wrote a newer token: adopt it. Never adopt the rejected one.
++        let stored: ClaudeCredentials | null = null
++        try { stored = refreshAccount(account.source, account.configDir) } catch {}
++        if (fresh(stored)) {
++          const reloaded = reloadCredentialsFromSource(account)
++          if (fresh(reloaded)) return { token: reloaded, how: "reloaded" }
++        }
++        // 3. One refresh through the locked, single-flight, cooldown-aware path (updates the cache).
++        return { token: await rotateAccountCredentials(account), how: "refreshed" }
 +      })().finally(() => recoveries.delete(account.source))
 +      recoveries.set(account.source, pending)
 +    }
@@ -193,10 +214,10 @@ index 0000000..18691ea
 +}
 diff --git a/src/harness-auth-recovery.test.ts b/src/harness-auth-recovery.test.ts
 new file mode 100644
-index 0000000..4d87080
+index 0000000..f0dadf2
 --- /dev/null
 +++ b/src/harness-auth-recovery.test.ts
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,114 @@
 +// Harness r32: one same-account retry on 401, cache coherence after rotation, token-free telemetry.
 +import assert from "node:assert/strict"
 +import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs"
@@ -270,6 +291,22 @@ index 0000000..4d87080
 +      assert.equal(calls, 0); assert.equal(result, initial)
 +      assert.equal(events().at(-1).outcome, "no_new_token")
 +    } finally { globalThis.fetch = realFetch }
++  })
++
++  it("a store still holding the rejected token is not adopted; a newer in-memory token is used and cached", async () => {
++    const acct = credentials.getAccountBySource("file")!
++    acct.credentials = { accessToken: "fake-mem-new", refreshToken: "fake-refresh-m", expiresAt: Date.now() + 3600_000 }
++    writeStore("fake-stale-signed", "fake-refresh-s") // failed write-back left the revoked token in the store
++    const request = await prepared()
++    const rejected = request.headers.get("authorization")!.slice(7)
++    writeStore(rejected, "fake-refresh-s")
++    acct.credentials = { accessToken: "fake-mem-new", refreshToken: "fake-refresh-m", expiresAt: Date.now() + 3600_000 }
++    const sent: string[] = []
++    const result = await provider.finishClaudeResponse(request, new Response("revoked", { status: 401 }), "file", async (_u, init) => {
++      sent.push(new Headers(init?.headers).get("authorization") ?? ""); return new Response("ok") })
++    assert.equal(result.status, 200); assert.deepEqual(sent, ["Bearer fake-mem-new"])
++    assert.equal(events().at(-1).how, "memory")
++    assert.equal((await prepared()).headers.get("authorization"), "Bearer fake-mem-new", "cache primed; the revoked store token is not re-adopted")
 +  })
 +
 +  it("400/429/529 are still never retried", async () => {

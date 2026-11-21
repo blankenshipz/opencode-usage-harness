@@ -8,7 +8,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { installObservationMasking, createMaskStore, createStateStore, pruneMaskStore, sessionStateName,
-  resetMaskPruneSchedule, MAX_MASKED_PER_SESSION, PRUNE_DEFAULTS } from '../plugins/v2/observation-masking.mjs';
+  resetMaskPruneSchedule, MAX_MASKED_PER_SESSION, PRUNE_DEFAULTS, placeholderText } from '../plugins/v2/observation-masking.mjs';
 import { mergeTokenSavingConfig } from '../plugins/v2/token-saving.mjs';
 import { summarizeTokenSaving, formatTokenSaving } from '../bin/harness-token-saving-report.mjs';
 
@@ -201,4 +201,48 @@ test('r32 #1: summary totals masking savings and 1h-TTL events per day; the CLI 
   assert.equal(rollup.tokenSaving.masking.estTokensRemoved, 150_000);
   assert.equal(rollup.tokenSaving.parentTtl.breakerTrips, 1);
   fs.rmSync(state, { recursive: true, force: true });
+});
+
+test('Fable r32 #2: a full store recounts after another instance pruned, instead of staying full', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'mask-full-'));
+  try {
+    let t = 0;
+    const store = createMaskStore(root, { maxBytes: 30_000, now: () => t, recountMs: 1000 });
+    const first = await store({ sessionID: 's', id: 'a', text: 'a'.repeat(9000) });
+    await assert.rejects(store({ sessionID: 's', id: 'b', text: 'b'.repeat(9000) }), { code: 'MASK_STORE_FULL' });
+    await fsp.rm(path.dirname(first), { recursive: true }); // pruned by another instance
+    await assert.rejects(store({ sessionID: 's', id: 'b', text: 'b'.repeat(9000) }), { code: 'MASK_STORE_FULL' }, 'recount is throttled');
+    t += 1000;
+    assert.match(await store({ sessionID: 's', id: 'b', text: 'b'.repeat(9000) }), /chunks\.jsonl$/);
+  } finally { await fsp.rm(root, { recursive: true, force: true }); }
+});
+
+test('Fable r32 #3: a session touched after the scan is not evicted; masks whose original vanished are dropped on load', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'mask-race-'));
+  const now = Date.now(), day = 24 * 3600_000;
+  try {
+    const { maskDir, stateDir, state } = await seedStore(root, { now, sessions: { ses_back: { ageMs: 8 * day } } });
+    const stateFile = path.join(stateDir, sessionStateName('ses_back'));
+    let scanned = false;
+    // The session resumes (touch) after the scan read its mtime, before eviction.
+    const io = { ...fsp, readdir: async (dir, opts) => { const r = await fsp.readdir(dir, opts); if (dir === maskDir && !scanned) { scanned = true; const at = new Date(now); await fsp.utimes(stateFile, at, at); } return r; } };
+    // states are read before the mask scan, so the touch lands between scan and evict.
+    const result = await pruneMaskStore({ maskDir, stateDir, now, io });
+    assert.equal(result.sessions, 0); assert.equal(await ownedBy(maskDir, 'ses_back'), 2);
+    // Self-heal: delete one original; the reloaded mask set drops that entry only.
+    const paths = [...(await state.load('ses_back')).values()];
+    await state.save('ses_back', new Map(paths.map((chunksPath, i) => [`c${i}`, placeholderText({ name: 'read', input: {}, chars: 5000, chunksPath })])));
+    const masks = await state.load('ses_back');
+    assert.equal(masks.size, 2);
+    const victim = paths[0];
+    await fsp.rm(path.dirname(victim), { recursive: true });
+    assert.equal((await state.load('ses_back')).size, masks.size - 1);
+  } finally { await fsp.rm(root, { recursive: true, force: true }); }
+});
+
+test('Fable r32 minor: summary keys from telemetry are bounded', () => {
+  const s = summarizeTokenSaving([{ at: new Date(2026, 10, 20, 9).toISOString(), event: 'observation_mask_stopped', reason: 'x'.repeat(200) },
+    { at: new Date(2026, 10, 20, 9).toISOString(), event: 'claude_auth_recovery', outcome: 'has space' }]);
+  assert.deepEqual(s['2026-11-20'].masking.stopped, { other: 1 });
+  assert.deepEqual(s['2026-11-20'].auth.recoveries, { other: 1 });
 });
