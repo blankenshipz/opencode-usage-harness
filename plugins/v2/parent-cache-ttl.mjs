@@ -11,7 +11,7 @@
 // missing hook, a 400 mentioning the TTL) is logged once and the request is
 // sent unchanged; a TTL rejection disables the rewrite for this process.
 import { canonicalHarnessRole } from './agent-mode.mjs';
-import { loadTokenSavingConfig, logOnce, logTokenSaving } from './token-saving.mjs';
+import { loadTokenSavingConfig, logOnce, logTokenSaving, parentTtlBreaker } from './token-saving.mjs';
 
 const BILLING_PREFIX = 'x-anthropic-billing-header';
 const isRecord = v => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -44,7 +44,7 @@ export function parentTtlApplies(event, config) {
   return (config.roles ?? []).includes(role);
 }
 
-export async function installParentCacheTtl(ctx, { loadConfig = loadTokenSavingConfig, log = logTokenSaving, once = logOnce, now = Date.now } = {}) {
+export async function installParentCacheTtl(ctx, { loadConfig = loadTokenSavingConfig, log = logTokenSaving, once = logOnce, now = Date.now, breaker = parentTtlBreaker() } = {}) {
   // No session hook API at all (older runtime or a test double): nothing to do, nothing to log.
   if (typeof ctx?.session?.hook !== 'function') return { stop() {}, state: () => ({ disabled: 'unsupported' }) };
   if (typeof Request !== 'function') {
@@ -62,6 +62,8 @@ export async function installParentCacheTtl(ctx, { loadConfig = loadTokenSavingC
     let config;
     try { config = loadConfig().parentCacheTtl; } catch { return; }
     if (!parentTtlApplies(event, config)) return;
+    // r32 item 2: a tripped breaker (this process, another plugin instance, or persisted) means default TTL.
+    try { if (breaker?.state()) return; } catch { return; }
     try {
       const request = event.request;
       if (!(request instanceof Request) || request.method !== 'POST') return;
@@ -85,6 +87,7 @@ export async function installParentCacheTtl(ctx, { loadConfig = loadTokenSavingC
   // rewrite for that session disables the rewrite for this process.
   await register('http.response', async event => {
     if (stopped || disabled || !recent.has(event.sessionID)) return;
+    try { if (breaker?.state()) return; } catch {}
     const status = event.response?.status;
     if (status !== 400) return;
     try {
@@ -92,8 +95,9 @@ export async function installParentCacheTtl(ctx, { loadConfig = loadTokenSavingC
       if (/\bttl\b|cache_control/i.test(text)) {
         disabled = 'provider_rejected_ttl';
         log({ event: 'parent_cache_ttl_disabled', reason: disabled, session: event.sessionID });
+        try { breaker?.trip(disabled); } catch { /* local disable still applies */ }
       }
     } catch { /* leave the response untouched */ }
   });
-  return { stop() { stopped = true; recent.clear(); }, state: () => ({ disabled }) };
+  return { stop() { stopped = true; recent.clear(); }, state: () => ({ disabled: disabled ?? (breaker?.state() ? 'breaker_tripped' : undefined) }) };
 }

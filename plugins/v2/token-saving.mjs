@@ -123,3 +123,59 @@ export function logOnce(key, record) {
   return true;
 }
 export function resetTokenSavingState() { cache = undefined; once.clear(); }
+
+// r32 item 2: the 1h parent-TTL circuit breaker, shared by every plugin instance in
+// the process (parent-cache-ttl trips it; dispatch-routing's 1h warm window reads it)
+// and persisted for `holdMs`, so a restart or hot reload does not send another
+// request the provider already rejected. While tripped, parents use the default
+// 5m TTL and the 5m warm window; the fallback is logged once per trip.
+// Reset by deleting <state>/token-saving/ttl-breaker.json (it also expires).
+export const TTL_BREAKER_HOLD_MS = 24 * 3600_000;
+export function createTtlBreaker({ file = statePath('token-saving', 'ttl-breaker.json'), holdMs = TTL_BREAKER_HOLD_MS, now = Date.now,
+  log = logTokenSaving, io = fs } = {}) {
+  let tripped, cacheKey, cacheValue, logged = false;
+  const read = () => {
+    let key = 'absent';
+    try { const info = io.statSync(file); key = `${info.mtimeMs}:${info.size}`; } catch {}
+    if (key !== cacheKey) {
+      cacheKey = key; cacheValue = undefined;
+      if (key !== 'absent') {
+        try {
+          const value = JSON.parse(io.readFileSync(file, 'utf8'));
+          if (Number.isFinite(value?.at) && typeof value.reason === 'string') cacheValue = { at: value.at, reason: value.reason.slice(0, 64) };
+        } catch { /* unreadable: ignore */ }
+      }
+    }
+    return cacheValue;
+  };
+  const fallback = state => {
+    if (logged) return;
+    logged = true;
+    try { log({ event: 'parent_cache_ttl_fallback', reason: state.reason, ttl: '5m', warmMs: TOKEN_SAVING_DEFAULTS.cacheKeep.warmMs, until: new Date(state.at + holdMs).toISOString() }); } catch {}
+  };
+  return {
+    // The current trip, or undefined. Expired trips are ignored.
+    state() {
+      const current = tripped ?? read();
+      if (!current || now() - current.at >= holdMs) { if (tripped && now() - tripped.at >= holdMs) { tripped = undefined; logged = false; } return undefined; }
+      fallback(current); // a persisted trip seen by a new process also logs the fallback once
+      return current;
+    },
+    trip(reason) {
+      if (this.state()) return false;
+      tripped = { at: now(), reason: String(reason).slice(0, 64) };
+      logged = false;
+      try {
+        io.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+        const temporary = `${file}.${process.pid}.tmp`;
+        io.writeFileSync(temporary, JSON.stringify({ version: 1, ...tripped }), { mode: 0o600 });
+        io.renameSync(temporary, file);
+      } catch { /* in-process trip still applies */ }
+      fallback(tripped);
+      return true;
+    },
+  };
+}
+let sharedBreaker;
+export function parentTtlBreaker() { return (sharedBreaker ??= createTtlBreaker()); }
+export function setParentTtlBreaker(value) { const previous = sharedBreaker; sharedBreaker = value; return previous; }

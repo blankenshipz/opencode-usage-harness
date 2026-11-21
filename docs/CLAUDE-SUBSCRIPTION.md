@@ -82,14 +82,27 @@ subscription-only harness. It removes hidden Claude CLI generation during token
 refresh, automatic borrowing of another account, and response retries that run
 outside the harness's admission hooks. Ordinary OAuth refresh for the selected
 account remains. Failed inference responses are returned to the caller for explicit
-recovery. Preserve the package license and original commit provenance.
+recovery, with one exception added in 0.3.1 (below). Preserve the package license and
+original commit provenance.
+
+Since 0.3.1, also apply `compat/claude-auth-3.0.0-auth-recovery.patch` on top (hashes in
+`compat/claude-auth-3.0.0-auth-recovery-baseline.json`). It fixes a cache bug: when
+OpenCode refreshed the credential through the adapter, the adapter's 30-second request
+cache kept the access token that the refresh had just revoked, so requests failed with
+"OAuth access token has been revoked" for up to 30 seconds. The refresh now updates that
+cache. The patch also allows exactly one retry after a 401, for the same account only:
+the adapter re-reads that account's credential store, or refreshes once with that
+account's own refresh token. It never uses another account, an API key or the CLI, and
+never retries other statuses. Each recovery writes a `claude_auth_recovery` event
+(outcome only, no token values) to `<state>/telemetry/token-saving.jsonl`.
 
 ### Installing the artifact and generating the plugin entry
 
 `install.py` copies only this repository's allowlisted source, so it does not
 produce the adapter. Build opencode-claude-auth 3.0.0 at the pinned upstream
-commit, apply `compat/claude-auth-3.0.0-subscription-only.patch`, verify the
-source hashes in `compat/claude-auth-3.0.0-subscription-only-baseline.json`, and
+commit, apply `compat/claude-auth-3.0.0-subscription-only.patch` and then
+`compat/claude-auth-3.0.0-auth-recovery.patch`, verify the source hashes in both
+`*-baseline.json` files, and
 vendor the built directory (`package.json`, `index.mjs`, `dist/`, production
 `node_modules`). Recommended location: `<prefix>/vendor/claude-auth`, outside the
 hash-pinned release inventory (a file added under `releases/<version>/` fails

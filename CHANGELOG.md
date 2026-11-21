@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1 — masking telemetry and pruning, TTL breaker gate, pending-file cleanup, OAuth revoked fix
+
+- **Observation-masking telemetry** (`observation-masking.mjs`): `observation_mask_batch` now records `charsRemoved`, `tokensRemoved` (`tokensCleared` is kept), `tokensBefore` and the thresholds in effect (`triggerTokens`, `minBatchTokens`, `keepRecentTurns`). `observation_mask_stopped` is logged once per session when masking stops at the 5000-id cap (`id_cap`) or the 256 MiB store cap (`store_cap`).
+- **Masked-store pruning:** session-granular eviction of `tool-output-store/masked` and `observation-masking/`. It evicts sessions idle for more than 7 days, orphans older than 7 days, and stale `.pending-*` directories. Above 75% of the cap it evicts the least recently active sessions idle for at least 6 hours, down to 50%. It runs at startup, every 6 hours, and early when the store is full. Logged as `observation_mask_pruned`. Sessions in use refresh their state mtime.
+- **Report:** new `bin/harness-token-saving-report.mjs` with per-day totals of masking savings, stops and prunes, 1h-TTL events, breaker trips and fallbacks, and auth recovery. `harness-daily-rollup.mjs` adds a `tokenSaving` section.
+- **1h TTL gated on the circuit breaker** (known gap from 0.3.0): the breaker is shared per process and persisted for 24 hours in `<state>/token-saving/ttl-breaker.json`. While it is tripped, parents use the default 5m TTL and the 5m cache-keep window, and one `parent_cache_ttl_fallback` is logged per trip and process.
+- **Permission-pending files:** `state/permission-pending/<loc>.json` is deleted when its pending map becomes empty. At startup, files that are already empty are swept. Each file is moved aside atomically and restored if it gained an entry in the meantime, so a file with pending entries is never deleted. A sweep that removes files logs `pending_files_swept`.
+- **Claude OAuth "access token has been revoked"** (2026-11-21T02:06:40Z): the root cause was in the vendored adapter. The credential refresh that OpenCode runs through the adapter did not update the adapter's 30-second request cache, so requests were signed with the token the refresh had just revoked. New `compat/claude-auth-3.0.0-auth-recovery.patch` (plus its baseline):
+  - the refresh now updates the cache;
+  - a 401 gets exactly one retry, for the same account only;
+  - a `claude_auth_recovery` event is logged without token values.
+
+  The OpenCode runtime is unchanged.
+- Tests: `tests/v2-r32-masking-telemetry.test.mjs`, new cases in `tests/v2-token-saving.test.mjs` and `tests/v2-permission-reevaluate.test.mjs`, and the adapter test `src/harness-auth-recovery.test.ts` (in the patch).
+
 ## 0.3.0 — token-saving strategies (cache-aware continuations, 1h parent TTL, observation masking, effort map)
 
 All four are on by default. They are configured in `<state>/config/token-saving.json` (hot-reload) with `HARNESS_TOKEN_SAVING` / `HARNESS_CACHE_KEEP` / `HARNESS_PARENT_CACHE_TTL` / `HARNESS_OBSERVATION_MASKING` / `HARNESS_EFFORT_MAP` `=off` kill switches, and log decisions to `<state>/telemetry/token-saving.jsonl`. See README "Token-saving strategies" (sources, caveats, how to measure). Research: r29.

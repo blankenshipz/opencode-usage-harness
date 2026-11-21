@@ -1,0 +1,297 @@
+diff --git a/src/credentials.ts b/src/credentials.ts
+index 5348388..41cd4e8 100644
+--- a/src/credentials.ts
++++ b/src/credentials.ts
+@@ -554,10 +554,15 @@ export async function refreshIfNeeded(
+  * cross-process lock: OpenCode's own refresh callback and the request path
+  * can't both spend the same refresh token.
+  */
+-export function rotateAccountCredentials(
++export async function rotateAccountCredentials(
+   account: ClaudeAccount,
+ ): Promise<ClaudeCredentials | null> {
+-  return refreshIfNeeded(account, Number.POSITIVE_INFINITY)
++  const rotated = await refreshIfNeeded(account, Number.POSITIVE_INFINITY)
++  // Harness r32: the exchange above revokes the previous access token. Keep the
++  // request path's 30 s cache coherent, or prepareClaudeRequest keeps signing
++  // with the revoked token until the cache entry ages out.
++  if (rotated) accountCacheMap.set(account.source, { creds: rotated, cachedAt: Date.now() })
++  return rotated
+ }
+ 
+ /**
+diff --git a/src/provider.ts b/src/provider.ts
+index 57ae4dd..571f971 100644
+--- a/src/provider.ts
++++ b/src/provider.ts
+@@ -8,8 +8,11 @@ import {
+   getActiveAccount,
+   getCachedCredentials,
+   getCredentialsWithBackoff,
++  forceRefreshActiveAccount,
++  reloadCredentialsFromSource,
+   type ClaudeCredentials,
+ } from "./credentials.ts"
++import { recordHarnessAuthEvent } from "./harness-telemetry.ts"
+ import { log } from "./logger.ts"
+ import { getUserAgent } from "./model-config.ts"
+ import { transformBody, transformResponseStream } from "./transforms.ts"
+@@ -98,6 +101,13 @@ function modelFromBody(body: string): string {
+   }
+ }
+ 
++// Harness r32: the prepared body, kept until the response so a 401 can be re-sent
++// once even after the runtime consumed the request body.
++const preparedBodies = new WeakMap<Request, string>()
++// One recovery per account at a time: concurrent 401s share the same new token
++// instead of exchanging the same refresh token twice.
++const recoveries = new Map<string, Promise<{ token: ClaudeCredentials | null; how: string }>>()
++
+ /** Prepare the native Anthropic request for Claude Code subscription billing. */
+ export async function prepareClaudeRequest(
+   request: Request,
+@@ -115,7 +125,8 @@ export async function prepareClaudeRequest(
+     throw new Error(
+       "Claude subscription credentials are unavailable. Run /connect in OpenCode 2.",
+     )
+-  return new Request(buildRequestURL(request), {
++  const preparedBody = transformBody(body)
++  const prepared = new Request(buildRequestURL(request), {
+     method: request.method,
+     headers: buildRequestHeaders(
+       request,
+@@ -124,9 +135,11 @@ export async function prepareClaudeRequest(
+       modelID,
+       getExcludedBetas(modelID),
+     ),
+-    body: transformBody(body),
++    body: preparedBody,
+     signal: request.signal,
+   })
++  if (typeof preparedBody === "string") preparedBodies.set(prepared, preparedBody)
++  return prepared
+ }
+ 
+ async function sendRequest(request: Request, send: Fetch): Promise<Response> {
+@@ -148,11 +161,66 @@ export async function finishClaudeResponse(
+   source?: string,
+   send: Fetch = fetch,
+ ): Promise<Response> {
++  if (initial.status === 401) {
++    const recovered = await recoverUnauthorized(request, source, send)
++    if (recovered) return recovered.ok ? transformResponseStream(recovered) : recovered
++    return initial
++  }
+   if (!initial.ok) return initial
+ 
+   return transformResponseStream(initial)
+ }
+ 
++/**
++ * Harness r32: a 401 (revoked or rotated access token) gets exactly one retry,
++ * for the SAME account only: re-read its own credential store, else one OAuth
++ * refresh of its own refresh token. No other account, no API key, no CLI, no
++ * retry for any other status, and never a second retry. The request was already
++ * admitted for this account; only its bearer token changes. Records a
++ * `claude_auth_recovery` telemetry event without any token value.
++ */
++async function recoverUnauthorized(
++  request: Request,
++  source: string | undefined,
++  send: Fetch,
++): Promise<Response | null> {
++  const modelID = modelFromBody(preparedBodies.get(request) ?? "")
++  const report = (outcome: string, extra: Record<string, unknown> = {}) =>
++    recordHarnessAuthEvent({ event: "claude_auth_recovery", outcome, status: 401, model: modelID, ...extra })
++  try {
++    if (request.signal?.aborted) return report("aborted"), null
++    const account = resolveAccount(source)
++    if (!account) return report("no_account"), null
++    const rejected = request.headers.get("authorization")?.replace(/^Bearer /i, "") ?? ""
++    let pending = recoveries.get(account.source)
++    if (!pending) {
++      pending = (async () => {
++        const reloaded = reloadCredentialsFromSource(account)
++        if (reloaded && reloaded.accessToken !== rejected) return { token: reloaded, how: "reloaded" }
++        const current = await getCachedCredentials(account)
++        if (current && current.accessToken !== rejected) return { token: current, how: "cached" }
++        return { token: await forceRefreshActiveAccount(undefined, account), how: "refreshed" }
++      })().finally(() => recoveries.delete(account.source))
++      recoveries.set(account.source, pending)
++    }
++    const { token, how } = await pending
++    if (!token || !token.accessToken || token.accessToken === rejected) return report("no_new_token", { how }), null
++    const body = preparedBodies.get(request) ?? (await request.clone().text())
++    const headers = new Headers(request.headers)
++    headers.set("authorization", `Bearer ${token.accessToken}`)
++    headers.set("x-client-request-id", crypto.randomUUID())
++    log("auth_recovery_retry", { modelID, how })
++    const response = await send(request.url, { method: request.method, headers, body, signal: request.signal })
++    report(response.ok ? "retried" : "retry_failed", { how, retryStatus: response.status })
++    return response
++  } catch (cause) {
++    report("error", { error: String((cause as Error)?.name ?? "Error").slice(0, 40) })
++    return null
++  } finally {
++    preparedBodies.delete(request)
++  }
++}
++
+ /** Standalone transport used by existing integration checks. */
+ export function claudeSubscriptionFetch(
+   accessToken: string,
+diff --git a/src/vendor-hardening.test.ts b/src/vendor-hardening.test.ts
+index e9ac497..40fc4bb 100644
+--- a/src/vendor-hardening.test.ts
++++ b/src/vendor-hardening.test.ts
+@@ -22,7 +22,7 @@ describe("subscription-only hardening", () => {
+     )
+   })
+ 
+-  it("returns denied responses without retrying", async () => {
++  it("returns denied responses without retrying (401 without an account: no retry)", async () => {
+     const request = new Request("https://api.anthropic.com/v1/messages", {
+       method: "POST",
+       headers: { authorization: "Bearer selected-token" },
+diff --git a/src/harness-telemetry.ts b/src/harness-telemetry.ts
+new file mode 100644
+index 0000000..18691ea
+--- /dev/null
++++ b/src/harness-telemetry.ts
+@@ -0,0 +1,32 @@
++// Harness r32: append-only telemetry for the opencode-usage-harness token-saving
++// report (<HARNESS_STATE_DIR>/telemetry/token-saving.jsonl). Callers pass only
++// closed-set fields; this module never writes a token or header value and never throws.
++import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs"
++import { homedir } from "node:os"
++import { dirname, join } from "node:path"
++
++const MAX_BYTES = 8 * 1024 * 1024
++const SECRET_KEY = /token|authorization|secret|key|bearer|refresh|access/i
++
++export function harnessTelemetryFile(env: NodeJS.ProcessEnv = process.env): string {
++  const state = env.HARNESS_STATE_DIR || join(homedir(), ".local/state/opencode-usage-harness")
++  return join(state, "telemetry", "token-saving.jsonl")
++}
++
++export function recordHarnessAuthEvent(record: Record<string, unknown>, file = harnessTelemetryFile()): void {
++  try {
++    const safe: Record<string, unknown> = {}
++    for (const [key, value] of Object.entries(record)) {
++      if (SECRET_KEY.test(key)) continue
++      if (typeof value === "string") safe[key] = value.slice(0, 120)
++      else if (typeof value === "number" || typeof value === "boolean") safe[key] = value
++    }
++    mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
++    let size = 0
++    try { size = statSync(file).size } catch {}
++    if (size >= MAX_BYTES) renameSync(file, `${file}.1`)
++    appendFileSync(file, JSON.stringify({ version: 1, at: new Date().toISOString(), ...safe }) + "\n", { mode: 0o600 })
++  } catch {
++    // telemetry is optional
++  }
++}
+diff --git a/src/harness-auth-recovery.test.ts b/src/harness-auth-recovery.test.ts
+new file mode 100644
+index 0000000..4d87080
+--- /dev/null
++++ b/src/harness-auth-recovery.test.ts
+@@ -0,0 +1,98 @@
++// Harness r32: one same-account retry on 401, cache coherence after rotation, token-free telemetry.
++import assert from "node:assert/strict"
++import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { describe, it, before } from "node:test"
++
++const home = mkdtempSync(join(tmpdir(), "auth-r32-"))
++process.env.HOME = home
++process.env.HARNESS_STATE_DIR = join(home, "state")
++const configDir = join(home, "claude")
++const telemetry = join(home, "state", "telemetry", "token-saving.jsonl")
++const writeStore = (accessToken: string, refreshToken = "fake-refresh-1") =>
++  writeFileSync(join(configDir, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken, refreshToken, expiresAt: Date.now() + 3600_000 } }))
++const events = () => (existsSync(telemetry) ? readFileSync(telemetry, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : [])
++
++const { mkdirSync } = await import("node:fs")
++mkdirSync(configDir, { recursive: true })
++writeStore("fake-old-access")
++const credentials = await import("./credentials.ts")
++const provider = await import("./provider.ts")
++
++const account = () => ({ label: "A", source: "file", configDir, credentials: { accessToken: "fake-old-access", refreshToken: "fake-refresh-1", expiresAt: Date.now() + 3600_000 } })
++const prepared = async () =>
++  provider.prepareClaudeRequest(
++    new Request("https://api.anthropic.com/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [] }) }),
++    "fake-opencode-access",
++    "file",
++  )
++
++describe("harness r32 auth recovery", () => {
++  before(() => { credentials.initAccounts([account()]); credentials.setActiveAccountSource("file") })
++
++  it("a 401 is retried once with the same account's newer stored token", async () => {
++    const request = await prepared()
++    assert.equal(request.headers.get("authorization"), "Bearer fake-old-access")
++    writeStore("fake-new-access", "fake-refresh-2") // another process rotated it
++    const sent: string[] = []
++    const result = await provider.finishClaudeResponse(request, new Response("revoked", { status: 401 }), "file", async (_url, init) => {
++      sent.push(new Headers(init?.headers).get("authorization") ?? "")
++      assert.equal(typeof init?.body, "string")
++      return new Response("ok", { status: 200 })
++    })
++    assert.equal(result.status, 200)
++    assert.deepEqual(sent, ["Bearer fake-new-access"])
++    const last = events().at(-1)
++    assert.equal(last.event, "claude_auth_recovery"); assert.equal(last.outcome, "retried"); assert.equal(last.how, "reloaded")
++    assert.equal(last.retryStatus, 200); assert.equal(last.model, "claude-sonnet-4-6")
++    assert.doesNotMatch(readFileSync(telemetry, "utf8"), /fake-/, "no token values in telemetry")
++  })
++
++  it("never retries twice: a second 401 is returned as is", async () => {
++    const request = await prepared() // signed with fake-new-access (now cached)
++    writeStore("fake-newer-access", "fake-refresh-3")
++    let calls = 0
++    const result = await provider.finishClaudeResponse(request, new Response("revoked", { status: 401 }), "file", async () => { calls++; return new Response("still", { status: 401 }) })
++    assert.equal(calls, 1); assert.equal(result.status, 401)
++    assert.equal(events().at(-1).outcome, "retry_failed")
++  })
++
++  it("no newer token and a failing refresh: no retry, initial response returned", async () => {
++    const request = await prepared()
++    const token = request.headers.get("authorization")!.slice(7)
++    writeStore(token, "fake-refresh-dead")
++    const realFetch = globalThis.fetch
++    globalThis.fetch = (async () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 })) as typeof fetch
++    try {
++      let calls = 0
++      const initial = new Response("revoked", { status: 401 })
++      const result = await provider.finishClaudeResponse(request, initial, "file", async () => { calls++; return new Response("x") })
++      assert.equal(calls, 0); assert.equal(result, initial)
++      assert.equal(events().at(-1).outcome, "no_new_token")
++    } finally { globalThis.fetch = realFetch }
++  })
++
++  it("400/429/529 are still never retried", async () => {
++    for (const status of [400, 429, 529]) {
++      let calls = 0
++      const initial = new Response("denied", { status })
++      const result = await provider.finishClaudeResponse(await prepared(), initial, "file", async () => { calls++; return new Response("x") })
++      assert.equal(calls, 0); assert.equal(result, initial)
++    }
++  })
++
++  it("rotation through the OpenCode refresh path updates the request cache (root cause)", async () => {
++    writeStore("fake-before-rotation", "fake-refresh-9")
++    credentials.reloadCredentialsFromSource(credentials.getAccountBySource("file")!)
++    assert.equal((await credentials.getCachedCredentials(credentials.getAccountBySource("file")!))?.accessToken, "fake-before-rotation")
++    const realFetch = globalThis.fetch
++    globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "fake-rotated", refresh_token: "fake-refresh-10", expires_in: 3600 }), { status: 200 })) as typeof fetch
++    try {
++      const rotated = await credentials.rotateAccountCredentials(credentials.getAccountBySource("file")!)
++      assert.equal(rotated?.accessToken, "fake-rotated")
++    } finally { globalThis.fetch = realFetch }
++    const request = await prepared()
++    assert.equal(request.headers.get("authorization"), "Bearer fake-rotated", "next request is signed with the new token, not the revoked one")
++  })
++})

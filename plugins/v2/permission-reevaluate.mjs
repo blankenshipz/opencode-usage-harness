@@ -19,7 +19,7 @@ import { PROBE_TOOL } from './read-scope.mjs';
 export function pendingStore(directory, { root = statePath('permission-pending') } = {}) {
   const file = path.join(root, `${crypto.createHash('sha256').update(String(directory ?? '')).digest('hex').slice(0, 24)}.json`);
   return {
-    file,
+    file, root,
     load() {
       try {
         const data = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -30,6 +30,8 @@ export function pendingStore(directory, { root = statePath('permission-pending')
     },
     save(map, meta = new Map()) {
       try {
+        // r32 item 3: an empty pending map leaves no file behind.
+        if (!map.size) { try { fs.unlinkSync(file); } catch (error) { if (error?.code !== 'ENOENT') throw error; } return; }
         fs.mkdirSync(root, { recursive: true, mode: 0o700 });
         const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
         fs.writeFileSync(temporary, JSON.stringify({ pending: Object.fromEntries(map), meta: Object.fromEntries([...meta].filter(([id]) => map.has(id))) }), { mode: 0o600 });
@@ -38,6 +40,39 @@ export function pendingStore(directory, { root = statePath('permission-pending')
     },
   };
 }
+
+// r32 item 3: remove `{"pending":{},...}` files left behind by earlier releases. A file is moved
+// aside atomically before it is judged, so a concurrent writer's file is never lost: anything
+// that is not a parseable, empty pending map is linked back (unless a newer file already exists).
+export function isEmptyPendingText(text) {
+  try {
+    const data = JSON.parse(text);
+    return data !== null && typeof data === 'object' && !Array.isArray(data)
+      && data.pending !== null && typeof data.pending === 'object' && !Array.isArray(data.pending) && Object.keys(data.pending).length === 0;
+  } catch { return false; }
+}
+export function sweepEmptyPending({ root = statePath('permission-pending'), io = fs } = {}) {
+  const removed = [];
+  let names;
+  try { names = io.readdirSync(root); } catch { return removed; }
+  for (const name of names) {
+    if (!/^[a-f0-9]{24}\.json$/.test(name)) continue;
+    const file = path.join(root, name);
+    let text;
+    try { if (!io.lstatSync(file).isFile()) continue; text = io.readFileSync(file, 'utf8'); } catch { continue; }
+    if (!isEmptyPendingText(text)) continue;
+    const aside = `${file}.${process.pid}.${crypto.randomUUID()}.sweep`;
+    try { io.renameSync(file, aside); } catch { continue; }
+    let empty = false;
+    try { empty = isEmptyPendingText(io.readFileSync(aside, 'utf8')); } catch { /* keep it */ }
+    if (empty) { try { io.unlinkSync(aside); removed.push(name); } catch {} continue; }
+    // A writer replaced it between the read and the move: restore without clobbering anything newer.
+    try { io.linkSync(aside, file); } catch { /* a newer file exists */ }
+    try { io.unlinkSync(aside); } catch {}
+  }
+  return removed;
+}
+const sweptRoots = new Set(); // sweep each pending root once per module instance
 
 export function reevaluationLogger({ file = statePath('telemetry', 'permission-reevaluation.jsonl') } = {}) {
   return record => {
@@ -52,7 +87,8 @@ const listData = value => Array.isArray(value) ? value : Array.isArray(value?.da
 
 export async function installPermissionReevaluation(ctx, { delays = [1500, 6000], setTimer = setTimeout, clearTimer = clearTimeout,
   store = ctx?.location?.directory ? pendingStore(ctx.location.directory) : undefined,
-  log = ctx?.location?.directory ? reevaluationLogger() : () => {}, now = () => Date.now() } = {}) {
+  log = ctx?.location?.directory ? reevaluationLogger() : () => {}, now = () => Date.now(),
+  sweep = store?.root ? () => sweepEmptyPending({ root: store.root }) : undefined } = {}) {
   const permission = ctx?.permission;
   if (typeof ctx?.event?.subscribe !== 'function' || typeof permission?.hook !== 'function' || typeof permission?.assert !== 'function' ||
       typeof permission?.list !== 'function' || typeof permission?.reply !== 'function') return { stop() {}, recheck: async () => [] };
@@ -63,6 +99,11 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
       event.message = 'harness permission probe: still requires approval';
     }
   });
+  const sweepKey = store?.root ?? '';
+  if (sweep && !sweptRoots.has(sweepKey)) {
+    sweptRoots.add(sweepKey);
+    try { const removed = sweep(); if (removed.length) log({ at: new Date(now()).toISOString(), event: 'pending_files_swept', removed: removed.length }); } catch {}
+  }
   const loaded = store?.load?.() ?? [];
   const pending = new Map(loaded.map(([id, sid]) => [id, sid])); // requestID -> sessionID
   // requestID -> {agent, tool} of the asking call, so a probe after reload uses the asking agent's rules.

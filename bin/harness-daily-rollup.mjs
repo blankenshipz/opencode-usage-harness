@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { readTokenSavingRecords, summarizeTokenSaving } from './harness-token-saving-report.mjs';
 
 const SECRET = /header_value|hmac|token|secret|authorization|api_?key/i;
 
@@ -118,13 +119,16 @@ export function rollup({ state, date, repos }) {
   const inDay = r => { const t = tsOf(r); return t !== undefined && t >= start && t < end; };
   const tasks = readJsonl(path.join(tel, 'task-outcomes.jsonl')).filter(inDay);
   const verdicts = [path.join(tel, 'review-verdicts.jsonl'), path.join(state, 'review-verdicts.jsonl')].flatMap(readJsonl).filter(inDay);
-  return scrub({
+  // r32: token-saving totals are our own numeric aggregates (added after scrub, whose
+  // /token/ key filter would otherwise drop the estimated-token fields).
+  const tokenSaving = summarizeTokenSaving(readTokenSavingRecords(state).filter(inDay))[date] ?? null;
+  return { ...scrub({
     date,
     tasks: { total: tasks.length, byStatus: count(tasks, r => r.status ?? r.outcome), bySource: count(tasks, r => r.source) },
     verdicts: { total: verdicts.length, byVerdict: count(verdicts, r => r.verdict ?? r.status ?? r.outcome) },
     commits: commits(repos, start, end),
     quotaPoints: quotaPoints(state, start, end),
-  });
+  }), tokenSaving };
 }
 
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('harness-daily-rollup.mjs')) {

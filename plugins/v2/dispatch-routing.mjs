@@ -6,7 +6,7 @@ import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
 import { readAnthropicFinancialPolicy } from './anthropic-financial-policy.mjs';
 import { readSelectedClaudeUsage } from './anthropic-subscription.mjs';
 import { canonicalHarnessRole, harnessRoleIDs } from './agent-mode.mjs';
-import { loadTokenSavingConfig, logTokenSaving } from './token-saving.mjs';
+import { loadTokenSavingConfig, logTokenSaving, parentTtlBreaker } from './token-saving.mjs';
 
 export const TASK_TYPES = Object.freeze(['general','exploration','mechanical','implementation','debugging','architecture','testing','review']);
 const TASK_TYPE_SET = new Set(TASK_TYPES);
@@ -321,7 +321,9 @@ export function selectDispatchModel(args) {
   if (!current || !result.selected || baseModel(current) === baseModel(result.selected)) return result;
   const role = canonicalHarnessRole(input.agent) ?? input.agent;
   // Fable r30 #4: the 1h window only where the 1h TTL can exist (Anthropic parents).
-  const parent = (tokenSaving.parentCacheTtl?.enabled && (tokenSaving.parentCacheTtl.roles ?? []).includes(role) && current.startsWith('anthropic/'));
+  let parent = (tokenSaving.parentCacheTtl?.enabled && (tokenSaving.parentCacheTtl.roles ?? []).includes(role) && current.startsWith('anthropic/'));
+  // r32 item 2: once the TTL breaker trips, parents are back on the 5m cache, so the warm window is too.
+  if (parent) { try { if ((args.ttlBreaker ?? parentTtlBreaker()).state()) parent = false; } catch { parent = false; } }
   // Fable r30 #5: never pin a child to a pool whose scoped quota is unavailable.
   const policy = args.quota?.routingPolicy;
   if (scopedQuotaUnavailable(current, args.quota, Number.isFinite(policy?.reservePercent) ? policy.reservePercent : 2)) return result;

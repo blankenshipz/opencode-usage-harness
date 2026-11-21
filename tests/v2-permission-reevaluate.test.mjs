@@ -128,3 +128,60 @@ test('asks pending under the previous plugin instance are re-checked on reload, 
   second.stop();
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+import { sweepEmptyPending, isEmptyPendingText } from '../plugins/v2/permission-reevaluate.mjs';
+
+test('r32: the pending file is deleted when its map becomes empty and rewritten when an ask appears', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'perm-pending-'));
+  const store = pendingStore('/w/q', { root });
+  store.save(new Map([['per_1', 'ses_1']]), new Map([['per_1', { agent: 'builder' }]]));
+  assert.ok(fs.existsSync(store.file));
+  store.save(new Map(), new Map());
+  assert.equal(fs.existsSync(store.file), false, 'empty map: no file left behind');
+  store.save(new Map(), new Map()); // already absent: no throw, no file
+  assert.equal(fs.existsSync(store.file), false);
+  store.save(new Map([['per_2', 'ses_1']]));
+  assert.deepEqual(store.load().map(([id]) => id), ['per_2']);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('r32: startup sweep removes only empty pending files', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'perm-pending-'));
+  const write = (name, text) => fs.writeFileSync(path.join(root, name), text);
+  write('aaaaaaaaaaaaaaaaaaaaaaaa.json', '{"pending":{},"meta":{}}');
+  write('bbbbbbbbbbbbbbbbbbbbbbbb.json', '{"pending":{"per_x":"ses_1"},"meta":{}}');
+  write('cccccccccccccccccccccccc.json', '{not json');
+  write('dddddddddddddddddddddddd.json', '{"pending":[]}');
+  write('notes.json', '{"pending":{}}');
+  const removed = sweepEmptyPending({ root });
+  assert.deepEqual(removed, ['aaaaaaaaaaaaaaaaaaaaaaaa.json']);
+  assert.deepEqual(fs.readdirSync(root).sort(), ['bbbbbbbbbbbbbbbbbbbbbbbb.json', 'cccccccccccccccccccccccc.json', 'dddddddddddddddddddddddd.json', 'notes.json']);
+  assert.equal(fs.readFileSync(path.join(root, 'bbbbbbbbbbbbbbbbbbbbbbbb.json'), 'utf8'), '{"pending":{"per_x":"ses_1"},"meta":{}}');
+  assert.equal(isEmptyPendingText('{"pending":{"a":"b"}}'), false);
+  assert.deepEqual(sweepEmptyPending({ root: path.join(root, 'missing') }), []);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('r32: sweep restores a file that gained an entry between the check and the move', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'perm-pending-'));
+  const file = path.join(root, 'eeeeeeeeeeeeeeeeeeeeeeee.json');
+  fs.writeFileSync(file, '{"pending":{},"meta":{}}');
+  // A concurrent writer replaces the file right before the sweep moves it aside.
+  const io = { ...fs, renameSync(from, to) { fs.writeFileSync(from, '{"pending":{"per_live":"ses_9"},"meta":{}}'); return fs.renameSync(from, to); } };
+  assert.deepEqual(sweepEmptyPending({ root, io }), []);
+  assert.equal(fs.readFileSync(file, 'utf8'), '{"pending":{"per_live":"ses_9"},"meta":{}}');
+  assert.deepEqual(fs.readdirSync(root), ['eeeeeeeeeeeeeeeeeeeeeeee.json'], 'no .sweep leftovers');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('r32: install sweeps empty files once and logs the count', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'perm-pending-'));
+  fs.writeFileSync(path.join(root, 'ffffffffffffffffffffffff.json'), '{"pending":{},"meta":{}}');
+  const store = pendingStore('/w/r', { root });
+  const h = harness(() => 'ask'), logs = [];
+  const handle = await installPermissionReevaluation(h.ctx, { setTimer: h.setTimer, clearTimer: () => {}, store, log: r => logs.push(r) });
+  assert.equal(fs.existsSync(path.join(root, 'ffffffffffffffffffffffff.json')), false);
+  assert.ok(logs.some(r => r.event === 'pending_files_swept' && r.removed === 1));
+  handle.stop();
+  fs.rmSync(root, { recursive: true, force: true });
+});

@@ -479,7 +479,14 @@ Effort-only changes, such as the existing `continuationEffort: "reassess"`, keep
 
 The OpenCode 2.0.30 context hook cannot set the request cache policy. However, the runtime lowers `LLM.CacheHint{ttlSeconds >= 3600}` to `cache_control: {type: "ephemeral", ttl: "1h"}`, and its `session.http.request` plugin hook receives the final Anthropic request body. For `primary` requests from roles in `parentCacheTtl.roles`, the harness rewrites the cache breakpoints the runtime already placed to `ttl: "1h"`. It keeps the same positions and the same count, so it never adds a fifth breakpoint. Workers, compaction requests and titles keep the 5-minute default. A 1h write costs 2x base input, against 1.25x for a 5m write, and reads cost 0.1x ([Anthropic prompt caching](https://docs.claude.com/en/docs/build-with-claude/prompt-caching)). It pays off only when the parent resumes within the hour. Claude Code itself uses a 1h TTL on subscription main threads and 5m for subagents ([Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)).
 
-**Fail safe:** If the hook API is missing, the body is not JSON, or the Claude subscription adapter already transformed the request (its hook must run after this one), the request is sent unchanged and the reason is logged once (`parent_cache_ttl_unsupported`). If a 400 response that mentions the TTL or `cache_control` follows a rewrite, the rewrite is turned off for the rest of the process (`parent_cache_ttl_disabled`). Successful rewrites are logged once per session (`parent_cache_ttl_applied`).
+**Fail safe:** If the hook API is missing, the body is not JSON, or the Claude subscription adapter already transformed the request (its hook must run after this one), the request is sent unchanged and the reason is logged once (`parent_cache_ttl_unsupported`). Successful rewrites are logged once per session (`parent_cache_ttl_applied`).
+
+**When the circuit breaker trips:** a 400 response that mentions the TTL or `cache_control` right after a rewrite trips the breaker (`parent_cache_ttl_disabled`). Since 0.3.1 the breaker is shared by every plugin instance in the server and persisted in `<state>/token-saving/ttl-breaker.json` for 24 hours, so a restart or hot reload does not send another request the provider rejected. While it is tripped:
+- router and coordinator requests are sent with the runtime's default 5-minute TTL (no rewrite);
+- strategy 1 uses the 5-minute `warmMs` window for parents instead of `parentWarmMs`, because a 1h cache no longer exists;
+- one `parent_cache_ttl_fallback` event (`reason`, `ttl: "5m"`, `warmMs`, `until`) is logged per trip and process.
+
+After 24 hours the 1h TTL is tried again. To retry sooner, delete `ttl-breaker.json`. The file is read on every request, so no restart is needed.
 
 **Configure:** `parentCacheTtl.*`. `ttlSeconds: 300` or `HARNESS_PARENT_CACHE_TTL=off` turns it off.
 
@@ -499,6 +506,23 @@ A batch is applied only when it frees at least `minBatchTokens`. The masked set 
 - Anthropic's tool-result clearing (`clear_tool_uses`) cut tokens by 84% in a 100-turn evaluation ([context management](https://www.anthropic.com/news/context-management), [context editing docs](https://docs.claude.com/en/docs/build-with-claude/context-editing)).
 - Simple observation masking matched LLM summarization's solve rate at about 52% lower cost ([JetBrains Research, arXiv 2508.21433](https://arxiv.org/abs/2508.21433)).
 - Clearing on every turn would break the cache each time ([write-up](https://abhimanyuaryan.github.io/ai-bytes/2026-04-11-why-i-dont-like-opencode)), which is why masking works in large batches.
+
+**Telemetry (0.3.1):** each batch logs `observation_mask_batch` with `session`, `agent`, `results` (results masked), `charsRemoved`, `tokensRemoved` (estimated at 4 chars per token; `tokensCleared` is the same value under its 0.3.0 name), `tokensBefore` (the estimate that triggered it) and the thresholds in effect (`triggerTokens`, `minBatchTokens`, `keepRecentTurns`). When masking stops for a session it logs `observation_mask_stopped` once per session: `reason: "id_cap"` means the session has 5000 masked results, and `reason: "store_cap"` means the store reached 256 MiB.
+
+**Pruning (0.3.1):** whole sessions are evicted, meaning the state file plus all of the session's originals, so a placeholder in a live context never loses its original. Pruning runs at startup, at most every 6 hours, and early (at most once per 10 minutes) when the store is full. It evicts:
+- sessions idle for more than 7 days (the state file mtime is refreshed while a session is in use);
+- originals with no session state that are older than 7 days;
+- abandoned `.pending-*` directories;
+- when the store is above 75% of the cap, the least recently active sessions that have been idle for at least 6 hours, until the store is below 50%.
+
+Each prune that removes anything logs `observation_mask_pruned` (`sessions`, `originals`, `freedBytes`, `remainingBytes`, `reasons`). A session evicted while it is idle gets its results back unmasked if it resumes, and may be masked again later.
+
+**Reading the savings:** run `harness-token-saving-report.mjs` from the release `bin/` (`--state DIR`, `--date YYYY-MM-DD`, `--days N`, `--json`). It prints per local day:
+- masking batches, results, estimated tokens and chars removed, sessions, stops by reason, and prunes;
+- 1h-TTL `applied` (once per session and process), breaker trips, fallbacks and unsupported reasons;
+- `claude_auth_recovery` outcomes.
+
+`harness-daily-rollup.mjs` includes the same day summary under `tokenSaving`. `tokensRemoved` is the size of the context removed from each later request in that session until compaction, not a one-off saving. The per-request saving is roughly `tokensRemoved × remaining turns`, minus the one cache rewrite per batch.
 
 **Risk:** A model may redo work it can no longer see. Watch re-reads and `native_original_retrievals`. Reading an original uses ordinary native read permissions: the store is outside the workspace, so the read may ask for permission.
 
@@ -527,8 +551,8 @@ The decision is recorded in `routing.effortMap {from, to, basis, applied, reason
 Use the existing telemetry over comparable work, before and after, and compare it with `subscription_quota` deltas:
 
 - **K:** Count `model_switch_suppressed` in `telemetry/token-saving.jsonl` and `cache_keep` routing sources in `task_dispatch_status`. In `harness-metrics --days N` per root, cache-read should rise and cache-write should fall on continuations; the `route_changed` reasons in its cache observation should drop.
-- **B:** `parent_cache_ttl_applied` and `parent_cache_ttl_unsupported` events. For router and coordinator sessions (`harness-metrics --session <root>`), compare cache-write and cache-read on the first step after an idle gap of 5 to 60 minutes. A hit shows up as a large cache-read and a small cache-write. The extra cost of 1h writes shows up as larger cache-write totals on parents that never resume.
-- **A:** `observation_mask_batch` events (`tokensBefore`, `tokensCleared`), `masking_boundary` counts in the cache observation, uncached-input and cache-read totals per root, and the number of compactions. Watch `native_original_retrievals` and repeated reads of the same files as signs of loss.
+- **B:** `parent_cache_ttl_applied` and `parent_cache_ttl_unsupported` events, and `parent_cache_ttl_disabled`/`parent_cache_ttl_fallback` when the breaker trips. For router and coordinator sessions (`harness-metrics --session <root>`), compare cache-write and cache-read on the first step after an idle gap of 5 to 60 minutes. A hit shows up as a large cache-read and a small cache-write. The extra cost of 1h writes shows up as larger cache-write totals on parents that never resume.
+- **A:** `observation_mask_batch` events (`tokensBefore`, `tokensRemoved`, `charsRemoved`; totals per day from `harness-token-saving-report.mjs`), `observation_mask_stopped`/`observation_mask_pruned`, `masking_boundary` counts in the cache observation, uncached-input and cache-read totals per root, and the number of compactions. Watch `native_original_retrievals` and repeated reads of the same files as signs of loss.
 - **C:** `routing.effortMap` in dispatch status, the `reasoning` and `output` token totals per role in `harness-metrics`, plus acceptance, review and recheck failure rates, to catch quality regressions on work classified as `routine`.
 
 ## What works today

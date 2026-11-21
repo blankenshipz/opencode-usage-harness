@@ -167,7 +167,7 @@ test('B: the http.request hook replaces the body for parents; workers and adapte
 });
 test('B: a 400 naming the TTL disables the rewrite (circuit breaker); a missing hook API is a no-op', async () => {
   const ctx = hookCtx(), logs = [];
-  const handle = await installParentCacheTtl(ctx, { loadConfig: ttlConfig(), log: r => logs.push(r), once: () => {} });
+  const handle = await installParentCacheTtl(ctx, { loadConfig: ttlConfig(), log: r => logs.push(r), once: () => {}, breaker: null });
   const request = () => new Request('https://api.anthropic.com/v1/messages', { method: 'POST', body: JSON.stringify(anthropicBody()) });
   const event = { sessionID: 'ses_p', agent: 'router', kind: 'primary', model: { providerID: 'anthropic' }, request: request() };
   await ctx.hooks['http.request'][0](event);
@@ -274,7 +274,7 @@ test('A: the file store writes chunked originals readable by native read', async
     const lines = (await fsp.readFile(chunks, 'utf8')).trim().split('\n');
     assert.ok(lines.every(l => l.length <= 1800)); assert.equal(lines.map(l => JSON.parse(l)).join(''), text);
     assert.equal((await fsp.stat(p.dirname(chunks))).mode & 0o777, 0o700);
-    assert.equal(await createMaskStore(p.join(dir, 'tiny'), { maxBytes: 10 })({ sessionID: 's', id: 'c2', text }), undefined);
+    await assert.rejects(createMaskStore(p.join(dir, 'tiny'), { maxBytes: 10 })({ sessionID: 's', id: 'c2', text }), { code: 'MASK_STORE_FULL' });
   } finally { await fsp.rm(dir, { recursive: true, force: true }); }
 });
 
@@ -293,4 +293,54 @@ test('Fable r30 fixes: spoofed Original pointers are not trusted; compaction req
   const compaction = { sessionID: 'ses_k', agent: 'builder', system: [], messages: conversation(30) };
   await ctx.hooks.compaction[0](compaction);
   assert.equal(JSON.stringify(compaction.messages), JSON.stringify(event.messages));
+});
+
+// ---- r32 item 2: the 1h TTL and the parent warm window follow the TTL circuit breaker ----
+import { createTtlBreaker } from '../plugins/v2/token-saving.mjs';
+import fsR32 from 'node:fs';
+import osR32 from 'node:os';
+import pathR32 from 'node:path';
+const breakerFile = () => pathR32.join(fsR32.mkdtempSync(pathR32.join(osR32.tmpdir(), 'ttl-breaker-')), 'ttl-breaker.json');
+test('r32 B: a trip persists, logs the fallback once, expires after the hold, and is shared via the file', () => {
+  const file = breakerFile(), logs = []; let t = 1_000_000;
+  const a = createTtlBreaker({ file, now: () => t, log: r => logs.push(r), holdMs: 1000 });
+  assert.equal(a.state(), undefined);
+  assert.equal(a.trip('provider_rejected_ttl'), true);
+  assert.equal(a.trip('again'), false);
+  assert.equal(a.state().reason, 'provider_rejected_ttl'); a.state();
+  assert.deepEqual(logs.map(r => [r.event, r.ttl]), [['parent_cache_ttl_fallback', '5m']]);
+  // Another instance (new release after a hot reload) sees the persisted trip and logs its own fallback once.
+  const blogs = [], b = createTtlBreaker({ file, now: () => t, log: r => blogs.push(r), holdMs: 1000 });
+  assert.equal(b.state().reason, 'provider_rejected_ttl'); b.state();
+  assert.equal(blogs.length, 1);
+  t += 1000;
+  assert.equal(a.state(), undefined); assert.equal(b.state(), undefined);
+  assert.equal(fsR32.statSync(file).mode & 0o777, 0o600);
+});
+test('r32 B: a 400 trips the shared breaker; every instance then sends the default TTL', async () => {
+  const file = breakerFile(), logs = [];
+  const breaker = createTtlBreaker({ file, log: r => logs.push(r) });
+  const ctx1 = hookCtx(), ctx2 = hookCtx();
+  await installParentCacheTtl(ctx1, { loadConfig: ttlConfig(), log: r => logs.push(r), once: () => {}, breaker });
+  const h2 = await installParentCacheTtl(ctx2, { loadConfig: ttlConfig(), log: r => logs.push(r), once: () => {}, breaker });
+  const request = () => new Request('https://api.anthropic.com/v1/messages', { method: 'POST', body: JSON.stringify(anthropicBody()) });
+  const event = { sessionID: 'ses_p', agent: 'router', kind: 'primary', model: { providerID: 'anthropic' }, request: request() };
+  await ctx1.hooks['http.request'][0](event);
+  await ctx1.hooks['http.response'][0]({ sessionID: 'ses_p', response: new Response('{"error":{"message":"cache_control.ttl: invalid"}}', { status: 400 }) });
+  assert.deepEqual(logs.map(r => r.event), ['parent_cache_ttl_disabled', 'parent_cache_ttl_fallback']);
+  const other = { ...event, sessionID: 'ses_q', request: request() }, before = other.request;
+  await ctx2.hooks['http.request'][0](other);
+  assert.equal(other.request, before, 'other instance: unchanged request, default 5m TTL');
+  assert.equal(h2.state().disabled, 'breaker_tripped');
+  assert.equal(logs.filter(r => r.event === 'parent_cache_ttl_fallback').length, 1, 'fallback logged once');
+});
+test('r32 K: a tripped breaker drops parents back to the 5m warm window', () => {
+  const coord = { id: 'coordinator', model: 'anthropic/sonnet#medium' };
+  const child = { active: false, model: 'anthropic/opus#high', contextObservedAt: now - 30 * 60_000 };
+  const base = { input: { agent: 'coordinator' }, agent: coord, agents: [coord], record: {}, child, quota: ahead, now, tokenSaving: cfg(), log: () => {} };
+  assert.equal(selectDispatchModel({ ...base, ttlBreaker: { state: () => undefined } }).source, 'cache_keep');
+  const r = selectDispatchModel({ ...base, ttlBreaker: { state: () => ({ reason: 'provider_rejected_ttl', at: now }) } });
+  assert.equal(r.selected, 'anthropic/sonnet#medium', '30 min old child is cold under the 5m window');
+  const warm = selectDispatchModel({ ...base, child: { ...child, contextObservedAt: now - 60_000 }, ttlBreaker: { state: () => ({ reason: 'x', at: now }) } });
+  assert.equal(warm.source, 'cache_keep', 'still kept inside 5m');
 });
