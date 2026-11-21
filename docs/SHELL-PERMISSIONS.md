@@ -210,6 +210,31 @@ and `ssh` remote command):
 Known gaps: script files (`bash deploy.sh`, `python x.py`, `make`) and interpreters (`python -c`,
 `node -e`) run unseen; remote paths are judged lexically; anything not listed above is allowed.
 
+## 0.3.3: permission waits
+
+Measured in r35: 67 of the 72 asks logged in r34 auto-allow under these rules; 5 still ask.
+
+Full-auto now also allows:
+
+- writes whose target uses a literal shell variable (`D=/repo/.review/x; cmd > $D/out`, `for i in 1 2; do cmd > out$i; done`) or an unknown variable after a literal in-project directory (`.review/verify-$TS/revision.txt`). Delete targets must still be literal or literally assigned;
+- `cd T && cmd > rel` and `cd T && ( … > rel )`: segments joined to a top-level `cd` by `&&` run in `T` only. After `;`, a newline, `||` or `&`, the union of directories is used, as before;
+- relative redirects that resolve into `/tmp`;
+- secret-scan report files (`secret-scan.txt`, `secret-hits-lines.txt`): these are not secret paths anywhere. `secrets.txt`, `client_secret.json` and files under `secret*/` directories still are;
+- `external_directory` asks from read-only tools (`read`, `glob`, `grep`, `list`, `large_file_check`, `structured_json_read`, …) for any path except credential paths (`~/.ssh`, `~/.aws`, `~/.config`, `~/.gnupg`, `~/.docker`, `~/.kube`, `gateway/secrets`, secret-looking names) and another project's files that are not tracked and clean. "Another project" means a sibling directory of the project that is a git repository. Cleanliness is checked with `git --no-optional-locks status --porcelain --untracked-files=all` and `git ls-files`, both read-only;
+- `external_directory` asks from a shell call when the full-auto shell check of the command is clean and no word names another project's path. This covers OpenCode resolving `cd ../web` against the session root.
+
+Full-auto now asks for:
+
+- `sudo`, `doas`, `su`, `pkexec`, `run0` as a command (also behind `env`/`timeout`/`xargs` and over ssh);
+- system service changes on any unit, local or over ssh: `systemctl` with a verb other than `cat/status/show/is-*/list-*` (or any change verb in its arguments), and `service <unit> <verb>` other than `status`;
+- in projects with `no_push_deploy` (`configure.py --full-auto-no-deploy DIR`, removed with `--full-auto-allow-deploy DIR`): `git push` in any form, `gh pr create|merge`, `gh release create`, `gh repo create|sync`, `gh workflow run`, `docker|podman push`, `npm|pnpm|yarn publish`, deploy subcommands of `railway`, `fly`, `flyctl`, `vercel` (any use), `netlify`, `heroku`, `eas`, `firebase`, `wrangler`, `serverless`, `cdk`, `terraform`, `pulumi`, `kubectl`, `helm`, `gcloud`, `aws`, `az`, `doctl`, `twine`, and `scp`/`rsync` to a `host:` target. This is lexical: a deploy run from a script file is not seen.
+
+The auto-permission `background_process` decline (non-full-auto projects) now means a real background job (`cmd &`, `nohup`, `setsid`, `disown`, `$!`); `&&` and `2>&1` no longer count.
+
+Park and yield: the stall is logged on the first 10 s tick after an ask (a tick also runs immediately on each new ask), and a foreground parent waiting on the child is released after 30 s with a blocked result, so it continues other work. `HARNESS_PARK_NOTIFY_MS` and `HARNESS_PARK_AFTER_MS` still override this.
+
+Still asking from the r34 log (by design): `git commit --amend` of a commit that cannot be verified as unpushed on a feature branch (1), `rm -rf` of a `/tmp/opencode` scratch directory, which is a delete outside the repo (2; adding `/tmp/opencode` as a `data_dirs` entry would allow it), and the garage-server `.env` read in a remote command that also has `$(...)` and a `for` loop, which the 0.3.2 exemption deliberately does not cover (2).
+
 ## Pending asks after a config reload
 
 OpenCode 2.0.30 re-evaluates pending asks only after an "always" reply. An ask raised

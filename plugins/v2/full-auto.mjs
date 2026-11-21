@@ -56,7 +56,8 @@ function normalizeProject(entry) {
   if (directory === '/') return undefined;
   const dataDirs = (Array.isArray(raw.data_dirs) ? raw.data_dirs : [])
     .filter(dir => typeof dir === 'string' && path.isAbsolute(dir)).map(dir => realish(path.resolve(dir))).filter(dir => dir !== '/');
-  return { directory, roots: [directory, ...dataDirs] };
+  // no_push_deploy (0.3.3): pushes and deploys always ask in this project (yrdsale Phase 1 rule).
+  return { directory, roots: [directory, ...dataDirs], ...(raw.no_push_deploy === true ? { noPushDeploy: true } : {}) };
 }
 
 let cache = { key: undefined, projects: [] };
@@ -314,6 +315,101 @@ export function garageUnitDanger(segment, skip = sshRemoteWords(segment.words) ?
   return undefined;
 }
 
+// 0.3.3: privilege escalation and system service changes always ask under full-auto (local or over
+// ssh). systemctl/service reads (status, cat, show, is-*, list-*) stay allowed.
+const SUDO_WORD = /^(?:.*\/)?(sudo|doas|su|pkexec|run0)$/;
+export function serviceDanger(words) {
+  for (let k = 0; k < words.length; k++) {
+    const word = words[k];
+    if (SUDO_WORD.test(word) && (k === 0 || /^(?:.*\/)?(env|timeout|nice|nohup|command|exec|time|xargs)$/.test(words[k - 1]) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[k - 1])))
+      return `${word} runs commands as another user`;
+    if (/(^|\/)systemctl$/.test(word)) {
+      const args = words.slice(k + 1);
+      const verb = systemctlVerb(args);
+      if (verb !== undefined && (!UNIT_READ_VERBS.has(verb) || args.some(arg => UNIT_CHANGE_VERBS.has(arg)))) return `systemctl ${verb} changes a system service`;
+    }
+    if (/(^|\/)service$/.test(word) && k === 0 && words.length >= 3) {
+      const verb = words.slice(k + 1).filter(arg => !arg.startsWith('-'))[1];
+      if (verb && verb !== 'status') return `service ${verb} changes a system service`;
+    }
+  }
+  return undefined;
+}
+
+// 0.3.3: projects with no_push_deploy (yrdsale Phase 1: never push or deploy) ask for every push,
+// publish or deploy command. Lexical: a deploy run from a script file is not seen.
+const DEPLOY_TOOLS = /^(?:.*\/)?(railway|fly|flyctl|vercel|netlify|heroku|eas|firebase|wrangler|serverless|sls|cdk|terraform|pulumi|kubectl|helm|ansible-playbook|twine|gcloud|aws|az|doctl)$/;
+const DEPLOY_SUBS = new Set(['up', 'deploy', 'redeploy', 'publish', 'release', 'submit', 'update', 'apply', 'build', 'push', 'promote', 'upload', 'install', 'upgrade', 'rollout', 'create', 'sync']);
+export function pushDeployDanger(words) {
+  for (let k = 0; k < words.length; k++) {
+    const word = words[k];
+    if (isGitWord(word) && git(words, k).sub === 'push') return 'git push (pushes are off for this project)';
+    if (/(^|\/)gh$/.test(word)) {
+      const [group, sub] = words.slice(k + 1).filter(arg => !arg.startsWith('-'));
+      if ((group === 'pr' && ['create', 'merge'].includes(sub)) || (group === 'release' && sub === 'create') || (group === 'repo' && ['sync', 'create'].includes(sub)) || (group === 'workflow' && sub === 'run'))
+        return `gh ${group} ${sub} publishes (pushes are off for this project)`;
+    }
+    if (/(^|\/)(docker|podman)$/.test(word) && words[k + 1] === 'push') return `${word} push publishes an image`;
+    if (/(^|\/)(npm|pnpm|yarn)$/.test(word) && words[k + 1] === 'publish') return `${word} publish`;
+    if (DEPLOY_TOOLS.test(word)) {
+      const sub = words.slice(k + 1).find(arg => !arg.startsWith('-'));
+      if (/(^|\/)vercel$/.test(word) || (sub && DEPLOY_SUBS.has(sub))) return `${word} ${sub ?? ''} deploys (deploys are off for this project)`.replace('  ', ' ');
+    }
+    if (/(^|\/)(scp|rsync)$/.test(word) && words.slice(k + 1).some(arg => /^[^/.~\-][^/\s]*:/.test(arg))) return `${word} to a remote host (deploys are off for this project)`;
+  }
+  return undefined;
+}
+
+// 0.3.3: literal shell variables. `B=/abs/dir; ... > $B/x` and `for L in a b; do ... $L ...` are
+// expanded before path checks. Values with $, backticks, globs or quotes stay unknown.
+const LITERAL_VALUE = /^[A-Za-z0-9_./@%+=:,~-]*$/;
+export function literalVariables(segments) {
+  const vars = new Map();
+  for (const segment of segments) {
+    if (segment.sub) continue;
+    const words = segment.words[0] === 'export' ? segment.words.slice(1) : segment.words;
+    if (words.length && words.every(word => /^[A-Za-z_][A-Za-z0-9_]*=/.test(word))) {
+      for (const word of words) {
+        const name = word.slice(0, word.indexOf('=')), value = word.slice(name.length + 1);
+        vars.set(name, LITERAL_VALUE.test(value) && !value.startsWith('~') ? [value] : null);
+      }
+    } else if (words[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(words[1] ?? '') && words[2] === 'in') {
+      const values = words.slice(3);
+      vars.set(words[1], values.length && values.every(value => LITERAL_VALUE.test(value) && !value.includes('/') && value !== '..') ? values : null);
+    } else if (words[0] === 'read' || words[0] === 'select') {
+      for (const word of words.slice(1)) if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) vars.set(word, null);
+    }
+  }
+  return vars;
+}
+// Every expansion of target (array), or undefined when a variable is unknown.
+export function expandVariables(target, vars) {
+  if (typeof target !== 'string' || !/\$/.test(target)) return [target];
+  let results = [''];
+  const re = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)|\$/g;
+  let last = 0, match;
+  while ((match = re.exec(target))) {
+    const literal = target.slice(last, match.index);
+    const name = match[1] ?? match[2];
+    const values = name ? vars.get(name) : undefined;
+    if (!values) return undefined;
+    results = results.flatMap(prefix => values.map(value => prefix + literal + value));
+    last = re.lastIndex;
+  }
+  return results.map(prefix => prefix + target.slice(last));
+}
+// A write target whose unknown variables all sit after a literal directory that lies strictly inside
+// the project (`.review/run-$TS/out.txt`, `$D/x` with D a project path) is judged by that directory.
+function literalWritePrefix(target) {
+  const index = target.indexOf('$');
+  if (index < 0) return target;
+  const head = target.slice(0, index);
+  const slash = head.lastIndexOf('/');
+  if (slash <= 0) return undefined;
+  const dir = head.slice(0, slash);
+  return dir.split('/').includes('..') && !/^(\.\.\/)+[^.]/.test(dir + '/') ? undefined : `${dir}/__write_entry__`;
+}
+
 const DISK_COMMANDS = /^(dd|mkfs(\..+)?|mke2fs|mkswap|shred|wipefs|fdisk|sfdisk|cfdisk|gdisk|sgdisk|parted|blkdiscard|hdparm|badblocks)$/;
 const BLOCK_DEVICE = /^\/dev\/(sd|hd|vd|xvd|nvme|mmcblk|md|dm-|loop|disk|mapper\/|nbd|sr)/;
 const SAFE_WRITE_TARGET = /^\/(dev\/(null|stdout|stderr|tty|fd\/\d+)|tmp\/|proc\/self\/fd\/)/;
@@ -473,6 +569,29 @@ function nestedCommands(segment, nested, ctx, { garageOk = false } = {}) {
   return reasons;
 }
 
+// 0.3.3: per-segment working directories. After a top-level `cd T`, the segments joined to it by
+// `&&` (and the subshells opened by `&& (`) run only if the cd succeeded, so they run in T alone; a
+// `;`, newline, `||` or `&` at the top level ends that, and later segments get the union (as before).
+function segmentCwdList(segments, base, home) {
+  const union = segmentCwds(segments, base, home);
+  const list = [];
+  let exact, moved = false;
+  for (const segment of segments) {
+    const sep = segment.prevSep === '(' && segment.outer !== undefined ? segment.outer : segment.prevSep;
+    const top = !segment.sub || segment.prevSep === '(';
+    if (exact && top && ['', ';', '\n', '||', '&', '|', '|&', ')'].includes(sep) && !(sep === '' && segment.sub)) exact = undefined;
+    list.push(exact ?? union);
+    const { words } = segment;
+    if (!segment.sub && words[0] === 'cd' && words.length <= 2 && union) {
+      const from = exact ?? (!moved && base ? new Set([base]) : undefined);
+      moved = true;
+      const target = from && from.size === 1 ? cdTarget([...from][0], words, home) : undefined;
+      exact = target ? new Set([target]) : undefined;
+    } else if (words.some(word => ['cd', 'pushd', 'popd', 'chdir'].includes(word))) { exact = undefined; moved = true; }
+  }
+  return list;
+}
+
 function segmentCwds(segments, base, home) {
   let cwds = base ? new Set([base]) : undefined;
   for (const segment of segments) {
@@ -504,7 +623,11 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
   if (remote) { const tracked = segmentCwds(segments, REMOTE_HOME, REMOTE_HOME); ctx.cwds = tracked; ctx.home = REMOTE_HOME; }
   const nested = [];
   const envReads = garage && remote && depth > 0 ? garageEnvReads(command, segments) : new Map();
+  const vars = literalVariables(segments);
+  const cwdList = remote ? undefined : segmentCwdList(segments, cwd, home);
+  const baseCtx = ctx;
   segments.forEach((segment, n) => {
+    const ctx = cwdList ? { ...baseCtx, cwds: cwdList[n] } : baseCtx;
     const { words, redirects } = segment;
     const text = JSON.stringify(segment.text.slice(0, 160));
     const push = gitPushDanger(words);
@@ -522,13 +645,25 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
       if (!redirect.file) continue;
       if (BLOCK_DEVICE.test(redirect.target ?? '')) reasons.push(`${text}: redirect writes device ${redirect.target}`);
       if (paths && !remote && (['>', '>|', '&>', '<>'].includes(redirect.op) || /^\d+>$/.test(redirect.op))) {
-        if (!SAFE_WRITE_TARGET.test(redirect.target ?? '')) {
-          const why = deleteTargetDanger(redirect.target ?? '', ctx);
-          if (why && !/is git metadata/.test(why)) reasons.push(`${text}: truncating redirect ${redirect.op} ${JSON.stringify(redirect.target)} (${why})`);
+        const raw = redirect.target ?? '';
+        const expanded = expandVariables(raw, vars);
+        const targets = expanded ?? [literalWritePrefix(raw) ?? raw];
+        for (const target of targets) {
+          if (SAFE_WRITE_TARGET.test(target)) continue;
+          // Relative targets that resolve into /tmp (cd /tmp/x && cmd > out) are scratch writes too.
+          if (!path.isAbsolute(target) && !target.includes('$') && !target.startsWith('~') && ctx.cwds?.size && [...ctx.cwds].every(cwd => SAFE_WRITE_TARGET.test(path.resolve(cwd, target)))) continue;
+          const why = deleteTargetDanger(target, ctx);
+          if (why && !/is git metadata/.test(why)) reasons.push(`${text}: truncating redirect ${redirect.op} ${JSON.stringify(raw)} (${why.replace('/__write_entry__', '/…')})`);
         }
       }
     }
-    if (paths) reasons.push(...[...rmDanger(words, ctx), ...findDanger(words, ctx), ...rsyncDanger(words, ctx, nested)].map(why => `${text}: ${why}`));
+    const service = serviceDanger(words);
+    if (service) reasons.push(`${text}: ${service}`);
+    const deploy = project?.noPushDeploy ? pushDeployDanger(words) : undefined;
+    if (deploy) reasons.push(`${text}: ${deploy}`);
+    // Delete targets with literal variables (B=/x; rm -rf $B) are judged by their expansion.
+    const expandedWords = words.map(word => { const values = /\$/.test(word) ? expandVariables(word, vars) : undefined; return values?.length === 1 ? values[0] : word; });
+    if (paths) reasons.push(...[...rmDanger(expandedWords, ctx), ...findDanger(expandedWords, ctx), ...rsyncDanger(words, ctx, nested)].map(why => `${text}: ${why}`));
     reasons.push(...nestedCommands(segment, nested, ctx, { garageOk }).map(why => `${text}: ${why}`));
   });
   for (const inner of nested) {

@@ -33,7 +33,7 @@ test('install tracks asked/replied events and the parked result is never a pass'
   const m = createParkMonitor(); let interval;
   const ctx = { event: { subscribe: async function* () { for (const e of events) yield e; } } };
   const handle = installParkYield(ctx, { monitor: m, setTimer: (fn, ms) => (interval = ms, { unref() {} }), clearTimer: () => {} });
-  await new Promise(r => setImmediate(r)); assert.equal(interval, 60_000); assert.equal(m.pending().length, 0); handle.stop();
+  await new Promise(r => setImmediate(r)); assert.equal(interval, 10_000); assert.equal(m.pending().length, 0); handle.stop();
   const r = parkedResult({ parked: { requestID: 'per_1', sessionID: 'c', action: 'bash', pendingMs: PARK_AFTER_MS }, identity: { sessionID: 'c', agent: 'verifier', generation: 1 }, collect: {} });
   assert.equal(r.metadata.status, 'blocked'); assert.equal(r.metadata.verdict, 'blocked'); assert.match(r.content, /NOT a pass/); assert.match(r.content, /not denied/);
 });
@@ -71,4 +71,14 @@ test('r26 fable: redaction covers env assignments, auth headers and flags', asyn
     const s = askSummary({ permission: 'bash', patterns: [cmd] });
     assert.ok(!s.includes(secret), s);
   }
+});
+
+test('0.3.3: stall is logged at once and the parent is released after 30 s', async () => {
+  const { NOTIFY_AFTER_MS: N, PARK_AFTER_MS: P, PARK_TICK_MS: T } = await import('../plugins/v2/park-yield.mjs');
+  assert.equal(N, 0); assert.equal(P, 30_000); assert.equal(T, 10_000);
+  let at = 0; const logged = [];
+  const m = createParkMonitor({ now: () => at, log: r => logged.push(r) });
+  m.asked({ id: 'per_z', sessionID: 's', action: 'shell', since: 0 });
+  await m.tick(); assert.deepEqual(logged.map(r => r.outcome), ['stalled']);
+  at = 30_000; await m.tick(); assert.deepEqual(logged.map(r => r.outcome), ['stalled', 'parked']);
 });

@@ -7,12 +7,22 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { isSecretPath, markers } from './shell-guard.mjs';
-import { realish } from './full-auto.mjs';
+import { execFileSync } from 'node:child_process';
+import { isSecretPath, markers, scanShell } from './shell-guard.mjs';
+import { realish, fullAutoProjectFor, fullAutoShellCheck } from './full-auto.mjs';
 import { statePath } from './paths.mjs';
 
 export const LISTABLE_DIRS = ['/opt', '/snap/bin', '/bin', '/sbin', '/usr/bin', '/usr/local/bin'];
-const BACKGROUND = /&|\bnohup\b|\bsetsid\b|\bdisown\b|\$!/;
+// 0.3.3: a real background job only (`cmd &`, nohup/setsid/disown, `$!`); `&&` and `2>&1` are not.
+// Before 0.3.3 any `&` matched, so 10 of 10 logged declines were `&&` chains or `2>&1`.
+export function startsBackground(text) {
+  if (typeof text !== 'string' || !text) return false;
+  if (/\$!/.test(text)) return true;
+  const { segments } = scanShell(text);
+  if (segments.some(segment => segment.prevSep === '&' || segment.words.some(word => /^(?:.*\/)?(nohup|setsid|disown)$/.test(word)))) return true;
+  return /(^|[^&>|<])&\s*$/.test(text.trim()) || /(^|[^&>|<])&\s*\)/.test(text);
+}
+const BACKGROUND = { test: startsBackground };
 const LS = /^ls((?:\s+-[1ad]+)*)\s+(\S+?)\/?$/;
 const contains = (root, target) => target === root || target.startsWith(root + '/');
 
@@ -25,7 +35,63 @@ function credentialPath(target, home) {
 
 const stripGlob = resource => String(resource).replace(/\/\*$/, '');
 
-export function decideAutoPermission({ action, resources, tool, input, directory, home = os.homedir(), realpath = fs.realpathSync } = {}) {
+// 0.3.3 full-auto: read-only tools may look anywhere outside the project except credential/secret
+// paths and other projects' uncommitted files; a shell call's external_directory ask is allowed when
+// the full-auto shell check finds nothing that must ask (it re-checks deletes, secrets, pushes,
+// sudo/services, deploys) and it names no other project. Edits outside the project still ask.
+export const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'ls', 'large_file_check', 'structured_json_read', 'repo_identity', 'codesearch', 'lsp']);
+const SHELL_TOOLS = new Set(['shell', 'bash']);
+// Sibling git repositories of the project (e.g. /home/box/work/yrdsale for a demodirector session).
+export function otherProjectOf(target, project, { exists = fs.existsSync } = {}) {
+  const parent = path.dirname(project.directory);
+  if (!contains(parent, target) || contains(project.directory, target)) return undefined;
+  const top = target.slice(parent.length + 1).split('/')[0];
+  if (!top) return undefined;
+  const repo = path.join(parent, top);
+  return exists(path.join(repo, '.git')) ? repo : undefined;
+}
+// Clean and tracked in its repository (read-only git, no optional locks): safe to read.
+export function committedClean(repo, target, { run = execFileSync } = {}) {
+  try {
+    const rel = path.relative(repo, target) || '.';
+    const opts = { cwd: repo, timeout: 2000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } };
+    const status = run('git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain', '--untracked-files=all', '--', rel], opts);
+    if (String(status).trim()) return false;
+    const tracked = run('git', ['--no-optional-locks', 'ls-files', '--', rel], opts);
+    return Boolean(String(tracked).trim());
+  } catch { return false; }
+}
+export function decideFullAutoExternal({ action, resources, tool, input, project, directory, home = os.homedir(), realpath = fs.realpathSync, exists = fs.existsSync, clean = committedClean } = {}) {
+  const res = Array.isArray(resources) ? resources.map(String) : [];
+  if (!res.length) return { decision: 'ask', reason: 'no_resources' };
+  if (!['external_directory', 'read'].includes(action)) return { decision: 'ask', reason: 'full_auto_action_not_covered' };
+  const shell = SHELL_TOOLS.has(tool);
+  if (!shell && !READ_ONLY_TOOLS.has(tool)) return { decision: 'ask', reason: 'full_auto_tool_not_read_only' };
+  for (const r of res) {
+    const lexical = path.resolve(directory ?? '/', stripGlob(r).replace(/\/\*\*$/, ''));
+    for (const candidate of [lexical, realish(lexical, { realpath })]) {
+      if (credentialPath(candidate, home)) return { decision: 'ask', reason: 'credential_path' };
+      const other = otherProjectOf(candidate, project, { exists });
+      if (other && (shell || !clean(other, candidate))) return { decision: 'ask', reason: shell ? 'other_project_shell' : 'other_project_uncommitted' };
+    }
+  }
+  if (shell) {
+    const command = typeof input?.command === 'string' ? input.command : undefined;
+    if (command === undefined) return { decision: 'ask', reason: 'shell_without_command' };
+    const workdir = typeof input?.workdir === 'string' && input.workdir ? path.resolve(directory ?? '/', input.workdir) : directory;
+    if (fullAutoShellCheck(command, workdir, project).length) return { decision: 'ask', reason: 'full_auto_shell_reasons' };
+    // Words naming another project's files (cat ../yrdsale/x) ask: a shell may write them.
+    for (const word of command.split(/[\s'"=:;|&()<>]+/).filter(word => word.startsWith('/') || word.startsWith('..'))) {
+      const target = path.resolve(workdir ?? '/', word);
+      if (otherProjectOf(target, project, { exists })) return { decision: 'ask', reason: 'other_project_shell' };
+    }
+    return { decision: 'allow', reason: 'full_auto_shell_external' };
+  }
+  return { decision: 'allow', reason: 'full_auto_read_only_external' };
+}
+
+export function decideAutoPermission({ action, resources, tool, input, directory, home = os.homedir(), realpath = fs.realpathSync, fullAutoProject } = {}) {
+  if (fullAutoProject) return decideFullAutoExternal({ action, resources, tool, input, project: fullAutoProject, directory, home, realpath });
   const res = Array.isArray(resources) ? resources.map(String) : [];
   const command = typeof input?.command === 'string' ? input.command.trim() : undefined;
   const pattern = typeof input?.pattern === 'string' ? input.pattern : undefined;
@@ -87,7 +153,7 @@ export function autoPermissionLogger({ file = statePath('telemetry', 'auto-permi
   };
 }
 
-export async function installAutoPermission(ctx, { log = autoPermissionLogger(), now = () => Date.now(), home = os.homedir(), realpath = fs.realpathSync } = {}) {
+export async function installAutoPermission(ctx, { log = autoPermissionLogger(), now = () => Date.now(), home = os.homedir(), realpath = fs.realpathSync, fullAutoProjects } = {}) {
   const permission = ctx?.permission;
   if (typeof permission?.hook !== 'function') return { stop() {} };
   const calls = new Map(); // `${sessionID}\0${callID}` -> {tool, input}
@@ -105,7 +171,8 @@ export async function installAutoPermission(ctx, { log = autoPermissionLogger(),
     if (!call) return; // unknown tool/input: leave it with the human
     let verdict;
     try {
-      verdict = decideAutoPermission({ action: event.action, resources: event.resources, tool: call.tool, input: call.input, directory: ctx.location?.directory, home, realpath });
+      const project = event.metadata?.[markers.PROBE_MARKER] ? undefined : fullAutoProjectFor(ctx.location?.directory, ...(fullAutoProjects ? [fullAutoProjects()] : []));
+      verdict = decideAutoPermission({ action: event.action, resources: event.resources, tool: call.tool, input: call.input, directory: ctx.location?.directory, home, realpath, fullAutoProject: project });
     } catch { verdict = { decision: 'ask', reason: 'error' }; }
     const subject = typeof call.input?.command === 'string' ? call.input.command : (event.resources ?? []).join(' ');
     log({ time: new Date(now()).toISOString(), sessionID: event.sessionID, tool: call.tool, pattern: String(subject).slice(0, 200),

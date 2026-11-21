@@ -10,12 +10,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { statePath } from './paths.mjs';
 
+// 0.3.3: asks that still reach a human are the real MUST-ASK cases, so a foreground parent is
+// released after 30 s (was 5 min) and keeps working on other tasks while the ask is pending; the
+// stall is logged on the first tick (was 3 min). Ticks run every 10 s.
 // r26 item 2: a blocked foreground parent (usually the router) is released after
 // 5 min (was 30) so it keeps consuming new incoming messages; the stall is
 // logged at 3 min. HARNESS_PARK_AFTER_MS / HARNESS_PARK_NOTIFY_MS override.
-const envMs = (name, fallback) => { const raw = process.env[name]; return typeof raw === 'string' && /^\d{5,8}$/.test(raw) ? Number(raw) : fallback; };
-export const NOTIFY_AFTER_MS = envMs('HARNESS_PARK_NOTIFY_MS', 3 * 60_000);
-export const PARK_AFTER_MS = envMs('HARNESS_PARK_AFTER_MS', 5 * 60_000);
+const envMs = (name, fallback) => { const raw = process.env[name]; return typeof raw === 'string' && /^\d{1,8}$/.test(raw) ? Number(raw) : fallback; };
+export const NOTIFY_AFTER_MS = envMs('HARNESS_PARK_NOTIFY_MS', 0);
+export const PARK_AFTER_MS = envMs('HARNESS_PARK_AFTER_MS', 30_000);
 export const PENDING_ASKS_FILE = statePath('asks', 'pending.json');
 const REDACTIONS = [
   [/\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|KEY|AUTH|CREDENTIAL|HMAC|COOKIE)[A-Za-z0-9_]*)=\S+/gi, '$1=[redacted]'],
@@ -47,7 +50,7 @@ export function pendingAsksWriter({ file = PENDING_ASKS_FILE } = {}) {
     } catch { /* publishing state must not affect permissions */ }
   };
 }
-export const PARK_TICK_MS = 60_000;
+export const PARK_TICK_MS = 10_000;
 
 export function parkLogger({ file = statePath('telemetry', 'permission-park.jsonl') } = {}) {
   return record => {
@@ -127,7 +130,7 @@ export function installParkYield(ctx, { monitor = parkMonitor, tickMs = PARK_TIC
     try {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         const data = event?.data ?? {};
-        if (event?.type === 'permission.asked' && data.id && data.sessionID) monitor.asked({ id: data.id, sessionID: data.sessionID, action: data.action ?? data.permission, summary: askSummary(data) });
+        if (event?.type === 'permission.asked' && data.id && data.sessionID) { monitor.asked({ id: data.id, sessionID: data.sessionID, action: data.action ?? data.permission, summary: askSummary(data) }); void monitor.tick().catch(() => {}); }
         else if (event?.type === 'permission.replied') monitor.replied(data.requestID ?? data.id);
         // An aborted or deleted session's asks can no longer be answered; never park on them.
         else if (['session.deleted', 'session.execution.interrupted'].includes(event?.type) && (data.sessionID ?? data.id)) monitor.forgetSession(data.sessionID ?? data.id);

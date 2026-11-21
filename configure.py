@@ -406,7 +406,7 @@ def valid_full_auto_projects(value):
         and Path(entry['directory']).resolve()!=Path('/') and isinstance(entry.get('data_dirs',[]),list)
         and all(isinstance(d,str) and os.path.isabs(d) for d in entry.get('data_dirs',[])) for entry in value)
 
-def update_full_auto_projects(current,add=(),remove=()):
+def update_full_auto_projects(current,add=(),remove=(),no_deploy=(),allow_deploy=()):
     projects=[dict(entry) for entry in current]
     for directory in remove:
         resolved=str(Path(directory).expanduser().resolve())
@@ -417,6 +417,14 @@ def update_full_auto_projects(current,add=(),remove=()):
             raise ValueError(f'--full-auto-project {directory}: not an existing project directory')
         if not any(entry['directory']==str(resolved) for entry in projects):
             projects.append({'directory':str(resolved),'data_dirs':[]})
+    # no_push_deploy (0.3.3): pushes, publishes and deploys always ask in that full-auto project.
+    for directories,value in ((no_deploy,True),(allow_deploy,False)):
+        for directory in directories:
+            resolved=str(Path(directory).expanduser().resolve())
+            entry=next((entry for entry in projects if entry['directory']==resolved),None)
+            if entry is None: raise ValueError(f'{directory}: not a full-auto project')
+            if value: entry['no_push_deploy']=True
+            else: entry.pop('no_push_deploy',None)
     return projects
 
 def load_choices(path):
@@ -454,6 +462,8 @@ def main():
     p.add_argument('--compaction-tokens',type=compaction_tokens_arg,default=None,metavar='N',help=f'Absolute context tokens that mark a session high-pressure and eligible for compaction, even when a larger model window is known (effective trigger: min(N, 80%% of the window)); persisted. HARNESS_COMPACTION_TOKENS overrides it at runtime. Default: previously persisted choice, else {DEFAULT_COMPACTION_TOKENS}')
     p.add_argument('--full-auto-project',action='append',default=[],metavar='DIR',help='Enable the full-auto permission profile for this project directory (repeatable; persisted in full_auto_projects): shell, external_directory, read and edit asks inside it are allowed except force pushes, history rewrites, branch deletes, deletes outside the project, disk writes and secret paths')
     p.add_argument('--no-full-auto-project',action='append',default=[],metavar='DIR',help='Remove a directory from the persisted full-auto projects (repeatable)')
+    p.add_argument('--full-auto-no-deploy',action='append',default=[],metavar='DIR',help='In this full-auto project, every push, publish and deploy command (git push, gh pr create, railway/fly/vercel/eas deploys, docker push, npm publish, scp/rsync to a host) asks (persisted as no_push_deploy)')
+    p.add_argument('--full-auto-allow-deploy',action='append',default=[],metavar='DIR',help='Remove no_push_deploy from a full-auto project')
     a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
     state_dir=a.state_dir.expanduser().resolve();directory=state_dir/'config';target=directory/'opencode.json'
     choices_path=directory/'configure-choices.json'
@@ -461,7 +471,7 @@ def main():
     shell_policy=a.shell_policy or choices.get('shell_policy') or DEFAULT_SHELL_POLICY
     tmp_scratch=a.allow_tmp_scratch if a.allow_tmp_scratch is not None else choices.get('tmp_scratch',False)
     compaction_tokens=a.compaction_tokens if a.compaction_tokens is not None else choices.get('compaction_tokens',DEFAULT_COMPACTION_TOKENS)
-    try: full_auto=update_full_auto_projects(choices.get('full_auto_projects',[]),a.full_auto_project,a.no_full_auto_project)
+    try: full_auto=update_full_auto_projects(choices.get('full_auto_projects',[]),a.full_auto_project,a.no_full_auto_project,a.full_auto_no_deploy,a.full_auto_allow_deploy)
     except ValueError as error: p.error(str(error))
     claude_auth=None
     if a.claude_auth_plugin is not None:

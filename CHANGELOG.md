@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.3 — permission waits (r35)
+
+72 permission asks cost 40.8 h of waiting in r34. Replaying all 72 through 0.3.3 logic: 67 would auto-allow, 5 still ask (see `docs/SHELL-PERMISSIONS.md`, "0.3.3").
+
+- **Full-auto shell check** (`plugins/v2/full-auto.mjs`):
+  - literal shell variables are expanded before path checks (`D=/repo/.review/x; cmd > $D/out`, `for i in 1 2; ... > out$i`). A write target whose unknown variable follows a literal directory strictly inside the project (`.review/verify-$TS/revision.txt`) is judged by that directory. Deletes still need literal (or literally assigned) targets;
+  - per-segment working directory: after a top-level `cd T`, segments joined by `&&` (and `&& ( … )` subshells) run in T only, so `cd backend && (ruff . > ../.review/x)` is inside the project. `;`, newline, `||` and `&` fall back to the union of directories, as before;
+  - relative redirects that resolve into `/tmp` (`cd /tmp/opencode/x && cmd > out`) are scratch writes;
+  - **new asks:** `sudo`/`doas`/`su`/`pkexec` and system service changes (`systemctl` verbs other than reads, `service X <verb>` other than `status`), local or over ssh, for every unit. Before 0.3.3 full-auto allowed these;
+  - **new per-project `no_push_deploy`** (`configure.py --full-auto-no-deploy DIR`; set for yrdsale, Phase 1 rule): `git push` (any form), `gh pr create|merge`, `gh release create`, `railway|fly|vercel|eas|netlify|heroku|… deploy/up/submit/…`, `docker push`, `npm publish`, `scp`/`rsync` to a host all ask.
+- **Secret paths** (`shell-guard.mjs`): report files of a secret *scan* (`secret-scan.txt`, `secret-hits-lines.txt`, `secrets_scan-*.out`) are not secret paths; `secrets.txt`, `client_secret.json` and anything under a `secret*` directory still are. This was 7 verifier asks.
+- **Auto-permission** (`plugins/v2/auto-permission.mjs`):
+  - the `background_process` decline now means a real background job (`cmd &`, `nohup`, `setsid`, `disown`, `$!`). It used to match any `&`, so `&&` chains and `2>&1 | tee .review/…` were declined (10 of 10 logged declines);
+  - full-auto `external_directory` rule: read-only tools (`read`, `glob`, `grep`, `list`, …) may look outside the project anywhere except credential/secret paths and other projects' uncommitted files (a sibling git repo's path must be tracked and clean, checked with read-only `git --no-optional-locks status`). A shell call's `external_directory` ask (e.g. OpenCode resolving `cd ../web` against the session root) is allowed when the full-auto shell check is clean and the command names no other project. Edits outside the project still ask.
+- **Park and yield** (`plugins/v2/park-yield.mjs`): the stall is logged on the first tick after the ask (was 3 min), ticks run every 10 s (was 60 s) and run at once on a new ask, and a foreground parent is released after 30 s (was 5 min) with the blocked result, so it keeps working on other tasks while the ask waits for a human.
+- Tests: new `tests/v2-permission-waits.test.mjs`; updated sudo expectations in `tests/v2-full-auto.test.mjs` and the tick interval in `tests/v2-park-yield.test.mjs`.
+
 ## 0.3.2 — garage-server read-only .env / wncscanner-stack full-auto exemption
 
 - **Standing permission rule** (operator: "always allow read-only access to /opt/wncscanner-docker/.env and the wncscanner-stack service"), implemented as a full-auto exemption in `plugins/v2/full-auto.mjs`, like the docker `--env-file` one, not as an OpenCode "always" pattern. Under full-auto, `ssh garage-server` (or `user@garage-server`, plain options only) may read exactly `/opt/wncscanner-docker/.env` with `cat`/`less`/`grep`/`stat`/`readlink`, alongside other read-only checks in the same remote command. Other secret files, writes/redirects/copies/edits of the file, substitutions, output redirected or piped into anything but text filters, other hosts, `-F/-J/-p/-o HostName`, `sudo`, nested shells and local reads still ask. See `docs/SHELL-PERMISSIONS.md`.

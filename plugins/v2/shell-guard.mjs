@@ -51,6 +51,7 @@ export function isEnvTemplatePath(target) {
 // *.key (extension at the end), auth.json, credentials, id_rsa/id_ed25519/..., dotted names
 // containing secret/credentials, anything in a secret*/credentials* directory, and private
 // files under .ssh/.
+const SECRET_SCAN_REPORT = /^secrets?[-_](scan|hits|check|audit|grep|report|findings|matches)[A-Za-z0-9_$.-]*\.(txt|out|log|md|csv|tsv|json|lines)$/i;
 export function isSecretPath(target) {
   if (typeof target !== 'string' || !target) return false;
   const normalized = target.replaceAll('\\', '/');
@@ -58,6 +59,8 @@ export function isSecretPath(target) {
   const parts = normalized.split('/').filter(Boolean);
   const base = parts.at(-1) ?? '';
   const dirs = parts.slice(0, -1);
+  // 0.3.3: output files of a secret *scan* (secret-scan.txt, secret-hits-lines.txt) are reports, not secrets.
+  if (SECRET_SCAN_REPORT.test(base) && !dirs.some(part => /secret|credentials/i.test(part)) && !dirs.includes('.ssh')) return false;
   if (!isEnvTemplatePath(target)) {
     if (SECRET_BASENAME.some(pattern => pattern.test(base))) return true;
     if (base.includes('.') && SECRET_NAMED_FILE.test(base)) return true;
@@ -206,7 +209,7 @@ export function scanShell(command) {
   const close = () => {
     if (current && (current.words.length || current.redirects.length)) {
       segments.push({ text: current.parts.join(' ').trim(), words: current.words, redirects: current.redirects,
-        hasCommand: current.words.some(word => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)), prevSep: current.prevSep, sub: current.sub });
+        hasCommand: current.words.some(word => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)), prevSep: current.prevSep, sub: current.sub, ...(current.outer !== undefined ? { outer: current.outer } : {}) });
     }
     current = undefined;
   };
@@ -242,7 +245,10 @@ export function scanShell(command) {
     }
     if (char === '#' ) { const lineEnd = command.indexOf('\n', i); i = lineEnd < 0 ? command.length : lineEnd; continue; }
     if (char === ';' || char === '(' || char === ')' || char === '`') {
+      // outer: the list operator before a `(` (`cd x && (...)` vs `cd x; (...)`), for cwd tracking.
+      const outer = char === '(' && (!current || (!current.words.length && !current.redirects.length)) ? prevSep : undefined;
       close(); if (char !== ';') nested = true;
+      if (outer !== undefined) { if (char === '(') depth++; prevSep = char; i++; open(i); current.outer = outer; continue; }
       if (char === '(') depth++; else if (char === ')') depth = Math.max(0, depth - 1); else if (char === '`') backtick = !backtick;
       prevSep = char; i++; open(i); continue;
     }

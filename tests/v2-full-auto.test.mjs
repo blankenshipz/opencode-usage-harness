@@ -87,7 +87,7 @@ const ALLOWED = [
   'scp dist/app.tar garage-server:/opt/wncscanner/', 'rsync -az --delete ./ garage-server:/opt/wncscanner/', 'rsync -az -e "ssh -p 22" config/ garage-server:/opt/wncscanner/config/',
   'ssh garage-server <<EOF\ncd /opt/wncscanner\ndocker compose pull\ndocker compose up -d\nEOF', 'ssh garage-server "rm -rf /opt/wncscanner/build"',
   'docker compose up -d --build', 'docker compose down', 'docker rm -f wnc', 'docker compose rm -f', 'docker system prune -f',
-  'kill 1234', 'pkill -f uvicorn', 'sudo systemctl restart wncscanner', 'sudo -u wnc ls /var/lib', 'chmod -R u+w scripts', 'chown -R box data',
+  'kill 1234', 'pkill -f uvicorn', 'chmod -R u+w scripts', 'chown -R box data',
   'bash -c "pytest -q && ruff check ."', 'sh -c "echo hi"', 'bash scripts/deploy.sh', 'eval "make test"',
   'rm -rf build', 'rm -rf build/*', 'rm -rf data/recordings/old', 'rm data/recordings/*.ogg', 'cd data && rm -rf recordings', 'rm -f build/x 2>/dev/null; rm -rf ./build',
   `rm -rf ${P}/build`, 'find build -name "*.pyc" -delete', 'find . -name __pycache__ -exec rm -rf {} +', 'git clean -fdx build',
@@ -132,10 +132,10 @@ test('full-auto exempts only the value of docker --env-file from the secret-path
   const allowed = [
     'docker compose --env-file ../.env up -d', 'docker compose -f x.yml --env-file .env.prod up', 'docker --env-file .env run --rm img',
     'docker run --env-file=.env img', 'docker compose --env-file=/abs/path/.env pull', 'docker-compose --env-file .env up -d',
-    'sudo docker compose --env-file ../.env up -d', 'bash -c "docker compose --env-file .env up -d"', "sh -c 'cd app && docker run --env-file=.env img'",
+    'bash -c "docker compose --env-file .env up -d"', "sh -c 'cd app && docker run --env-file=.env img'",
     'ssh garage-server "cd app && docker compose --env-file .env up -d"', 'ssh garage-server docker compose --env-file .env pull',
     'git pull && docker compose --env-file ../.env up -d --build',
-    'FOO=1 docker compose --env-file .env up -d', 'timeout 600 docker compose --env-file .env pull', 'sudo -E docker compose --env-file .env up -d',
+    'FOO=1 docker compose --env-file .env up -d', 'timeout 600 docker compose --env-file .env pull',
     'ssh -p 2222 garage-server docker compose --env-file .env pull', '/usr/bin/docker compose --env-file=.env up',
   ];
   const asked = [
@@ -170,7 +170,6 @@ const GARAGE_ALLOWED = [
   "ssh garage-server 'systemctl status wncscanner-stack --no-pager -l; systemctl is-active wncscanner-stack'",
   "ssh garage-server 'cat /etc/systemd/system/wncscanner-stack.service'", "ssh garage-server 'readlink /etc/systemd/system/wncscanner-stack.service'",
   "ssh -o BatchMode=yes -o ConnectTimeout=30 garage-server 'cat /opt/wncscanner-docker/.env; docker ps'",  "ssh garage-server 'systemctl --no-pager -n 50 status wncscanner-stack'",
-  "ssh garage-server 'sudo systemctl status wncscanner-stack'",
   "ssh garage-server 'journalctl -u wncscanner-stack.service -n 50 --no-pager'",
   "ssh garage-server 'service wncscanner-stack status'",
   "ssh garage-server 'systemctl show -p ActiveState wncscanner-stack'",
@@ -256,7 +255,9 @@ test('the garage-server exemption is full-auto only and leaves docker --env-file
   assert.notDeepEqual(shellSecretReasons("ssh garage-server 'cat /opt/wncscanner-docker/.env'", { envFiles: false }), []);
   assert.notDeepEqual(shellSecretReasons(GARAGE_EXAMPLE, { envFiles: false }), []);
   // Other units keep their existing full-auto behaviour.
-  assert.equal(await decide("ssh garage-server 'systemctl restart other-unit'"), 'allow');
+  // 0.3.3: every system service change asks (any unit, local or remote); reads stay allowed.
+  assert.notEqual(await decide("ssh garage-server 'systemctl restart other-unit'"), 'allow');
+  assert.equal(await decide("ssh garage-server 'systemctl status other-unit'"), 'allow');
   assert.equal(await decide('ssh garage-server docker compose --env-file .env pull'), 'allow');
   assert.notEqual(await decide("ssh garage-server 'docker compose --env-file .env up -d && cat .env'"), 'allow');
 });
