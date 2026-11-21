@@ -23,7 +23,15 @@ const MAX_MASKED_PER_SESSION = 5000;
 const MAX_STORE_BYTES = 256 * 1024 * 1024;
 // `read` results are the main target; every other protected control record stays.
 export const MASK_PROTECTED_TOOLS = new Set([...PROTECTED_TOOLS].filter(name => name !== 'read').concat(['review_verdict', 'check_rerun']));
-const EXISTING_ORIGINAL = /Original: native read (\S+\/chunks\.jsonl) offset=1 limit=3/;
+// Fable r30 #1: only the harness compression marker at the END of the text, pointing
+// inside the tool-output store, is trusted; anything else gets its own saved original.
+const EXISTING_ORIGINAL = /\[harness compacted [^\]]*Original: native read (\S+\/chunks\.jsonl) offset=1 limit=3;[^\]]*\]\s*$/;
+export function trustedExistingOriginal(text, storeRoot = statePath('tool-output-store')) {
+  const found = typeof text === 'string' ? text.match(EXISTING_ORIGINAL)?.[1] : undefined;
+  if (!found) return undefined;
+  const relative = path.relative(storeRoot, path.resolve(found));
+  return /^[a-f0-9]{64}\/chunks\.jsonl$/.test(relative.split(path.sep).join('/')) ? found : undefined;
+}
 
 export function resultText(result) {
   if (!result || typeof result !== 'object') return undefined;
@@ -115,7 +123,7 @@ function createStateStore(directory = statePath('observation-masking'), io = fs)
     async load(sessionID) {
       try {
         const value = JSON.parse(await io.readFile(file(sessionID), 'utf8'));
-        return value?.version === 1 && value.masked && typeof value.masked === 'object' ? new Map(Object.entries(value.masked)) : new Map();
+        return value?.version === 1 && value.masked && typeof value.masked === 'object' ? new Map(Object.entries(value.masked).filter(([, v]) => typeof v === 'string')) : new Map();
       } catch { return new Map(); }
     },
     async save(sessionID, masked) {
@@ -173,7 +181,7 @@ export function planBatch(messages, masked, config) {
 }
 
 export async function installObservationMasking(ctx, { loadConfig = loadTokenSavingConfig, log = logTokenSaving, saveOriginal = createMaskStore(),
-  state = createStateStore(), onBatch = () => {} } = {}) {
+  state = createStateStore(), onBatch = () => {}, storeRoot = statePath('tool-output-store') } = {}) {
   if (typeof ctx?.session?.hook !== 'function') return () => {};
   const sessions = new Map(); // sessionID -> Map(id -> placeholder)
   let stopped = false;
@@ -201,7 +209,7 @@ export async function installObservationMasking(ctx, { loadConfig = loadTokenSav
       const batch = new Map();
       let savedChars = 0;
       for (const candidate of candidates) {
-        let chunksPath = candidate.text.match(EXISTING_ORIGINAL)?.[1];
+        let chunksPath = trustedExistingOriginal(candidate.text, storeRoot);
         if (!chunksPath) {
           try { chunksPath = await saveOriginal({ sessionID: event.sessionID, id: candidate.id, text: candidate.text }); }
           catch { chunksPath = undefined; }
@@ -223,6 +231,11 @@ export async function installObservationMasking(ctx, { loadConfig = loadTokenSav
     } catch (error) {
       try { log({ event: 'observation_mask_error', session: event.sessionID, error: String(error?.message ?? error).slice(0, 200) }); } catch {}
     }
+  });
+  // Fable r30 #2: the native compaction request must see the same masked prefix (apply only, no new batch).
+  await ctx.session.hook('compaction', async event => {
+    if (stopped || !Array.isArray(event?.messages) || typeof event.sessionID !== 'string' || isNativeAgent(event.agent)) return;
+    try { if (loadConfig().observationMasking.enabled) applyMasks(event.messages, await masksFor(event.sessionID)); } catch { /* never block compaction */ }
   });
   return () => { stopped = true; sessions.clear(); };
 }

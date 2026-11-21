@@ -45,13 +45,19 @@ export function parentTtlApplies(event, config) {
 }
 
 export async function installParentCacheTtl(ctx, { loadConfig = loadTokenSavingConfig, log = logTokenSaving, once = logOnce, now = Date.now } = {}) {
-  if (typeof ctx?.session?.hook !== 'function' || typeof Request !== 'function') {
-    once('parent-ttl:no-hook', { event: 'parent_cache_ttl_unsupported', reason: 'http_request_hook_unavailable' });
+  // No session hook API at all (older runtime or a test double): nothing to do, nothing to log.
+  if (typeof ctx?.session?.hook !== 'function') return { stop() {}, state: () => ({ disabled: 'unsupported' }) };
+  if (typeof Request !== 'function') {
+    once('parent-ttl:no-request', { event: 'parent_cache_ttl_unsupported', reason: 'fetch_request_unavailable' });
     return { stop() {}, state: () => ({ disabled: 'unsupported' }) };
   }
   let disabled, stopped = false;
   const recent = new Map(); // sessionID -> last rewrite time (bounded)
-  await ctx.session.hook('http.request', async event => {
+  const register = async (name, fn) => {
+    try { await ctx.session.hook(name, fn); return true; }
+    catch { once(`parent-ttl:register:${name}`, { event: 'parent_cache_ttl_unsupported', reason: `hook_${name}_unavailable` }); disabled = 'unsupported'; return false; }
+  };
+  await register('http.request', async event => {
     if (stopped || disabled) return;
     let config;
     try { config = loadConfig().parentCacheTtl; } catch { return; }
@@ -77,7 +83,7 @@ export async function installParentCacheTtl(ctx, { loadConfig = loadTokenSavingC
   });
   // Circuit breaker: a 400 that names the TTL/cache_control right after a
   // rewrite for that session disables the rewrite for this process.
-  await ctx.session.hook('http.response', async event => {
+  await register('http.response', async event => {
     if (stopped || disabled || !recent.has(event.sessionID)) return;
     const status = event.response?.status;
     if (status !== 400) return;

@@ -283,8 +283,10 @@ function applyEffortMap(result, { input, quota, config }) {
   if (!target || !parts || target.effort === parts.variant) return result;
   const base = { from: parts.variant, to: target.effort, basis: target.basis };
   // Never lower effort for high-risk work on a complexity guess.
-  if (target.basis === 'complexity' && input.routing?.risk === 'high' && EFFORT_RANK[target.effort] < (EFFORT_RANK[parts.variant] ?? 99))
-    return { ...result, effortMap: { ...base, applied: false, reason: 'high_risk_keeps_effort' } };
+  const lower = EFFORT_RANK[target.effort] < (EFFORT_RANK[parts.variant] ?? 99);
+  if (lower && input.routing?.risk === 'high') return { ...result, effortMap: { ...base, applied: false, reason: 'high_risk_keeps_effort' } };
+  // Fable r30 #6: tier mappings only raise effort (STRONG/MAXIMUM at xhigh/max stay there).
+  if (lower && target.basis === 'tier') return { ...result, effortMap: { ...base, applied: false, reason: 'tier_raise_only' } };
   if (taskFitContext({ input, policy: quota?.routingPolicy }).strict) return { ...result, effortMap: { ...base, applied: false, reason: 'strict_task_fit' } };
   const next = { ...parts, variant: target.effort, ref: `${parts.providerID}/${parts.id}#${target.effort}` };
   if (!catalogHasVariant(quota?.catalog, next)) return { ...result, effortMap: { ...base, applied: false, reason: 'variant_unavailable' } };
@@ -302,9 +304,13 @@ export function selectDispatchModel(args) {
   if (compacted && keep.enabled && keep.rerouteAfterCompaction && record?.routing?.selected && !record.routing.reviewProvenance
     && !record.modelOverride && input.model === undefined && input.routing?.reviewIndependence !== 'required' && input.continuationEffort !== 'reassess') {
     // Pacing/demotion decisions apply again right after a compaction.
-    result = selectDispatchModelBase({ ...args, record: { ...record, routing: undefined } });
-    rerouted = true;
-    if (result.selected !== record.routing.selected) result = { ...result, postCompactionReroute: { from: record.routing.selected, to: result.selected } };
+    const fresh = selectDispatchModelBase({ ...args, record: { ...record, routing: undefined } });
+    // Fable r30 #3: pacing/demotion only; never change provider for an admitted lane.
+    if (fresh.selected?.split('/')[0] === record.routing.selected.split('/')[0] && ['configured_role', 'pace_routine', 'routine_mechanical'].includes(fresh.source)) {
+      result = { ...fresh, ...(record.routing.taskFit && !fresh.taskFit ? { taskFit: record.routing.taskFit } : {}) };
+      rerouted = true;
+      if (result.selected !== record.routing.selected) result = { ...result, postCompactionReroute: { from: record.routing.selected, to: result.selected } };
+    } else result = selectDispatchModelBase(args);
   } else result = selectDispatchModelBase(args);
   if (tokenSaving.effort.enabled && (!continuation || rerouted)) result = applyEffortMap(result, { input, quota: args.quota, config: tokenSaving.effort });
   if (!continuation || !keep.enabled || compacted) return result;
@@ -314,7 +320,11 @@ export function selectDispatchModel(args) {
   const current = modelReference(child.model) ?? modelReference(record?.routing?.selected);
   if (!current || !result.selected || baseModel(current) === baseModel(result.selected)) return result;
   const role = canonicalHarnessRole(input.agent) ?? input.agent;
-  const parent = (tokenSaving.parentCacheTtl?.enabled && (tokenSaving.parentCacheTtl.roles ?? []).includes(role));
+  // Fable r30 #4: the 1h window only where the 1h TTL can exist (Anthropic parents).
+  const parent = (tokenSaving.parentCacheTtl?.enabled && (tokenSaving.parentCacheTtl.roles ?? []).includes(role) && current.startsWith('anthropic/'));
+  // Fable r30 #5: never pin a child to a pool whose scoped quota is unavailable.
+  const policy = args.quota?.routingPolicy;
+  if (scopedQuotaUnavailable(current, args.quota, Number.isFinite(policy?.reservePercent) ? policy.reservePercent : 2)) return result;
   const cache = childCacheState(child, { now, windowMs: parent ? keep.parentWarmMs : keep.warmMs });
   if (!cache) return result;
   const cacheKeep = { kept: current, suppressed: result.selected, suppressedSource: result.source, reason: `child_${cache.state}`, ...(cache.ageMs !== undefined ? { ageMs: cache.ageMs } : {}) };
