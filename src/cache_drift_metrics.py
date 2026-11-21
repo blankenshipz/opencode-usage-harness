@@ -33,7 +33,7 @@ def cache_drift_metrics(file, *, session_ids, cutoff_ms, now_ms):
                         if item.get('session_id') not in session_ids or not cutoff_ms <= item['created_ms'] <= now_ms:
                             continue
                         reason = item['reason']
-                        if reason not in {'baseline', 'compaction_boundary', 'route_changed', 'history_shortened', 'stable', 'drift_observed', 'observation_unavailable'}:
+                        if reason not in {'baseline', 'compaction_boundary', 'masking_boundary', 'route_changed', 'history_shortened', 'stable', 'drift_observed', 'observation_unavailable'}:
                             raise ValueError('unknown observation')
                         duration = item['processing_ms']
                         axes = item.get('dimensions', [])

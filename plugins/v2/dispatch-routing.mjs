@@ -6,6 +6,7 @@ import { readProviderQuotas, catalogProviders } from './provider-quota.mjs';
 import { readAnthropicFinancialPolicy } from './anthropic-financial-policy.mjs';
 import { readSelectedClaudeUsage } from './anthropic-subscription.mjs';
 import { canonicalHarnessRole, harnessRoleIDs } from './agent-mode.mjs';
+import { loadTokenSavingConfig, logTokenSaving } from './token-saving.mjs';
 
 export const TASK_TYPES = Object.freeze(['general','exploration','mechanical','implementation','debugging','architecture','testing','review']);
 const TASK_TYPE_SET = new Set(TASK_TYPES);
@@ -157,7 +158,7 @@ export function quotaPace(quota, now=Date.now(), provider='openai') {
 }
 // Model selection does not grant provider access or bypass the subscription guard.
 export const ROUTINE_MECHANICAL_DEMOTION=false;
-export function selectDispatchModel({input,agent,agents,record,child,quota,hasActiveDescendant=false}) {
+function selectDispatchModelBase({input,agent,agents,record,child,quota,hasActiveDescendant=false}) {
   const configured=modelReference(agent.model), observed=modelReference(child?.model);
   const explicit=modelReference(input.model);
   const reviewModel=modelReference(input.routing?.reviewProvenance?.model) ?? modelReference(input.routing?.reviewOf);
@@ -239,6 +240,86 @@ export function selectDispatchModel({input,agent,agents,record,child,quota,hasAc
     && scopedQuotaUnavailable(selected,quota,Number.isFinite(quota.routingPolicy.reservePercent) ? quota.routingPolicy.reservePercent : 2)) throw scopeQuotaError();
   const fallbackFit=!override && selectedTaskFit({input,policy:quota?.routingPolicy,ref:selected});
   return {selected:requireIndependent(selected),configured,observed,source,pace,modelOverride:override,...(!override ? {taskFit:fallbackFit ?? {taskType:taskTypeFor(input),band:'acceptable',evidenceStatus:'provisional',reason:'no_supported_preference'}} : {})};
+}
+
+
+// r30 token saving (K, C). Each model has its own prompt cache, so changing the
+// model of a warm or running child re-reads its whole prefix uncached; effort
+// changes keep the cache on 5.5 models. See README "Token-saving strategies".
+export const ROLE_TIERS = Object.freeze({ router:'STRONG', coordinator:'BALANCED', scout:'FAST', 'quick-builder':'FAST', builder:'BALANCED',
+  'deep-debugger':'STRONG', architect:'STRONG', reviewer:'STRONG', verifier:'STRONG', maximum:'MAXIMUM' });
+const EFFORT_RANK = { minimal:0, low:1, medium:2, high:3, xhigh:4, max:5 };
+const baseModel = ref => modelReference(ref)?.split('#')[0];
+const msTime = v => typeof v === 'number' && Number.isFinite(v) && v > 0 ? (v < 1e12 ? v * 1000 : v) : undefined;
+// A same-child compaction completed and nothing has run since: the prefix is
+// rewritten anyway, so a route change costs no extra cache miss.
+export function justCompacted(record, child) {
+  if (!record || child?.active) return false;
+  if (record.state === 'awaiting_continuation' && record.compactionOutcome?.status === 'completed' && record.compactionOutcome.id === record.compactionID) return true;
+  const mid = record.midRunCompaction?.last;
+  return Boolean(mid?.status === 'completed' && child?.lastAssistantID && child.lastAssistantID === record.compactedThrough);
+}
+export function childCacheState(child, { now = Date.now(), windowMs }) {
+  if (!child) return undefined;
+  if (child.active === true) return { state:'running' };
+  const at = msTime(child.contextObservedAt);
+  if (at !== undefined && now - at >= 0 && now - at < windowMs) return { state:'warm', ageMs: now - at };
+  return undefined;
+}
+export function effortTarget({ input, config }) {
+  const role = canonicalHarnessRole(input?.agent) ?? input?.agent;
+  if (config?.roles?.[role]) return { effort: config.roles[role], basis: 'role' };
+  const tier = ROLE_TIERS[role];
+  if (tier && config?.tiers?.[tier]) return { effort: config.tiers[tier], basis: 'tier' };
+  const complexity = input?.routing?.complexity;
+  if (complexity && config?.complexity?.[complexity]) return { effort: config.complexity[complexity], basis: 'complexity' };
+  return undefined;
+}
+function applyEffortMap(result, { input, quota, config }) {
+  const EFFORT_SOURCES = new Set(['configured_role', 'pace_routine', 'routine_mechanical']);
+  if (!EFFORT_SOURCES.has(result.source) || result.modelOverride || input.model !== undefined || input.routing?.reviewIndependence === 'required') return result;
+  const target = effortTarget({ input, config });
+  const parts = modelParts(result.selected);
+  if (!target || !parts || target.effort === parts.variant) return result;
+  const base = { from: parts.variant, to: target.effort, basis: target.basis };
+  // Never lower effort for high-risk work on a complexity guess.
+  if (target.basis === 'complexity' && input.routing?.risk === 'high' && EFFORT_RANK[target.effort] < (EFFORT_RANK[parts.variant] ?? 99))
+    return { ...result, effortMap: { ...base, applied: false, reason: 'high_risk_keeps_effort' } };
+  if (taskFitContext({ input, policy: quota?.routingPolicy }).strict) return { ...result, effortMap: { ...base, applied: false, reason: 'strict_task_fit' } };
+  const next = { ...parts, variant: target.effort, ref: `${parts.providerID}/${parts.id}#${target.effort}` };
+  if (!catalogHasVariant(quota?.catalog, next)) return { ...result, effortMap: { ...base, applied: false, reason: 'variant_unavailable' } };
+  return { ...result, selected: next.ref, effortMap: { ...base, applied: true, reason: 'same_model_effort' } };
+}
+export function selectDispatchModel(args) {
+  const { input, record, child } = args;
+  const tokenSaving = args.tokenSaving ?? loadTokenSavingConfig();
+  const now = args.now ?? Date.now();
+  const log = args.log ?? logTokenSaving;
+  const continuation = Boolean(child);
+  const compacted = continuation && justCompacted(record, child);
+  const keep = tokenSaving.cacheKeep;
+  let result, rerouted = false;
+  if (compacted && keep.enabled && keep.rerouteAfterCompaction && record?.routing?.selected && !record.routing.reviewProvenance
+    && !record.modelOverride && input.model === undefined && input.routing?.reviewIndependence !== 'required' && input.continuationEffort !== 'reassess') {
+    // Pacing/demotion decisions apply again right after a compaction.
+    result = selectDispatchModelBase({ ...args, record: { ...record, routing: undefined } });
+    rerouted = true;
+    if (result.selected !== record.routing.selected) result = { ...result, postCompactionReroute: { from: record.routing.selected, to: result.selected } };
+  } else result = selectDispatchModelBase(args);
+  if (tokenSaving.effort.enabled && (!continuation || rerouted)) result = applyEffortMap(result, { input, quota: args.quota, config: tokenSaving.effort });
+  if (!continuation || !keep.enabled || compacted) return result;
+  // K: a continuation of a warm or running child keeps its current model unless
+  // the caller explicitly asked for another model or a reset.
+  if (input.model !== undefined || input.resetModel === true || input.routing?.reviewIndependence === 'required') return result;
+  const current = modelReference(child.model) ?? modelReference(record?.routing?.selected);
+  if (!current || !result.selected || baseModel(current) === baseModel(result.selected)) return result;
+  const role = canonicalHarnessRole(input.agent) ?? input.agent;
+  const parent = (tokenSaving.parentCacheTtl?.enabled && (tokenSaving.parentCacheTtl.roles ?? []).includes(role));
+  const cache = childCacheState(child, { now, windowMs: parent ? keep.parentWarmMs : keep.warmMs });
+  if (!cache) return result;
+  const cacheKeep = { kept: current, suppressed: result.selected, suppressedSource: result.source, reason: `child_${cache.state}`, ...(cache.ageMs !== undefined ? { ageMs: cache.ageMs } : {}) };
+  try { log({ event: 'model_switch_suppressed', child: child.id, agent: input.agent, ...cacheKeep }); } catch {}
+  return { ...result, selected: current, source: 'cache_keep', cacheKeep };
 }
 
 

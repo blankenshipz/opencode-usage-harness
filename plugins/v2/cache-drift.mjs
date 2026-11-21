@@ -22,12 +22,18 @@ function visiblePart(part) {
   return visible; // Do not strip similarly named keys inside opaque tool data.
 }
 export function createCacheDriftObserver({ capacity = 128, now = Date.now } = {}) {
-  const states = new Map(), compactions = new Set(), secret = crypto.randomBytes(32);
+  const states = new Map(), compactions = new Set(), maskings = new Set(), secret = crypto.randomBytes(32);
   const hash = value => crypto.createHmac('sha256', secret).update(canonical(value)).digest('hex');
   const compaction = event => {
     if (!validID(event.sessionID)) return;
     if (compactions.size >= capacity) compactions.delete(compactions.values().next().value);
     compactions.add(event.sessionID);
+  };
+  // r30: an observation-masking batch is an expected, deliberate prefix reset.
+  const masking = sessionID => {
+    if (!validID(sessionID)) return;
+    if (maskings.size >= capacity) maskings.delete(maskings.values().next().value);
+    maskings.add(sessionID);
   };
   const observe = event => {
     if (!validID(event.sessionID)) return;
@@ -43,7 +49,9 @@ export function createCacheDriftObserver({ capacity = 128, now = Date.now } = {}
         .map(m=>hash({role:m.role,content:Array.isArray(m.content)?m.content.map(visiblePart):m.content}));
       const current = { route, system, tools, early, length:event.messages.length };
       const previous = states.get(session_id); let reason='baseline',dimensions=[];
+      const masked = maskings.delete(session_id);
       if (compactions.delete(session_id)) reason='compaction_boundary';
+      else if (masked && previous) reason='masking_boundary';
       else if (previous?.route !== undefined && previous.route !== route) reason='route_changed';
       else if (previous && current.length < previous.length) reason='history_shortened';
       else if (previous) {
@@ -57,7 +65,7 @@ export function createCacheDriftObserver({ capacity = 128, now = Date.now } = {}
       return {...record,reason,dimensions,processing_ms:performance.now()-started};
     } catch { return {...record,reason:'observation_unavailable',dimensions:[],processing_ms:performance.now()-started}; }
   };
-  return { observe, compaction, clear:()=>{states.clear();compactions.clear();} };
+  return { observe, compaction, masking, clear:()=>{states.clear();compactions.clear();maskings.clear();} };
 }
 
 // Bounded best-effort queue. A full/unavailable sink never stalls model admission.

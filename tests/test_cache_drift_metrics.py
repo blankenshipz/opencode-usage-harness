@@ -18,6 +18,14 @@ class CacheMetricsTests(unittest.TestCase):
             self.assertEqual(result['processing_ms'],1.5)
             self.assertEqual(result['invalid_records'],1)
 
+    def test_masking_boundary_is_a_known_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/'events.jsonl'
+            p.write_text(json.dumps(dict(session_id='s',created_ms=50,reason='masking_boundary',dimensions=[],processing_ms=1))+'\n')
+            result=cache_drift_metrics(p,session_ids={'s'},cutoff_ms=20,now_ms=100)
+            self.assertEqual(result['reasons'],{'masking_boundary':1})
+            self.assertEqual(result['invalid_records'],0)
+
     def test_previous_segment_is_included(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'events.jsonl'

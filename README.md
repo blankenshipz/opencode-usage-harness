@@ -139,7 +139,7 @@ not added automatically. Passing, sufficient verification is a reason to stop;
 uncertainty alone is not a reason to escalate.
 
 By default, every role sharing a tier also shares its configured reasoning variant.
-There is no automatic low/medium/high effort optimizer or measured price ranking.
+Since 0.3.0, new dispatches can map routing complexity to a same-model effort variant (see [Token-saving strategies](#token-saving-strategies)); there is no measured price ranking.
 At an explicit `continuationEffort: "reassess"` request, a completed, idle,
 ordinary normal-risk `builder` implementation may move from `#high` to `#medium`
 only when the current catalog advertises the same provider and base model at
@@ -157,7 +157,9 @@ model. An explicit dispatch `model` override persists for that work key;
 `resetModel: true` clears override metadata while retaining an admitted route. A UI model change observed
 after a known harness selection is also preserved. Legacy children have no override
 provenance: their next dispatch adopts the configured role unless an explicit
-model is supplied. This does not change inference already running. Dispatch status
+model is supplied. This does not change inference already running. Since 0.3.0 a warm or running
+child keeps its current model on a non-explicit continuation (see
+[Token-saving strategies](#token-saving-strategies)). Dispatch status
 shows configured, selected and previously observed models; completed-response
 telemetry is the evidence for what actually ran.
 
@@ -440,6 +442,94 @@ OAuth/account checks and provider-specific financial admission remain separate f
 purchased credits, API-key inference or an automatic paid/provider fallback.
 Compression and context diagnostics are model-family-neutral middleware; that does
 not enable additional subscription providers automatically.
+
+## Token-saving strategies
+
+Version 0.3.0 adds four token-saving strategies. All four are on by default. They are configured in one optional file, `<state>/config/token-saving.json`, which is hot-reloaded when its mtime or size changes. Each also has an environment kill switch, read when the server starts: `HARNESS_TOKEN_SAVING=off` turns off all four. An invalid section falls back to its defaults and is logged once. Decisions are written to `<state>/telemetry/token-saving.jsonl`.
+
+```json
+{
+  "cacheKeep":          { "enabled": true, "warmMs": 300000, "parentWarmMs": 3600000, "rerouteAfterCompaction": true },
+  "parentCacheTtl":     { "enabled": true, "ttlSeconds": 3600, "roles": ["router", "coordinator"] },
+  "observationMasking": { "enabled": true, "triggerTokens": 80000, "minBatchTokens": 30000, "keepRecentTurns": 8, "minResultChars": 1200 },
+  "effort":             { "enabled": true, "roles": { "scout": "low", "quick-builder": "low" },
+                          "tiers": { "STRONG": "high", "MAXIMUM": "high" },
+                          "complexity": { "routine": "low", "complex": "high" } }
+}
+```
+
+> **Caveat: subscription accounting.** Max plans count usage limits, not dollars. Anthropic does not document how cache reads and 1h cache writes count against Max usage limits ([Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)). Users report that cache reads count heavily against Max quota ([issue summary](https://claudeissues.com/issue/75290-bug-max-5x-plan-70m-cache-read-tokens-counted-against-quota-62-day-on-a-100-mont)). The working assumption is that a cache hit is cheaper than a miss but not free, and that fewer context tokens per turn help either way. API prices are only a guide, and Batch API pricing does not apply to an OAuth subscription. Check each change against observed quota deltas (`subscription_quota`), not against these docs alone.
+
+### 1. Cache-aware continuations (never switch a warm child's model)
+
+**What it does:** Each model has its own prompt cache. Switching a model re-reads the whole prefix uncached ([Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching); [Anthropic prompt caching](https://docs.claude.com/en/docs/build-with-claude/prompt-caching)). A continuation of a child that is running, or whose last completed response is younger than `warmMs` (5 min, or `parentWarmMs` = 1 h for roles with the 1h TTL), therefore keeps its current model. This applies to tier demotion, quota pacing and policy re-selection. The suppressed switch is recorded as `routing.source = "cache_keep"` with `routing.cacheKeep {kept, suppressed, reason, ageMs}`, and logged as `model_switch_suppressed`.
+
+Model changes still apply to:
+- new dispatches;
+- a continuation right after a completed same-child compaction (`routing.postCompactionReroute`), because compaction rewrites the prefix anyway;
+- an explicit `model`, a `resetModel: true`, or a required cross-family review.
+
+Effort-only changes, such as the existing `continuationEffort: "reassess"`, keep the cache and are unaffected.
+
+**Configure:** `cacheKeep.*`. Turn it off with `HARNESS_CACHE_KEEP=off`.
+
+### 2. 1h prompt-cache TTL for router and coordinator sessions
+
+**What it does:** Parents often sit idle for 5 to 60 minutes while their workers run. With the default 5-minute TTL, every wake-up rewrites the parent's whole context.
+
+The OpenCode 2.0.30 context hook cannot set the request cache policy. However, the runtime lowers `LLM.CacheHint{ttlSeconds >= 3600}` to `cache_control: {type: "ephemeral", ttl: "1h"}`, and its `session.http.request` plugin hook receives the final Anthropic request body. For `primary` requests from roles in `parentCacheTtl.roles`, the harness rewrites the cache breakpoints the runtime already placed to `ttl: "1h"`. It keeps the same positions and the same count, so it never adds a fifth breakpoint. Workers, compaction requests and titles keep the 5-minute default. A 1h write costs 2x base input, against 1.25x for a 5m write, and reads cost 0.1x ([Anthropic prompt caching](https://docs.claude.com/en/docs/build-with-claude/prompt-caching)). It pays off only when the parent resumes within the hour. Claude Code itself uses a 1h TTL on subscription main threads and 5m for subagents ([Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)).
+
+**Fail safe:** If the hook API is missing, the body is not JSON, or the Claude subscription adapter already transformed the request (its hook must run after this one), the request is sent unchanged and the reason is logged once (`parent_cache_ttl_unsupported`). If a 400 response that mentions the TTL or `cache_control` follows a rewrite, the rewrite is turned off for the rest of the process (`parent_cache_ttl_disabled`). Successful rewrites are logged once per session (`parent_cache_ttl_applied`).
+
+**Configure:** `parentCacheTtl.*`. `ttlSeconds: 300` or `HARNESS_PARENT_CACHE_TTL=off` turns it off.
+
+### 3. Batched observation masking
+
+**What it does:** Once the prepared context of a harness session is estimated (at about 4 characters per token) above `triggerTokens`, old tool *results* are replaced in batches. A result is replaced only if it comes before the last `keepRecentTurns` assistant turns and is at least `minResultChars` long. The placeholder reads:
+
+`[harness cleared old tool result: <tool> call <args digest>; N chars. Original: native read <path> offset=1 limit=3 …]`
+
+Tool calls are never changed. Control records (`task_*`, `check_*`, `large_file_*`, `review_verdict` and others) and error, image and media results stay verbatim.
+
+Each original is saved first, in the same chunked format, under `<state>/tool-output-store/masked/`. A result that already points at a compression original reuses that original. A result whose original cannot be saved is not masked.
+
+A batch is applied only when it frees at least `minBatchTokens`. The masked set is persisted per session in `<state>/observation-masking/` and re-applied byte-identically on every later request, so the cached prefix changes only once per batch. `cache-drift` records the batch as an expected `masking_boundary` reset. Native agents are not masked.
+
+**Evidence:**
+- Anthropic's tool-result clearing (`clear_tool_uses`) cut tokens by 84% in a 100-turn evaluation ([context management](https://www.anthropic.com/news/context-management), [context editing docs](https://docs.claude.com/en/docs/build-with-claude/context-editing)).
+- Simple observation masking matched LLM summarization's solve rate at about 52% lower cost ([JetBrains Research, arXiv 2508.21433](https://arxiv.org/abs/2508.21433)).
+- Clearing on every turn would break the cache each time ([write-up](https://abhimanyuaryan.github.io/ai-bytes/2026-04-11-why-i-dont-like-opencode)), which is why masking works in large batches.
+
+**Risk:** A model may redo work it can no longer see. Watch re-reads and `native_original_retrievals`. Reading an original uses ordinary native read permissions: the store is outside the workspace, so the read may ask for permission.
+
+**Configure:** `observationMasking.*`. Turn it off with `HARNESS_OBSERVATION_MASKING=off`.
+
+### 4. Reasoning effort from routing complexity
+
+**What it does:** On a *new* dispatch that uses the role's configured model (or a pacing demotion of it), the harness picks the reasoning variant on the same model:
+- by role: scout and quick-builder use `low`;
+- otherwise by tier: STRONG and MAXIMUM use `high`;
+- otherwise by `routing.complexity`: `routine` uses `low` and `complex` uses `high`. `standard` keeps the configured effort.
+
+The variant changes only when the current catalog lists it for that model. Complexity never lowers effort for `risk: "high"` work. The variant is not changed for:
+- explicit models;
+- routing-policy candidates;
+- required reviews;
+- strict task-fit floors;
+- continuations.
+
+The decision is recorded in `routing.effortMap {from, to, basis, applied, reason}`. Anthropic calls effort "your primary control for token usage" ([effort docs](https://platform.claude.com/docs/en/build-with-claude/effort); [Claude blog on effort in Claude Code](https://www.claude.com/blog/claude-model-and-effort-level-in-claude-code)). On the 5.5 models, changing effort keeps the cache and changing the model does not ([Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)).
+
+**Configure:** `effort.roles`, `effort.tiers` and `effort.complexity` (values: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Turn it off with `HARNESS_EFFORT_MAP=off`.
+
+### Measuring each change
+
+Use the existing telemetry over comparable work, before and after, and compare it with `subscription_quota` deltas:
+
+- **K:** Count `model_switch_suppressed` in `telemetry/token-saving.jsonl` and `cache_keep` routing sources in `task_dispatch_status`. In `harness-metrics --days N` per root, cache-read should rise and cache-write should fall on continuations; the `route_changed` reasons in its cache observation should drop.
+- **B:** `parent_cache_ttl_applied` and `parent_cache_ttl_unsupported` events. For router and coordinator sessions (`harness-metrics --session <root>`), compare cache-write and cache-read on the first step after an idle gap of 5 to 60 minutes. A hit shows up as a large cache-read and a small cache-write. The extra cost of 1h writes shows up as larger cache-write totals on parents that never resume.
+- **A:** `observation_mask_batch` events (`tokensBefore`, `tokensCleared`), `masking_boundary` counts in the cache observation, uncached-input and cache-read totals per root, and the number of compactions. Watch `native_original_retrievals` and repeated reads of the same files as signs of loss.
+- **C:** `routing.effortMap` in dispatch status, the `reasoning` and `output` token totals per role in `harness-metrics`, plus acceptance, review and recheck failure rates, to catch quality regressions on work classified as `routine`.
 
 ## What works today
 
