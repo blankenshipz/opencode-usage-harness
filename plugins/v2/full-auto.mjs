@@ -185,7 +185,6 @@ const GARAGE_SSH_OPTIONS = new Set(['batchmode', 'connecttimeout', 'serveralivei
 const GARAGE_SSH_FLAGS = new Set('46CnqTtvx'.split(''));
 const GARAGE_READERS = new Set(['cat', 'less', 'grep', 'stat', 'readlink']);
 const GARAGE_PIPE_FILTERS = new Set(['cat', 'less', 'grep', 'cut', 'head', 'tail', 'wc']);
-const LESS_WRITES = /^(-[a-zA-Z]*[oO]|--log-file|--LOG-FILE)/;
 const isGarageHost = host => typeof host === 'string' && (host === GARAGE_HOST || /^[A-Za-z0-9._-]+@garage-server$/.test(host));
 
 // Parses `ssh [opts] host [command...]` (args: the words after ssh). plain: every option is one
@@ -221,15 +220,21 @@ function sshRemoteWords(words) {
 const quietRedirects = segment => segment.redirects.every(redirect => !redirect.heredoc && !redirect.herestring
   && (!redirect.file || (redirect.target === '/dev/null' && redirect.op !== '<')));
 
-const hasSubstitution = (command, segments) => /\$\(|`|<\(|>\(/.test(command) || segments.some(segment => segment.sub);
-// Segment n's output reaches the caller's terminal only: no file redirects (except /dev/null),
-// no heredoc/herestring input, and any pipe after it runs read-only text filters only.
+// Shell grammar that can carry a redirect or pipe in another segment ({ ... } > f, while ...; done | x).
+const SHELL_KEYWORD = /^(\{|\}|!|do|done|then|fi|else|elif|if|while|until|for|select|case|esac|function|coproc|\[\[|\]\])$|\(\)$/;
+// The command as a whole is simple enough to judge the exemption: one line, no command or process
+// substitution, no shell keywords/grouping, and no file redirect anywhere (`exec > f; ...`)
+// except to /dev/null.
+const garageSimple = (command, segments) => !/[\r\n]/.test(command) && !/\$\(|`|<\(|>\(/.test(command)
+  && segments.every(segment => !segment.sub && !SHELL_KEYWORD.test(segment.words[0] ?? '') && quietRedirects(segment));
+// less is a reader/filter only without options or +commands (--log=, -o, +!cmd).
+const plainLess = words => words[0] !== 'less' || words.slice(1).every(word => !word.startsWith('-') && !word.startsWith('+'));
+// Segment n's output reaches the caller's terminal only: any pipe after it runs read-only text
+// filters only (redirects are checked for the whole command by garageSimple).
 function outputStaysQuiet(segments, n) {
-  if (!quietRedirects(segments[n])) return false;
   for (let m = n + 1; m < segments.length && ['|', '|&'].includes(segments[m].prevSep); m++) {
     const next = segments[m];
-    if (!GARAGE_PIPE_FILTERS.has(next.words[0]) || !quietRedirects(next)) return false;
-    if (next.words[0] === 'less' && next.words.some(word => LESS_WRITES.test(word))) return false;
+    if (!GARAGE_PIPE_FILTERS.has(next.words[0]) || !plainLess(next.words)) return false;
   }
   return true;
 }
@@ -238,7 +243,7 @@ function outputStaysQuiet(segments, n) {
 // (not redirected to a file, not piped into anything but text filters, not inside a substitution).
 function garageSshSegment(command, segments, n) {
   const words = segments[n].words;
-  if (hasSubstitution(command, segments) || !/(^|\/)ssh$/.test(words[0] ?? '')) return false;
+  if (!garageSimple(command, segments) || !/(^|\/)ssh$/.test(words[0] ?? '')) return false;
   const inv = sshInvocation(words.slice(1));
   return inv.plain && isGarageHost(inv.host) && outputStaysQuiet(segments, n);
 }
@@ -246,11 +251,10 @@ function garageSshSegment(command, segments, n) {
 // Word indexes (per segment) of the exempted .env read in a garage-server remote command.
 export function garageEnvReads(command, segments = scanShell(command).segments) {
   const skips = new Map();
-  if (hasSubstitution(command, segments)) return skips;
+  if (!garageSimple(command, segments)) return skips;
   segments.forEach((segment, n) => {
     const { words } = segment;
-    if (!GARAGE_READERS.has(words[0]) || !outputStaysQuiet(segments, n)) return;
-    if (words[0] === 'less' && words.some(word => LESS_WRITES.test(word))) return;
+    if (!GARAGE_READERS.has(words[0]) || !plainLess(words) || !outputStaysQuiet(segments, n)) return;
     const indexes = new Set();
     words.forEach((word, k) => { if (k > 0 && word === GARAGE_ENV_FILE) indexes.add(k); });
     if (indexes.size) skips.set(n, indexes);
@@ -259,24 +263,53 @@ export function garageEnvReads(command, segments = scanShell(command).segments) 
 }
 
 // The wncscanner-stack unit may be read (systemctl cat/status/show/is-*, or a read of its unit
-// file), never changed without asking, on any host: systemctl verbs other than the read ones,
-// redirects into the unit file or drop-in, and any other command naming the unit file path.
-const GARAGE_UNIT_WORD = /^wncscanner-stack(\.service|@|$)/;
+// file), never changed without asking, on any host: systemctl/service verbs other than the read
+// ones (also for globs/braces naming wncscanner), redirects into the unit file or drop-in, and
+// any other command naming the unit file.
+const GARAGE_UNIT_WORD = word => /^wncscanner-stack(\.service|@|$)/.test(word) || (/wncscanner/.test(word) && /[*?[{]/.test(word));
 const GARAGE_UNIT_FILE = /(^|\/)wncscanner-stack(@[^/]*)?\.service(\.d)?(\/|$)/;
 const UNIT_READ_VERBS = new Set(['cat', 'status', 'show', 'is-active', 'is-enabled', 'is-failed', 'list-units', 'list-unit-files', 'list-dependencies']);
-const UNIT_FILE_READERS = new Set(['cat', 'less', 'grep', 'stat', 'readlink', 'ls', 'head', 'tail', 'wc', 'diff', 'sha256sum', 'md5sum', 'file']);
+const UNIT_CHANGE_VERBS = new Set(['start', 'stop', 'restart', 'reload', 'try-restart', 'reload-or-restart', 'try-reload-or-restart', 'condrestart',
+  'force-reload', 'enable', 'disable', 'reenable', 'preset', 'mask', 'unmask', 'link', 'revert', 'edit', 'kill', 'clean', 'freeze', 'thaw',
+  'set-property', 'isolate', 'daemon-reload', 'daemon-reexec', 'add-wants', 'add-requires', 'bind', 'mount-image', 'reset-failed']);
+// systemctl options whose value is a separate word (`-n 50`, `-o cat`, `-p show`).
+const SYSTEMCTL_VALUE_SHORT = /^-[a-zA-Z]*[tpPsnoHM]$/;
+const SYSTEMCTL_VALUE_LONG = new Set(['--type', '--property', '--signal', '--lines', '--output', '--host', '--machine', '--kill-whom', '--kill-value',
+  '--state', '--job-mode', '--root', '--image', '--what', '--timestamp', '--check-inhibitors', '--when', '--preset-mode', '--boot-loader-menu', '--boot-loader-entry', '--reboot-argument', '--drop-in', '--message']);
+const UNIT_FILE_READERS = new Set(['cat', 'less', 'grep', 'stat', 'readlink', 'ls', 'head', 'tail', 'wc', 'sha256sum', 'md5sum', 'journalctl']);
+function systemctlVerb(args) {
+  for (let k = 0; k < args.length; k++) {
+    const arg = args[k];
+    if (arg === '--') return args[k + 1];
+    if (SYSTEMCTL_VALUE_SHORT.test(arg) || SYSTEMCTL_VALUE_LONG.has(arg)) { k++; continue; }
+    if (!arg.startsWith('-')) return arg;
+  }
+  return undefined;
+}
 // skip: word indexes checked elsewhere (an ssh segment's remote words).
 export function garageUnitDanger(segment, skip = sshRemoteWords(segment.words) ?? new Set()) {
   const { words, redirects } = segment;
   for (const redirect of redirects) {
     if (redirect.file && redirect.op !== '<' && GARAGE_UNIT_FILE.test(redirect.target ?? '')) return `redirect ${redirect.op} writes the wncscanner-stack unit`;
   }
-  const s = words.findIndex(word => /(^|\/)systemctl$/.test(word));
-  if (s >= 0 && !skip.has(s) && words.slice(s + 1).some(word => GARAGE_UNIT_WORD.test(word))) {
-    const verb = words.slice(s + 1).find(word => !word.startsWith('-'));
-    if (!UNIT_READ_VERBS.has(verb)) return `systemctl ${verb} changes the wncscanner-stack service`;
+  const s = words.findIndex(word => /(^|\/)(systemctl|service)$/.test(word));
+  if (s >= 0 && !skip.has(s)) {
+    const args = words.slice(s + 1);
+    if (args.some(word => GARAGE_UNIT_WORD(word) || GARAGE_UNIT_FILE.test(word))) {
+      if (/service$/.test(words[s]) && !/(^|\/)systemctl$/.test(words[s])) {
+        const verb = args.find(word => !word.startsWith('-') && !GARAGE_UNIT_WORD(word) && !GARAGE_UNIT_FILE.test(word));
+        if (verb !== 'status') return `service ${verb} changes the wncscanner-stack service`;
+      } else {
+        const verb = systemctlVerb(args);
+        if (!UNIT_READ_VERBS.has(verb) || args.some(word => UNIT_CHANGE_VERBS.has(word)))
+          return `systemctl ${verb} changes the wncscanner-stack service`;
+        // A read only when systemctl is the command (behind sudo/simple wrappers at most), so
+        // `cp u .../wncscanner-stack.service systemctl status x` still gets the file check below.
+        if (words.slice(0, s).every(word => WRAPPER_COMMAND.test(word) || word.startsWith('-') || /^\d+(\.\d+)?[smhd]?$/.test(word))) return undefined;
+      }
+    }
   }
-  if (words.some((word, k) => !skip.has(k) && word.includes('/') && GARAGE_UNIT_FILE.test(word)) && !UNIT_FILE_READERS.has(words[0]))
+  if (words.some((word, k) => !skip.has(k) && GARAGE_UNIT_FILE.test(word)) && !UNIT_FILE_READERS.has(words[0]))
     return `${words[0]} on the wncscanner-stack unit file is not a read`;
   return undefined;
 }

@@ -179,25 +179,33 @@ and `ssh` remote command):
   ssh), its only options are `-o BatchMode|ConnectTimeout|ServerAliveInterval|ServerAliveCountMax|
   ConnectionAttempts|LogLevel`, `-l user` and the flags `-4 -6 -C -n -q -T -t -v -x` (`-F`, `-J`,
   `-p`, `-i`, `-o HostName=...` ask); the read is a plain segment of the remote command (no `sudo`
-  or other wrapper, not a heredoc body); neither side has a command or process substitution
-  (`$(..)`, backticks, `<(..)`); neither the read nor the local ssh redirects to a file other
-  than `/dev/null`, and a pipe after either runs only `cat`, `less`, `grep`, `cut`, `head`, `tail`
-  or `wc` (`less -o/-O` asks). The path must match exactly (`/opt/wncscanner-docker/.env.prod`,
-  `../` forms or another `.env` ask). Other secret paths in the same command still ask, and so do
+  or other wrapper, not a heredoc body); both the local command and the remote command are one
+  line, with no command or process substitution (`$(..)`, backticks, `<(..)`), no shell keywords
+  or grouping (`{ }`, `if`, `while ... done`, `f()`) and no file redirect anywhere other than to
+  `/dev/null` (so `exec > f; ...` asks); a pipe after the read or after the local ssh runs only
+  `cat`, `less`, `grep`, `cut`, `head`, `tail` or `wc`; and `less` has no options or `+` commands. The path must match exactly (`/opt/wncscanner-docker/.env.prod`,
+  `../` forms or another `.env` ask). Other secret-looking paths (as defined above; e.g.
+  `/etc/shadow` is not one, as before) in the same command still ask, and so do
   `tee`, `sed -i`, `cp`, `mv`, `rm`, `chmod`, editors and redirects involving the file, `ssh
   other-host`, `scp`/`rsync` of it, and a local `cat /opt/wncscanner-docker/.env`. The exemption is
   full-auto only (the non-full-auto guard and `shellSecretReasons` are unchanged);
-- the wncscanner-stack service (0.3.2, any host, local or over ssh): `systemctl` with
-  `wncscanner-stack`/`wncscanner-stack.service` asks unless the verb is a read (`cat`, `status`,
-  `show`, `is-active`, `is-enabled`, `is-failed`, `list-units`, `list-unit-files`,
-  `list-dependencies`; flags such as `--no-pager` are fine), and a path to its unit file or
-  drop-in (`.../wncscanner-stack.service`, `.../wncscanner-stack.service.d/...`) asks unless the
-  command is a reader (`cat`, `less`, `grep`, `stat`, `readlink`, `ls`, `head`, `tail`, `wc`,
-  `diff`, `sha256sum`, `md5sum`, `file`) and it is not a redirect target. Before 0.3.2 full-auto
+- the wncscanner-stack service (0.3.2, any host, local or over ssh): `systemctl` naming
+  `wncscanner-stack`, `wncscanner-stack.service`, its unit file, or a glob/brace word containing
+  `wncscanner` asks unless the verb is a read (`cat`, `status`, `show`, `is-active`,
+  `is-enabled`, `is-failed`, `list-units`, `list-unit-files`, `list-dependencies`; option values
+  such as `-n 50`, `-p ActiveState`, `-o cat` are skipped when finding the verb, and any change
+  verb anywhere in the arguments asks); `service wncscanner-stack <verb>` asks unless the verb is
+  `status`; and the unit file or drop-in (`wncscanner-stack.service`, with or without a
+  directory, `.../wncscanner-stack.service.d/...`) asks unless the command is a reader (`cat`,
+  `less`, `grep`, `stat`, `readlink`, `ls`, `head`, `tail`, `wc`, `sha256sum`, `md5sum`,
+  `journalctl`) and it is not a redirect target. A unit named through a variable
+  (`U=wncscanner-stack; systemctl restart $U`) is not caught (commands are judged lexically). Before 0.3.2 full-auto
   allowed `ssh garage-server 'systemctl restart wncscanner-stack'`; it now asks. Other units are
   unchanged;
 - `curl … | bash` (a shell reading piped input), `ssh -o ProxyCommand|LocalCommand`;
-- since 0.3.2, backticks inside a quoted word (`echo "`cat .env`"`) are scanned like `$(...)`.
+- since 0.3.2, backticks inside a quoted word (`echo "`cat .env`"`) are scanned like `$(...)`
+  (also inside single quotes, where nothing runs; that errs toward asking), and a line break after
+  `|`, `|&`, `&&` or `||` keeps the operator (`curl x |` + newline + `bash` asks).
 
 Known gaps: script files (`bash deploy.sh`, `python x.py`, `make`) and interpreters (`python -c`,
 `node -e`) run unseen; remote paths are judged lexically; anything not listed above is allowed.

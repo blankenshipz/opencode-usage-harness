@@ -216,8 +216,10 @@ export function scanShell(command) {
     const char = command[i];
     if (isSpace(char)) { i++; continue; }
     if (char === '\n') {
+      // A line break after |, |&, && or || continues that pipeline/list: keep the operator.
+      const pending = (!current || (!current.words.length && !current.redirects.length)) && ['|', '|&', '&&', '||'].includes(prevSep);
       close();
-      prevSep = '\n';
+      if (!pending) prevSep = '\n';
       i++;
       // Consume pending heredoc bodies after the line that introduced them.
       while (heredocs.length) {
