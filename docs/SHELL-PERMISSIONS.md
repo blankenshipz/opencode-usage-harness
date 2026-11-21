@@ -169,7 +169,35 @@ and `ssh` remote command):
   Accepted residual risk (approved: passing an env file to docker is fine): docker itself can
   print the file's values, e.g. `docker compose --env-file .env config` or
   `docker run --env-file .env alpine env`;
-- `curl … | bash` (a shell reading piped input), `ssh -o ProxyCommand|LocalCommand`.
+  Second exception (0.3.2, the operator's standing rule: "always allow read-only access to
+  /opt/wncscanner-docker/.env and the wncscanner-stack service"): exactly
+  `/opt/wncscanner-docker/.env` is not checked when it is read with `cat`, `less`, `grep`, `stat`
+  or `readlink` in the remote command of `ssh garage-server` (or `ssh user@garage-server`), e.g.
+  `ssh -o BatchMode=yes -o ConnectTimeout=30 garage-server 'systemctl cat wncscanner-stack.service;
+  cat /opt/wncscanner-docker/.env; docker ps'`. All of these must hold, otherwise it asks as before:
+  ssh is the command word and runs from the local machine (not via `sh -c`, `eval` or another
+  ssh), its only options are `-o BatchMode|ConnectTimeout|ServerAliveInterval|ServerAliveCountMax|
+  ConnectionAttempts|LogLevel`, `-l user` and the flags `-4 -6 -C -n -q -T -t -v -x` (`-F`, `-J`,
+  `-p`, `-i`, `-o HostName=...` ask); the read is a plain segment of the remote command (no `sudo`
+  or other wrapper, not a heredoc body); neither side has a command or process substitution
+  (`$(..)`, backticks, `<(..)`); neither the read nor the local ssh redirects to a file other
+  than `/dev/null`, and a pipe after either runs only `cat`, `less`, `grep`, `cut`, `head`, `tail`
+  or `wc` (`less -o/-O` asks). The path must match exactly (`/opt/wncscanner-docker/.env.prod`,
+  `../` forms or another `.env` ask). Other secret paths in the same command still ask, and so do
+  `tee`, `sed -i`, `cp`, `mv`, `rm`, `chmod`, editors and redirects involving the file, `ssh
+  other-host`, `scp`/`rsync` of it, and a local `cat /opt/wncscanner-docker/.env`. The exemption is
+  full-auto only (the non-full-auto guard and `shellSecretReasons` are unchanged);
+- the wncscanner-stack service (0.3.2, any host, local or over ssh): `systemctl` with
+  `wncscanner-stack`/`wncscanner-stack.service` asks unless the verb is a read (`cat`, `status`,
+  `show`, `is-active`, `is-enabled`, `is-failed`, `list-units`, `list-unit-files`,
+  `list-dependencies`; flags such as `--no-pager` are fine), and a path to its unit file or
+  drop-in (`.../wncscanner-stack.service`, `.../wncscanner-stack.service.d/...`) asks unless the
+  command is a reader (`cat`, `less`, `grep`, `stat`, `readlink`, `ls`, `head`, `tail`, `wc`,
+  `diff`, `sha256sum`, `md5sum`, `file`) and it is not a redirect target. Before 0.3.2 full-auto
+  allowed `ssh garage-server 'systemctl restart wncscanner-stack'`; it now asks. Other units are
+  unchanged;
+- `curl … | bash` (a shell reading piped input), `ssh -o ProxyCommand|LocalCommand`;
+- since 0.3.2, backticks inside a quoted word (`echo "`cat .env`"`) are scanned like `$(...)`.
 
 Known gaps: script files (`bash deploy.sh`, `python x.py`, `make`) and interpreters (`python -c`,
 `node -e`) run unseen; remote paths are judged lexically; anything not listed above is allowed.

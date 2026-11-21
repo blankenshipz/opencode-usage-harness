@@ -280,6 +280,11 @@ export function scanShell(command) {
       nested = true;
       for (const inner of scanShell(match[1]).segments) segments.push({ ...inner, sub: true });
     }
+    // Backticks inside a quoted word ("x: `cat .env`") run too; bare ones split the line above.
+    for (const match of command.slice(i, word.end).matchAll(/`([^`]*)`/g)) {
+      nested = true;
+      for (const inner of scanShell(match[1]).segments) segments.push({ ...inner, sub: true });
+    }
     i = word.end;
   }
   close();

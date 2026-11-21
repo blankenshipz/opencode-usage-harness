@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2 — garage-server read-only .env / wncscanner-stack full-auto exemption
+
+- **Standing permission rule** (operator: "always allow read-only access to /opt/wncscanner-docker/.env and the wncscanner-stack service"), implemented as a full-auto exemption in `plugins/v2/full-auto.mjs`, like the docker `--env-file` one, not as an OpenCode "always" pattern. Under full-auto, `ssh garage-server` (or `user@garage-server`, plain options only) may read exactly `/opt/wncscanner-docker/.env` with `cat`/`less`/`grep`/`stat`/`readlink`, alongside other read-only checks in the same remote command. Other secret files, writes/redirects/copies/edits of the file, substitutions, output redirected or piped into anything but text filters, other hosts, `-F/-J/-p/-o HostName`, `sudo`, nested shells and local reads still ask. See `docs/SHELL-PERMISSIONS.md`.
+- **wncscanner-stack changes ask** (tightening, all hosts): `systemctl` verbs other than `cat/status/show/is-*/list-*` on `wncscanner-stack[.service]`, and writes to its unit file or drop-ins. Full-auto allowed `ssh garage-server 'systemctl restart wncscanner-stack'` before 0.3.2.
+- **Shell scanner:** backticks inside a quoted word (`curl -H "x: `cat .env`"`) are now scanned as nested commands, like `$(...)`. Before, full-auto allowed such reads.
+- Tests: new cases in `tests/v2-full-auto.test.mjs` (the example command, still-ask cases, full-auto only, docker `--env-file` unchanged).
+
 ## 0.3.1 — masking telemetry and pruning, TTL breaker gate, pending-file cleanup, OAuth revoked fix
 
 - **Observation-masking telemetry** (`observation-masking.mjs`): `observation_mask_batch` now records `charsRemoved`, `tokensRemoved` (`tokensCleared` is kept), `tokensBefore` and the thresholds in effect (`triggerTokens`, `minBatchTokens`, `keepRecentTurns`). `observation_mask_stopped` is logged once per session when masking stops at the 5000-id cap (`id_cap`) or the 256 MiB store cap (`store_cap`).

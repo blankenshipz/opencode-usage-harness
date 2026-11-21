@@ -17,6 +17,9 @@
 // partitioners, /dev block devices), secret-looking paths (except the value of docker's
 // --env-file), truncating redirects outside the project, and the same inside sh/bash -c, eval, heredocs fed to a shell, and ssh remote commands
 // (remote deletes of /, top-level dirs or the remote home). Deny rules are never touched.
+// Standing exemption (0.3.2, operator: "always allow read-only access to /opt/wncscanner-docker/.env and
+// the wncscanner-stack service"): see garageEnvReads / garageUnitDanger below. Changes to the
+// wncscanner-stack unit (systemctl restart/stop/edit/..., writes to its unit file) always ask.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -141,9 +144,11 @@ export function dockerEnvFileValues(words) {
 // Secret-path reasons for one scanned segment: file arguments (docker --env-file values excepted),
 // redirect targets, and quoted literals in heredoc/herestring bodies (python - <<EOF open('.env')).
 // The docker --env-file exemption is part of the full-auto profile only (envFiles:false elsewhere).
-function segmentSecretReasons(segment, text, { envFiles = true } = {}) {
+function segmentSecretReasons(segment, text, { envFiles = true, skip } = {}) {
   const reasons = [];
-  const secret = secretWords(segment.words, envFiles ? dockerEnvFileValues(segment.words) : new Set())[0];
+  const skipped = envFiles ? dockerEnvFileValues(segment.words) : new Set();
+  for (const k of skip ?? []) skipped.add(k);
+  const secret = secretWords(segment.words, skipped)[0];
   if (secret !== undefined) reasons.push(`${text}: names secret-looking path ${JSON.stringify(secret)}`);
   for (const redirect of segment.redirects) {
     if (redirect.file && isSecretPath(redirect.target)) reasons.push(`${text}: redirect to secret-looking path ${JSON.stringify(redirect.target)}`);
@@ -165,6 +170,115 @@ export function shellSecretReasons(command, { depth = 0, envFiles = true } = {})
   }
   for (const inner of nested) reasons.push(...shellSecretReasons(inner.command, { depth: depth + 1, envFiles }).map(why => `nested ${why}`));
   return [...new Set(reasons)];
+}
+
+// The operator's standing rule (0.3.2): under full-auto only, `ssh garage-server` (or user@garage-server,
+// with only the plain options below) may read exactly /opt/wncscanner-docker/.env with cat, less,
+// grep, stat or readlink. Everything else about the command is still checked: other secret paths,
+// redirects, writes, deletes, pushes. The exempted read must be a plain segment of the ssh remote
+// command itself (no sudo/wrappers, no nested sh -c, no command or process substitution anywhere
+// in the remote command, no file redirects except to /dev/null) whose output goes to the caller or
+// through a pipe of read-only text filters only.
+export const GARAGE_HOST = 'garage-server';
+export const GARAGE_ENV_FILE = '/opt/wncscanner-docker/.env';
+const GARAGE_SSH_OPTIONS = new Set(['batchmode', 'connecttimeout', 'serveraliveinterval', 'serveralivecountmax', 'connectionattempts', 'loglevel']);
+const GARAGE_SSH_FLAGS = new Set('46CnqTtvx'.split(''));
+const GARAGE_READERS = new Set(['cat', 'less', 'grep', 'stat', 'readlink']);
+const GARAGE_PIPE_FILTERS = new Set(['cat', 'less', 'grep', 'cut', 'head', 'tail', 'wc']);
+const LESS_WRITES = /^(-[a-zA-Z]*[oO]|--log-file|--LOG-FILE)/;
+const isGarageHost = host => typeof host === 'string' && (host === GARAGE_HOST || /^[A-Za-z0-9._-]+@garage-server$/.test(host));
+
+// Parses `ssh [opts] host [command...]` (args: the words after ssh). plain: every option is one
+// of the harmless ones above (`-o HostName=x`, `-F cfg`, `-J jump`, `-p` ... are not).
+function sshInvocation(args) {
+  const localCommands = [];
+  let i = 0, plain = true;
+  for (; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') { i++; break; }
+    if (!arg.startsWith('-')) break;
+    for (let j = 1; j < arg.length; j++) {
+      if (!SSH_ARG_OPTIONS.has(arg[j])) { if (!GARAGE_SSH_FLAGS.has(arg[j])) plain = false; continue; }
+      const value = arg.slice(j + 1) || args[++i] || '';
+      if (arg[j] === 'o' && /^(proxycommand|localcommand|permitlocalcommand|knownhostscommand)/i.test(value)) localCommands.push(value);
+      if (!(arg[j] === 'o' && GARAGE_SSH_OPTIONS.has(value.split(/[=\s]/)[0].toLowerCase())) && arg[j] !== 'l') plain = false;
+      break;
+    }
+  }
+  return { host: args[i], hostIndex: i, remote: args.slice(i + 1), localCommands, plain };
+}
+
+// `ssh [opts] host <remote words>` as the segment's command word: indexes of the remote words,
+// which are re-checked as the remote command.
+function sshRemoteWords(words) {
+  if (!/(^|\/)ssh$/.test(words[0] ?? '')) return undefined;
+  const inv = sshInvocation(words.slice(1));
+  const skip = new Set();
+  for (let k = inv.hostIndex + 2; k < words.length; k++) skip.add(k);
+  return skip;
+}
+
+const quietRedirects = segment => segment.redirects.every(redirect => !redirect.heredoc && !redirect.herestring
+  && (!redirect.file || (redirect.target === '/dev/null' && redirect.op !== '<')));
+
+const hasSubstitution = (command, segments) => /\$\(|`|<\(|>\(/.test(command) || segments.some(segment => segment.sub);
+// Segment n's output reaches the caller's terminal only: no file redirects (except /dev/null),
+// no heredoc/herestring input, and any pipe after it runs read-only text filters only.
+function outputStaysQuiet(segments, n) {
+  if (!quietRedirects(segments[n])) return false;
+  for (let m = n + 1; m < segments.length && ['|', '|&'].includes(segments[m].prevSep); m++) {
+    const next = segments[m];
+    if (!GARAGE_PIPE_FILTERS.has(next.words[0]) || !quietRedirects(next)) return false;
+    if (next.words[0] === 'less' && next.words.some(word => LESS_WRITES.test(word))) return false;
+  }
+  return true;
+}
+
+// Local side: segment n is `ssh [plain opts] garage-server ...` whose output stays on the terminal
+// (not redirected to a file, not piped into anything but text filters, not inside a substitution).
+function garageSshSegment(command, segments, n) {
+  const words = segments[n].words;
+  if (hasSubstitution(command, segments) || !/(^|\/)ssh$/.test(words[0] ?? '')) return false;
+  const inv = sshInvocation(words.slice(1));
+  return inv.plain && isGarageHost(inv.host) && outputStaysQuiet(segments, n);
+}
+
+// Word indexes (per segment) of the exempted .env read in a garage-server remote command.
+export function garageEnvReads(command, segments = scanShell(command).segments) {
+  const skips = new Map();
+  if (hasSubstitution(command, segments)) return skips;
+  segments.forEach((segment, n) => {
+    const { words } = segment;
+    if (!GARAGE_READERS.has(words[0]) || !outputStaysQuiet(segments, n)) return;
+    if (words[0] === 'less' && words.some(word => LESS_WRITES.test(word))) return;
+    const indexes = new Set();
+    words.forEach((word, k) => { if (k > 0 && word === GARAGE_ENV_FILE) indexes.add(k); });
+    if (indexes.size) skips.set(n, indexes);
+  });
+  return skips;
+}
+
+// The wncscanner-stack unit may be read (systemctl cat/status/show/is-*, or a read of its unit
+// file), never changed without asking, on any host: systemctl verbs other than the read ones,
+// redirects into the unit file or drop-in, and any other command naming the unit file path.
+const GARAGE_UNIT_WORD = /^wncscanner-stack(\.service|@|$)/;
+const GARAGE_UNIT_FILE = /(^|\/)wncscanner-stack(@[^/]*)?\.service(\.d)?(\/|$)/;
+const UNIT_READ_VERBS = new Set(['cat', 'status', 'show', 'is-active', 'is-enabled', 'is-failed', 'list-units', 'list-unit-files', 'list-dependencies']);
+const UNIT_FILE_READERS = new Set(['cat', 'less', 'grep', 'stat', 'readlink', 'ls', 'head', 'tail', 'wc', 'diff', 'sha256sum', 'md5sum', 'file']);
+// skip: word indexes checked elsewhere (an ssh segment's remote words).
+export function garageUnitDanger(segment, skip = sshRemoteWords(segment.words) ?? new Set()) {
+  const { words, redirects } = segment;
+  for (const redirect of redirects) {
+    if (redirect.file && redirect.op !== '<' && GARAGE_UNIT_FILE.test(redirect.target ?? '')) return `redirect ${redirect.op} writes the wncscanner-stack unit`;
+  }
+  const s = words.findIndex(word => /(^|\/)systemctl$/.test(word));
+  if (s >= 0 && !skip.has(s) && words.slice(s + 1).some(word => GARAGE_UNIT_WORD.test(word))) {
+    const verb = words.slice(s + 1).find(word => !word.startsWith('-'));
+    if (!UNIT_READ_VERBS.has(verb)) return `systemctl ${verb} changes the wncscanner-stack service`;
+  }
+  if (words.some((word, k) => !skip.has(k) && word.includes('/') && GARAGE_UNIT_FILE.test(word)) && !UNIT_FILE_READERS.has(words[0]))
+    return `${words[0]} on the wncscanner-stack unit file is not a read`;
+  return undefined;
 }
 
 const DISK_COMMANDS = /^(dd|mkfs(\..+)?|mke2fs|mkswap|shred|wipefs|fdisk|sfdisk|cfdisk|gdisk|sgdisk|parted|blkdiscard|hdparm|badblocks)$/;
@@ -296,7 +410,8 @@ function rsyncDanger(words, ctx, nested) {
 
 // Collects command strings that run elsewhere: sh/bash -c, eval, heredocs/here-strings fed to a
 // shell or ssh, ssh remote commands. Returns reasons for inputs the guard cannot see.
-function nestedCommands(segment, nested, ctx) {
+// garageOk: segment is a local ssh to garage-server whose output stays quiet (garageSshSegment).
+function nestedCommands(segment, nested, ctx, { garageOk = false } = {}) {
   const { words, redirects } = segment;
   const reasons = [];
   const input = redirects.find(redirect => redirect.heredoc || redirect.herestring);
@@ -312,22 +427,13 @@ function nestedCommands(segment, nested, ctx) {
     } else if (word === 'eval' && k === 0) {
       nested.push({ command: words.slice(k + 1).join(' '), remote: ctx.remote });
     } else if (/(^|\/)ssh$/.test(word)) {
-      const args = words.slice(k + 1);
-      let i = 0;
-      for (; i < args.length; i++) {
-        const arg = args[i];
-        if (arg === '--') { i++; break; }
-        if (!arg.startsWith('-')) break;
-        for (let j = 1; j < arg.length; j++) {
-          if (!SSH_ARG_OPTIONS.has(arg[j])) continue;
-          const value = arg.slice(j + 1) || args[++i] || '';
-          if (arg[j] === 'o' && /^(proxycommand|localcommand|permitlocalcommand|knownhostscommand)/i.test(value)) reasons.push(`ssh -o ${value} runs a local command`);
-          break;
-        }
-      }
-      const remote = args.slice(i + 1);
-      if (remote.length) nested.push({ command: remote.join(' '), remote: true });
-      else if (input) nested.push({ command: input.body ?? '', remote: true });
+      const inv = sshInvocation(words.slice(k + 1));
+      for (const value of inv.localCommands) reasons.push(`ssh -o ${value} runs a local command`);
+      // garage: the garage-server read exemption applies to this remote command (ssh from the
+      // local machine as the segment's command word, plain options only).
+      const garage = garageOk && !ctx.remote && k === 0;
+      if (inv.remote.length) nested.push({ command: inv.remote.join(' '), remote: true, garage });
+      else if (input) nested.push({ command: input.body ?? '', remote: true, garage });
       break;
     }
   }
@@ -355,7 +461,8 @@ function segmentCwds(segments, base, home) {
 // cwd: the shell's working directory; project: from fullAutoProjectFor. paths:false skips the
 // path-dependent checks (used to re-check parsed native resources in the evaluate hook).
 // amendOk only applies to top-level local segments; amends in sh -c/eval/heredoc/ssh bodies still ask.
-export function fullAutoShellCheck(command, cwd, project, { home = process.env.HOME || os.homedir(), remote = false, paths = true, depth = 0, amendOk = false } = {}) {
+// garage: this is the remote command of a local `ssh garage-server` (set by the recursion only).
+export function fullAutoShellCheck(command, cwd, project, { home = process.env.HOME || os.homedir(), remote = false, paths = true, depth = 0, amendOk = false, garage = false } = {}) {
   if (typeof command !== 'string') return ['command is not a string'];
   if (depth > 4) return ['commands nested too deeply to inspect'];
   const { segments } = scanShell(command);
@@ -363,7 +470,8 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
   const ctx = { cwds: remote ? new Set([REMOTE_HOME]) : segmentCwds(segments, cwd, home), roots: project?.roots ?? [], home, remote };
   if (remote) { const tracked = segmentCwds(segments, REMOTE_HOME, REMOTE_HOME); ctx.cwds = tracked; ctx.home = REMOTE_HOME; }
   const nested = [];
-  for (const segment of segments) {
+  const envReads = garage && remote && depth > 0 ? garageEnvReads(command, segments) : new Map();
+  segments.forEach((segment, n) => {
     const { words, redirects } = segment;
     const text = JSON.stringify(segment.text.slice(0, 160));
     const push = gitPushDanger(words);
@@ -372,7 +480,11 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     if (history) reasons.push(`${text}: ${history}`);
     const disk = words.find(word => DISK_COMMANDS.test(word) || BLOCK_DEVICE.test(word) || /^of=\/dev\//.test(word));
     if (disk) reasons.push(`${text}: ${disk} writes disks or devices`);
-    reasons.push(...segmentSecretReasons(segment, text));
+    const garageOk = !remote && depth === 0 && garageSshSegment(command, segments, n);
+    const skip = new Set([...(envReads.get(n) ?? []), ...(garageOk ? sshRemoteWords(words) : [])]);
+    reasons.push(...segmentSecretReasons(segment, text, { skip }));
+    const unit = garageUnitDanger(segment);
+    if (unit) reasons.push(`${text}: ${unit}`);
     for (const redirect of redirects) {
       if (!redirect.file) continue;
       if (BLOCK_DEVICE.test(redirect.target ?? '')) reasons.push(`${text}: redirect writes device ${redirect.target}`);
@@ -384,12 +496,12 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
       }
     }
     if (paths) reasons.push(...[...rmDanger(words, ctx), ...findDanger(words, ctx), ...rsyncDanger(words, ctx, nested)].map(why => `${text}: ${why}`));
-    reasons.push(...nestedCommands(segment, nested, ctx).map(why => `${text}: ${why}`));
-  }
+    reasons.push(...nestedCommands(segment, nested, ctx, { garageOk }).map(why => `${text}: ${why}`));
+  });
   for (const inner of nested) {
     const innerCwd = inner.remote ? undefined : ctx.cwds && ctx.cwds.size === 1 ? [...ctx.cwds][0] : undefined;
     const innerReasons = innerCwd || inner.remote || !paths
-      ? fullAutoShellCheck(inner.command, innerCwd, project, { home, remote: inner.remote || remote, paths, depth: depth + 1 })
+      ? fullAutoShellCheck(inner.command, innerCwd, project, { home, remote: inner.remote || remote, paths, depth: depth + 1, garage: inner.garage === true })
       : fullAutoShellCheck(inner.command, undefined, project, { home, remote, paths, depth: depth + 1 });
     reasons.push(...innerReasons.map(why => `${inner.remote ? 'remote ' : 'nested '}${why}`));
   }
