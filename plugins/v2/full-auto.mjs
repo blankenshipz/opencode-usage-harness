@@ -569,7 +569,8 @@ function deleteTargetDanger(target, ctx) {
     const home = ctx.home, cwd = ctx.cwds?.size === 1 ? [...ctx.cwds][0] : undefined;
     let t = target.replace(/^\$\{?TMPDIR\}?(?=\/|$)/, process.env.TMPDIR || '/tmp');
     if (home) t = t.replace(/^\$\{?HOME\}?(?=\/|$)/, home);
-    if (cwd) t = t.replace(/^\$\{?PWD\}?(?=\/|$)/, cwd);
+    if (cwd) t = t.replace(/^\$\{?PWD\}?(?=\/|$)/, cwd).replace(/^\$\(pwd\)(?=\/|$)/, cwd);
+    for (const v of ctx.mktempVars ?? []) t = t.replace(new RegExp(`^\\$\\{?${v}\\}?(?=/|$)`), '/tmp/__mktemp__');
     if (t !== target) return deleteTargetDanger(t, ctx);
     if (/\{[^{}]*[,.][^{}]*\}/.test(target) && !/[$`]/.test(target)) { const all = braceExpand(target); if (all.length > 1) { for (const one of all) { const why = deleteTargetDanger(one, ctx); if (why) return why; } return undefined; } }
   }
@@ -582,6 +583,8 @@ function deleteTargetDanger(target, ctx) {
   if (!candidates) return `delete target ${JSON.stringify(target)} is relative to an unknown directory`;
   for (const candidate of candidates) {
     // A glob in the last component deletes the parent's contents: judge the parent.
+    // r40c: a glob directly under a scratch root (rm -f /tmp/*.log) only removes scratch files.
+    if (!ctx.remote && isGlob(path.basename(candidate)) && !path.basename(candidate).startsWith('.') && ctx.roots.includes(path.dirname(candidate))) continue;
     const effective = isGlob(path.basename(candidate)) ? path.dirname(candidate) : candidate;
     if (isGlob(effective)) return `delete target ${JSON.stringify(target)} globs over directories`;
     if (ctx.remote) {
@@ -750,7 +753,7 @@ const resetHeadOnly = words => {
   return sub === 'reset' && rest.every(arg => /^(-q|--quiet|--hard|HEAD|@)$/.test(arg));
 };
 const READERS = /(^|\/)(cat|tac|less|more|head|tail|grep|egrep|fgrep|rg|strings|base64|xxd|od|hexdump|nl|sed|awk|jq|bat|source|\.|cp|scp|nc|openssl)$/;
-const CRED_PATH = /(^|\/)(\.netrc|\.npmrc|\.pypirc|\.pgpass|\.git-credentials|hosts\.yml|\.docker\/config\.json|\.kube\/config|\.[A-Za-z0-9_]*_history|\.histfile|shadow|gshadow|[^/]*\.p12|[^/]*\.pfx|service-account[^/]*\.json|[^/]*\.tfstate(\.backup)?|token[^/]*\.txt|environ)$/;
+const CRED_PATH = /(^|\/)(\.netrc|\.npmrc|\.pypirc|\.pgpass|\.git-credentials|hosts\.yml|\.docker\/config\.json|\.kube\/config|\.[A-Za-z0-9_]*_history|\.vault-token|\.envrc|\.dev\.vars|[^/]*\.tfvars|kubeconfig|\.histfile|shadow|gshadow|[^/]*\.p12|[^/]*\.pfx|service-account[^/]*\.json|[^/]*\.tfstate(\.backup)?|token[^/]*\.txt|environ)$/;
 const SECRET_GLOB = /(^|\/)[.\[]?[\[\]?*]*\.?\[?e[\]?*]|(^|\/)\.[^/]*[*?[]/;
 const isDynamic = word => /[$`]/.test(word);
 // The next segment only counts or tests matches (`printenv | grep -c X`, `| wc -l`): nothing is printed.
@@ -764,11 +767,12 @@ export function secretVarName(name) {
   if (/(^|_)(DATABASE|DB|REDIS|MONGO[A-Z]*|POSTGRES[A-Z]*|PG|AMQP|SENTRY|MYSQL)_(URL|URI|DSN)$/.test(up)) return true;
   if (/^[A-Z0-9]*(APIKEY|TOKEN|SECRET|PASSWORD)$/.test(up)) return true;
   const toks = up.split('_').filter(Boolean);
+  if (toks.length === 1 && /^(KEY|PASS|PAT|COOKIE|PRIVATE|DSN|BEARER|CREDENTIAL)$/.test(toks[0])) return false;
   return toks.some((t, i) => SECRET_TOKEN.test(t) && !NOT_SECRET_NEXT.test(toks[i + 1] ?? ''));
 }
 // Names expanded in a word: [{ name, indirect }]. `${!X}` / `${!X*}` are indirect (undeterminable).
 const expansions = word => [...String(word).matchAll(/\$(?:\{(!?)([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))/g)].map(m => ({ name: m[2] ?? m[3], indirect: m[1] === '!' }));
-const secretExpansion = word => expansions(word).some(e => e.indirect || secretVarName(e.name));
+const secretExpansion = (word, aliases = new Set()) => expansions(String(word).replace(/\$\{[A-Za-z_][A-Za-z0-9_]*:?\+[^}]*\}/g, '')).some(e => e.indirect || secretVarName(e.name) || aliases.has(e.name));
 // Brace expansion (bash order), capped.
 export function braceExpand(word, limit = 64) {
   const m = /^(.*?)\{([^{}]*)\}(.*)$/s.exec(word);
@@ -877,6 +881,44 @@ function hardExtras2(segment, segments, n, ctx, { head, args, cmd, READ }) {
   const { words, redirects } = segment;
   const base = head.split('/').at(-1);
   const quiet = quietPipe(segments, n);
+  const aliases = new Set(segments.flatMap(sg => sg.words).map(w => /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(w)).filter(m => m && secretExpansion(m[2])).map(m => m[1]));
+  // H1 (r3): an unquoted backtick substitution as the target of a delete, write or push is not literal.
+  const next = segments[n + 1];
+  if (next?.sub && next.prevSep === '`' && (/^(rm|rmdir|unlink|find|mv|cp|tee|truncate|shred|install|ln|rsync|dd|chmod|chown)$/.test(base) || (isGitWord(head) && /^(push|clean|reset|checkout|restore)$/.test(args[0] ?? '')))) out.push([isGitWord(head) && args[0] === 'push' ? 'history' : 'delete', `${base} target comes from a command substitution`]);
+  // H2 (r3): destructive git in another repository (cd elsewhere, -C, --git-dir) is a delete outside the project.
+  for (let k = 0; k < words.length; k++) {
+    if (!isGitWord(words[k])) continue;
+    const { sub, rest, chdirs } = git(words, k);
+    const destructive = sub === 'clean' || (sub === 'reset' && rest.some(a => /^--(hard|merge|keep)$/.test(a))) || (sub === 'checkout' && (rest.includes('--') || rest.includes('.') || rest.some(a => /^-f$|^--force$/.test(a)))) || sub === 'restore' || (sub === 'stash' && /^(drop|clear)$/.test(rest[0] ?? '')) || (sub === 'worktree' && rest[0] === 'remove');
+    if (!destructive) continue;
+    const dirs = !ctx.cwds ? [undefined] : [...ctx.cwds].map(c => chdirs.reduce((d, x) => (d && x && !/[$`]/.test(x) ? path.resolve(d, x.startsWith('~') ? path.join(ctx.home ?? '/', x.slice(1)) : x) : undefined), c));
+    if (dirs.some(d => !d || !ctx.roots.some(r => contains(r, d) && contains(r, realish(d))))) out.push(['delete', `git ${sub} discards work in a repository outside the project`]);
+    if (sub === 'worktree') for (const t of rest.slice(1).filter(a => !a.startsWith('-'))) { const why = deleteTargetDanger(t, ctx); if (why) out.push(['delete', `git worktree remove: ${why}`]); }
+  }
+  // M3 (r3): more local rewrites.
+  for (let k = 0; k < words.length; k++) {
+    if (!isGitWord(words[k])) continue;
+    const { sub, rest } = git(words, k);
+    if (sub === 'fetch' && rest.some(a => /^\+[^:]*:./.test(a) || (/^(-f|--force)$/.test(a) && rest.some(b => /:./.test(b))))) out.push(['history', 'git fetch force-updates a local branch']);
+    if (sub === 'branch' && rest.some(a => /^-[a-zA-Z]*[MC]$/.test(a))) out.push(['history', 'git branch -M/-C overwrites a branch']);
+    if (sub === 'tag' && rest.some(a => /^-[a-zA-Z]*f$|^--force$/.test(a))) out.push(['history', 'git tag -f moves a tag']);
+  }
+  if (base === 'gh' && args[0] === 'repo' && args[1] === 'delete') out.push(['history', 'gh repo delete destroys a repository']);
+  // M1 (r3): recursive grep with a secret-like or empty pattern over a tree prints .env lines.
+  if (/^(grep|egrep|rg)$/.test(base) && (base !== 'rg' ? args.some(a => /^-[a-zA-Z]*[rR]/.test(a) || /^--(recursive|dereference-recursive)$/.test(a)) : args.some(a => /^(--hidden|--no-ignore|-uu+|-[a-zA-Z]*u)$/.test(a))) && !args.some(a => /^--exclude/.test(a) || /^--include/.test(a) || /^-g$|^--glob/.test(a))) {
+    const pat = args.find(a => !a.startsWith('-'));
+    const where = args.filter(a => !a.startsWith('-')).slice(1);
+    const wholeTree = !where.length || where.some(w => ['.', './', '..', '../', '~', '~/', '/'].includes(w) || ctx.roots.includes(w));
+    if (wholeTree && (pat === undefined || pat === '' || /key|token|secret|passw|credential|api_?key|_pat\b/i.test(pat))) out.push(['secret', `${base} -r over the tree with a secret-like pattern prints .env lines`]);
+  }
+  if (base === 'curl' && args.some(a => /^(-v|--verbose|--trace\S*|-[a-zA-Z]*v[a-zA-Z]*)$/.test(a)) && args.some(a => secretExpansion(a, aliases))) out.push(['secret', 'curl -v echoes a secret header']);
+  // M2 (r3): tar/unzip extraction into a directory outside the project.
+  if ((base === 'tar' && args.some(a => /^-?[a-zA-Z]*x/.test(a) && !a.startsWith('--'))) || base === 'unzip') {
+    const di = args.findIndex(a => /^(-C|--directory|-d)$/.test(a));
+    const dir = di >= 0 ? args[di + 1] : (args.find(a => /^--directory=/.test(a)) ?? '').split('=')[1];
+    if (dir) { const why = writeTargetDanger(path.join(dir, '__extract_entry__'), ctx, `${base} extracts`); if (why) out.push(['delete', why.replace('/__extract_entry__', '')]); }
+  }
+  if (words[0] === 'env' || words.includes('env')) { const ci = words.findIndex(w => /^(-C|--chdir)$/.test(w)); if (ci >= 0 && !insideRoots(words[ci + 1], ctx)) out.push(['delete', 'env -C runs a command outside the project']); }
   const inner = (command, label) => { for (const e of ctx.inner?.(command) ?? []) out.push([e.rule, `${label}: ${e.reason}`]); };
   // -- secrets: environment prints
   for (let k = 0; k < words.length; k++) {
@@ -899,8 +941,9 @@ function hardExtras2(segment, segments, n, ctx, { head, args, cmd, READ }) {
     if (!quiet && (!args.length && base !== 'local' || (args.length && args.every(a => a.startsWith('-')) && args.some(a => /p|x/.test(a))))) out.push(['secret', `${base} ${args.join(' ')} prints the environment`.replace('  ', ' ')]);
     if (args.some(a => /^-[a-zA-Z]*p/.test(a)) && names.some(secretVarName)) out.push(['secret', `${base} -p prints a secret variable`]);
   }
+  if (/^(docker|podman|nerdctl|kubectl|oc)$/.test(base) && args.includes('exec') && /^(env|printenv)$/.test(args.at(-1) ?? '')) out.push(['secret', `${base} exec prints the container environment`]);
   if (base === 'printenv' && args.some(a => !a.startsWith('-') && secretVarName(a)) && !quiet) out.push(['secret', 'printenv prints a secret variable']);
-  if (/^(echo|printf|print|cat|tee|logger|wall)$/.test(base) && args.some(secretExpansion) && !quiet) out.push(['secret', `${base} prints a secret environment variable`]);
+  if (/^(echo|printf|print|cat|tee|logger|wall)$/.test(base) && args.some(a => secretExpansion(a, aliases)) && !quiet) out.push(['secret', `${base} prints a secret environment variable`]);
   for (const r of redirects) if (r.herestring && secretExpansion(r.body ?? '')) out.push(['secret', 'here-string expands a secret environment variable']);
   if (/^(curl|wget|nc|ncat|http|https|xh)$/.test(base)) {
     const valueOpts = /^(-H|--header|-u|--user|--oauth2-bearer|-A|--user-agent|-b|--cookie|-o|--output|-x|--proxy|-K|--config|--cacert|--cert|--key|-e|--referer|--max-time|-m|-w|--write-out|--connect-timeout|-X|--request|--retry|--resolve)$/;
@@ -958,13 +1001,15 @@ function hardExtras2(segment, segments, n, ctx, { head, args, cmd, READ }) {
         if (/\b(git|gh)\b/.test(code) && /\bpush\b/.test(code) && !/\bpush\b/.test(lits.join(' '))) out.push(['history', `${base} code builds a git push it does not spell out`]);
       }
       if (FILE_CHANGE.test(code)) {
+        if (/home\(\)|homedir|expanduser|getenv|environ|argv|os\.walk|\bglob\b|listdir|readdirSync|\$HOME/.test(code)) out.push(['delete', `${base} code deletes or writes a computed path`]);
         const paths = lits.filter(l => /^(\/|~|\.\.?\/)|\//.test(l) && !/\s/.test(l) && !/^(https?|wss?):/.test(l));
         if (!lits.length) out.push(['delete', `${base} code deletes or writes a path that is not literal`]);
         for (const p of paths) { const why = deleteTargetDanger(p, ctx); if (why && !/is git metadata/.test(why)) out.push(['delete', `${base} code: ${why}`]); }
       }
       const envNames = [...code.matchAll(/environ(?:\.get)?\s*[\[(]\s*['"](\w+)|getenv\s*\(\s*['"](\w+)|process\.env(?:\.(\w+)|\[\s*['"](\w+))|ENV\s*(?:\[\s*['"]|\.fetch\(\s*['"])(\w+)|\$ENV\{\s*['"]?(\w+)/g)].map(m => m.slice(1).find(Boolean));
       const bareEnv = /os\.environ(?!\s*(\.get|\[|\.copy|\.setdefault|\.pop|\.update))|process\.env(?!\s*[.\[])|\bENV\b(?!\s*[\[.])|%ENV|Deno\.env\.toObject/.test(code);
-      if (PRINT_CALL.test(code) && (bareEnv || envNames.some(secretVarName))) out.push(['secret', `${base} code prints the environment or a secret variable`]);
+      const printFlag = /^(node|nodejs|bun)$/.test(base) && args.some(a => /^(-p|--print)/.test(a));
+      if ((PRINT_CALL.test(code) || printFlag) && (bareEnv || envNames.some(secretVarName))) out.push(['secret', `${base} code prints the environment or a secret variable`]);
       if (/open\s*\(|readFile|read_text|File\.read|IO\.read|slurp/.test(code) && lits.some(l => secretFile(l))) out.push(['secret', `${base} code reads a secret file`]);
     }
   }
@@ -1043,15 +1088,6 @@ function hardExtras(segment, segments, n, ctx, vars) {
     const targets = head === 'truncate' ? args.filter(a => !a.startsWith('-') && !/^\d+[KMG]?$/.test(a)) : head === 'mv' ? args.filter(a => !a.startsWith('-')).slice(0, -1) : args.some(a => /^--remove-files/.test(a)) ? args.filter(a => !a.startsWith('-')) : [];
     for (const t of targets) { const why = deleteTargetDanger(t, ctx); if (why) out.push(['delete', `${head}: ${why}`]); }
   }
-  if (false) {
-    const code = args.join(' ');
-    if (/rmtree|unlink|rmdir|os\.remove|\bremove\(|truncate/.test(code)) {
-      const lits = [...code.matchAll(/['"]((?:\/|~)[^'"]*)['"]|q\(([^)]*)\)/g)].map(m => m[1] ?? m[2]);
-      if (!lits.length) out.push(['delete', 'interpreter deletes an undeterminable path']);
-      for (const lit of lits) { const why = deleteTargetDanger(lit, ctx); if (why) out.push(['delete', `interpreter delete: ${why}`]); }
-    }
-    if (/environ|open\([^)]*["'][^"']*(\.env|netrc|npmrc|\.e["']\s*\+)/.test(code)) out.push(['secret', 'interpreter reads environment or secrets']);
-  }
   // Symlink created earlier in this command, then deleted through.
   if (/(^|\/)(rm|rmdir|unlink|find|rsync)$/.test(head)) {
     const links = segments.slice(0, n).filter(s => s.words[0] === 'ln' && s.words.some(w => /^-[a-zA-Z]*s/.test(w))).map(s => s.words.filter(w => !w.startsWith('-')).at(-1));
@@ -1066,7 +1102,8 @@ function hardExtras(segment, segments, n, ctx, vars) {
     const pos = args.filter(a => !a.startsWith('-'));
     const whole = pos.some(a => a === '.' || a === './' || a === '*' || (ctx.roots.some(r => r === a)));
     const remoteOrOut = head === 'tar' ? args.some((a, i) => a === '-' || /f$/.test(a) && args[i + 1] === '-') || segment.redirects.some(r => r.file) || segments[n + 1]?.prevSep === '|' : pos.some(a => /^[^/.~][^/]*:/.test(a));
-    if (whole && (remoteOrOut || head === 'tar' || head === 'zip')) out.push(['secret', `${head} copies the whole repository (including secrets) out`]);
+    const extract = head === 'tar' && args.some(a => /^-?[a-zA-Z]*x/.test(a) && !a.startsWith('--') || a === '--extract');
+    if (whole && !extract && (remoteOrOut || head === 'tar' || head === 'zip')) out.push(['secret', `${head} copies the whole repository (including secrets) out`]);
   }
   const READ = READERS.test(head);
   // The first positional of awk/sed/jq/grep/rg is a program or pattern, not a file.
@@ -1116,6 +1153,7 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
   const { segments } = scanShell(command);
   const reasons = [];
   const ctx = { cwds: remote ? new Set([REMOTE_HOME]) : segmentCwds(segments, cwd, home), roots: [...(project?.roots ?? []), ...(hard ? TMP_ROOTS : [])], home, remote };
+  ctx.mktempVars = [...command.matchAll(/([A-Za-z_][A-Za-z0-9_]*)="?\$\(mktemp(?:\s+-[dqut]+)*(?:\s+[A-Za-z0-9._X-]+)?\)/g)].map(m => m[1]);
   ctx.inner = inner => { const sub = []; const cw = ctx.cwds?.size === 1 ? [...ctx.cwds][0] : undefined; fullAutoShellCheck(inner, remote ? undefined : cw, project, { home, remote, paths, depth: depth + 1, hard: sub }); return sub; };
   if (remote) { const tracked = segmentCwds(segments, REMOTE_HOME, REMOTE_HOME); ctx.cwds = tracked; ctx.home = REMOTE_HOME; }
   const nested = [];
@@ -1136,7 +1174,10 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     if (disk) reasons.push(H('delete', `${text}: ${disk} writes disks or devices`));
     const garageOk = !remote && depth === 0 && garageSshSegment(command, segments, n);
     const skip = new Set([...(envReads.get(n) ?? []), ...(garageOk ? sshRemoteWords(words) : [])]);
-    reasons.push(...segmentSecretReasons(segment, text, { skip }).map(r => H('secret', r)));
+    // r40c: copying a template to a secret name (cp .env.example .env) creates the file; it reads no secret.
+    const cpPos = /(^|\/)(cp|install)$/.test(words[0] ?? '') ? words.slice(1).filter(w => !w.startsWith('-')) : [];
+    const templateCopy = cpPos.length === 2 && !isSecretPath(cpPos[0]) && !CRED_PATH.test(cpPos[0]) && !/[$`*?{]/.test(cpPos.join(' ')) && redirects.length === 0;
+    reasons.push(...segmentSecretReasons(segment, text, { skip }).map(r => templateCopy ? r : H('secret', r)));
     if (!remote) reasons.push(...segmentProtectedReasons(segment, words.map(word => { const values = /\$/.test(word) ? expandVariables(word, vars) : undefined; return values?.length === 1 ? values[0] : word; }), ctx, text).map(r => H('secret', r)));
     const unit = garageUnitDanger(segment);
     if (unit) reasons.push(`${text}: ${unit}`);

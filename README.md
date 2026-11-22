@@ -606,6 +606,10 @@ The 0.4.0 hard-deny classifier (`hardDenyCheck`) parses the command; it is a gua
 - Git aliases are resolved from the current repository's config only when the shell's directory is known; `include.path` files and system config written outside the command are not followed.
 - Symlinks are resolved at check time; a link swapped between the check and the run is not seen. Commands that change directory in loops or functions are judged by the union of directories, or denied when unknown.
 - Secret-variable names are recognised by name parts (`TOKEN`, `KEY`, `SECRET`, `PAT`, `PASSWORD`, `*_URL` of databases); a secret in an innocently named variable is not.
+- Remote commands are judged only for deletes of `/`, top-level directories or the remote home (`ssh host "rm -rf /srv/x"` is allowed).
+- Tools that print credentials through their own subcommands (`docker compose config`, `docker inspect`, `aws configure get`, `gcloud auth print-access-token`, `heroku config`, `pass show`, `ps eww`, `tmux show-environment`) and interpreter forms like `from os import environ as e; print(e)` are not recognised.
+- `git reset --soft HEAD~N`/`git reset HEAD~N`, `git checkout --orphan`, `git stash clear` in the project, and other forges/tools (`git lfs push --force`, `git subtree push`, `hub`, `jj`) are allowed. Trash tools (`trash`, `gio trash`), `crontab -r` and `docker system prune` are allowed.
+- `env -C` inside the project, `$PWD` after an inexact `cd`, and a pre-existing git alias defined in an `include.path` file are judged lexically.
 - `>>`, `tee -a` and other appends outside the project are allowed (they do not delete); `rsync` without `--delete` into an outside directory is allowed.
 
 ## Remaining work and next steps

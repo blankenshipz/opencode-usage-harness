@@ -46,6 +46,7 @@ The second 0.4.0 build (`2d599f9`) was not tagged or deployed: the second Fable 
 - **Overwrites outside the project or `/tmp`:** `cp`/`mv`/`install`/`ln -f` destinations (incl. `-t DIR`), `tee` (not `-a`), `sed -i`, `perl -i`, `dd of=`, `truncate`. `dd of=/tmp/x` is no longer a false deny.
 - **M6 (partial):** a `cd` keeps later `;` segments in the target only if the directory exists and is enterable now; a cd to a missing directory judges both directories.
 - **Workrelay:** the committed test temp directory `tests/.bound-attestation-*/` is removed and ignored (no credentials in it).
+- **Third review (Fable round 3) fixes:** unquoted backtick substitutions as delete/write/push targets are denied; destructive git (`clean`, `reset --hard`, `checkout -- .`, `restore`, `stash drop/clear`, `worktree remove`) in a repository outside the project, reached by `cd` or `-C`, is denied; `rm -f *.log` at the project root is allowed again. Also: secret aliases (`X=$API_KEY; echo $X`), `grep -r`/`rg -uu` over the whole tree with a secret-like pattern, `curl -v` with a secret header, `.vault-token`/`.envrc`/`.dev.vars`/`*.tfvars`/`kubeconfig`, `tar -C`/`unzip -d` outside the project, `git fetch +a:b`, `git branch -M`, `git tag -f`, `gh repo delete`, `env -C` outside the project and computed paths in interpreter deletes are denied; `$key`/`$pass`, `${API_KEY:+set}`, `$(mktemp)` variables, `$(pwd)/x` and `tar x -C .` are allowed.
 - Known limits are listed in the README ("Hard-deny known limits").
 
 ## 0.3.4 — protected reads, source files named like secrets (r37)
