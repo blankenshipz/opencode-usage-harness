@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.4 — protected reads, source files named like secrets (r37)
+
+Two fixes from the r36 log review.
+
+- **Protected locations ask under full-auto** (`plugins/v2/full-auto.mjs` `protectedLocation`, used by `auto-permission.mjs` `credentialPath` and the full-auto shell check). The 0.3.3 read-only rule (`full_auto_read_only_external`) allowed reading these without asking; no session did. Read tools and read-only shell (`cat`, `sqlite3 … .dump`, `ls`, `cp`, `<` input, `cd` into them, also behind literal variables and `bash -c`) now ask for:
+  - browser profile data: files named `Cookies`, `Login Data`, `Login Data For Account`, `Web Data`, `Local State` (and `-journal`/`-wal`/`-shm`), Chrome profile directories (`Default`, `Profile N`, `Guest Profile`, `System Profile`) under a `chrom*`/`user-data`/`*-profile*` directory, and anything under a directory that holds a `Local State` file;
+  - `/home/box/work/agent-profiles/**` and any `*profile*` path under `/workspace/browser-probe`;
+  - the harness install `/home/box/work/ocharness/**` (`workrelay-bridge.json`, `gateway/`, `claude-config/`, `xdg/` with the OpenCode DB, `state/`), plus the configured state dir (and its parent install when it is named `state`), `$OCH`, `$CLAUDE_CONFIG_DIR` and `HARNESS_PROTECTED_DIRS` (colon list).
+  - Still readable: `<state>/check-receipts/**` (sessions read their own test receipts), the harness code `<install>/harness/**` (sessions run `harness/releases/<v>/src/check_receipt.py`) and OpenCode shell-output files `<install>/xdg/data/opencode/shell/**`.
+  - `grep`/`codesearch` on a directory that contains a protected location or a credential directory (`/home/box/work`, `/workspace`, `~`) ask too.
+  - The garage-server `.env` exemption is unchanged.
+- **Source files named like secrets are code** (`shell-guard.mjs` `isSecretPath`, `configure.py` `SECRET_CODE_SHELL_ALLOW`): a dotted name containing `secret`/`credentials` with a code extension (`.py .ts .tsx .js .jsx .mjs .cjs .kt .swift .go .rb .java`, not a dotfile) is not a secret path, so `git add mobile/src/__tests__/screens/AgentSearchCredentials.test.tsx` and `backend/app/agent_search/credentials.py` auto-allow with no native second ask. This was all 4 asks since 0.3.3. Native permissive rules gain allows for `*credentials*.<ext>` and `*secret*.<ext>` after the secret asks; the other secret asks (`*.env*`, `*.pem*`, `*.key*`, `*auth.json*`, …) are repeated after them, so `cat .env x.py` still asks natively. `.env*`, `credentials.json`, `client_secret.json`, `secrets.yaml`, `*.pem`, `*.key`, bare `credentials`, `.secrets.py` and anything under `secret*/`/`credentials*/` directories still ask. The guard now also re-asks when a whole command the rules allow names a real secret path (`cat credentials.json x.py`).
+- Tests: new `tests/v2-protected-reads.test.mjs` (replays the 2 r36 commands through the guard and the native rules; protected reads by read/glob/grep/list and shell; check-receipts still allowed); native rule cases in `tests/test_configure.py`.
+
 ## 0.3.3 — permission waits (r35)
 
 72 permission asks cost 40.8 h of waiting in r34. Replaying all 72 through 0.3.3 logic: 67 would auto-allow, 5 still ask (see `docs/SHELL-PERMISSIONS.md`, "0.3.3").

@@ -197,6 +197,15 @@ WRAPPED_COMMAND_ASK = tuple(dict.fromkeys(
     ['find *-exec*', 'find *-ok*', 'find *-execdir*', 'find *-okdir*']))
 SECRET_SHELL_ASK = ('*.env*', '*auth.json*', '*.pem*', '*.key*', '*credentials*', '*secret*', '*financial-policy*', '*external-write-grants*')
 DANGEROUS_SHELL_ASK = DANGEROUS_COMMAND_ASK + WRAPPED_COMMAND_ASK + SECRET_SHELL_ASK
+# 0.3.4 (r36): source/test files named like secrets (credentials.py, AgentSearchCredentials.test.tsx)
+# are code. Must match plugins/v2/shell-guard.mjs CODE_EXTENSIONS. The allows follow the secret asks
+# and relax only `*credentials*`/`*secret*`: the other secret asks are repeated after them (last match
+# wins), so `cat .env x.py` still asks. Shell resources are whole commands, so `cat credentials.json
+# x.py` matches too; the shell guard re-asks for any real secret path in a command the rules allow.
+CODE_EXTENSIONS = ('py', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'kt', 'swift', 'go', 'rb', 'java')
+SECRET_NAME_SHELL_ASK = ('*credentials*', '*secret*')
+SECRET_CODE_SHELL_ALLOW = tuple(f'*{word}*.{ext}{tail}' for word in ('credentials', 'secret') for ext in CODE_EXTENSIONS for tail in ('', ' *'))
+SECRET_REASSERT_SHELL_ASK = tuple(p for p in SECRET_SHELL_ASK if p not in SECRET_NAME_SHELL_ASK)
 # Committed env templates hold placeholder values, not secrets. Exceptions match the exact
 # basename (any directory) and follow the secret deny/ask rules they relax (last match wins).
 # Real .env, .env.local, .env.production, ... stay protected.
@@ -271,6 +280,8 @@ def shell_rules(shell_policy):
     if shell_policy == 'permissive':
         return ([{'action':'shell','resource':'*','effect':'allow'}] +
                 [{'action':'shell','resource':p,'effect':'ask'} for p in SECRET_SHELL_ASK] +
+                [{'action':'shell','resource':p,'effect':'allow'} for p in SECRET_CODE_SHELL_ALLOW] +
+                [{'action':'shell','resource':p,'effect':'ask'} for p in SECRET_REASSERT_SHELL_ASK] +
                 [{'action':'shell','resource':p,'effect':'allow'} for p in ENV_TEMPLATE_SHELL_ALLOW] +
                 [{'action':'shell','resource':command,'effect':'ask'} for command in DANGEROUS_COMMAND_ASK + WRAPPED_COMMAND_ASK])
     raise ValueError(f'shell_policy must be one of {", ".join(SHELL_POLICIES)}')

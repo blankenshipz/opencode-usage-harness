@@ -24,8 +24,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { managedConfigRoot } from './paths.mjs';
-import { scanShell, gitPushDanger, isSecretPath, secretWords, secretLiterals, wildcardMatch, parseGitInvocation, isGitWord, cdTarget, literalPath } from './shell-guard.mjs';
+import { managedConfigRoot, stateRoot } from './paths.mjs';
+import { scanShell, gitPushDanger, isSecretPath, secretWords, secretLiterals, wildcardMatch, parseGitInvocation, isGitWord, cdTarget, literalPath, nonFileWords } from './shell-guard.mjs';
 
 // Must match configure.py SECRET_SHELL_ASK (tests/v2-full-auto.test.mjs checks). These native
 // wildcards match the whole command string (`*.key*` also hits `d.keys()`); the shell guard drops
@@ -58,6 +58,95 @@ function normalizeProject(entry) {
     .filter(dir => typeof dir === 'string' && path.isAbsolute(dir)).map(dir => realish(path.resolve(dir))).filter(dir => dir !== '/');
   // no_push_deploy (0.3.3): pushes and deploys always ask in this project (yrdsale Phase 1 rule).
   return { directory, roots: [directory, ...dataDirs], ...(raw.no_push_deploy === true ? { noPushDeploy: true } : {}) };
+}
+
+// 0.3.4 (r36): protected locations. Read tools and read-only shell must ask for them even under
+// full-auto: browser profile data (Chrome/Chromium user-data dirs and their Cookies, Login Data,
+// Web Data, Local State files), the agents' logged-in browser profiles, browser-probe profile
+// copies, and the harness install itself (bridge config, gateway, claude-config, xdg, state).
+// Exceptions that stay readable: <state>/check-receipts/** (sessions read their own test receipts),
+// the harness code <install>/harness/** (sessions run harness/releases/<v>/src/check_receipt.py)
+// and OpenCode's shell-output files <xdg data>/opencode/shell/** (a session's own command output).
+export const PROTECTED_DIRS = ['/home/box/work/agent-profiles', '/home/box/work/ocharness'];
+export const READABLE_DIRS = ['/home/box/work/ocharness/state/check-receipts', '/home/box/work/ocharness/harness', '/home/box/work/ocharness/xdg/data/opencode/shell'];
+// Directories under which any component named like *profile* is a browser profile copy.
+export const PROFILE_PARENTS = ['/workspace/browser-probe'];
+const BROWSER_DATA_FILE = /^(Cookies|Extension Cookies|Safe Browsing Cookies|Login Data|Login Data For Account|Web Data|Local State)(-journal|-wal|-shm)?$/;
+const PROFILE_DIR = /^(Default|Profile \d+|Guest Profile|System Profile)$/;
+const CHROME_ANCESTOR = /chrom|user[-_ ]?data|browser[-_ ]?profile|agent[-_ ]?profile/i;
+
+// Harness roots from the environment: the state dir (and its parent install when it is named
+// `state`, as in <install>/state), OCH and CLAUDE_CONFIG_DIR, plus HARNESS_PROTECTED_DIRS (colon list).
+export function protectedRoots({ env = process.env, state = stateRoot, home = os.homedir() } = {}) {
+  const roots = new Set(PROTECTED_DIRS), readable = new Set(READABLE_DIRS);
+  const add = dir => { if (typeof dir === 'string' && path.isAbsolute(dir)) { const r = path.resolve(dir); if (r !== '/' && r !== path.resolve(home)) roots.add(r); } };
+  if (state && path.isAbsolute(state)) {
+    add(state); readable.add(path.join(path.resolve(state), 'check-receipts'));
+    if (path.basename(state) === 'state') add(path.dirname(path.resolve(state)));
+  }
+  add(env.OCH); add(env.CLAUDE_CONFIG_DIR);
+  if (env.OCH && path.isAbsolute(env.OCH)) readable.add(path.join(path.resolve(env.OCH), 'harness'));
+  if (env.XDG_DATA_HOME && path.isAbsolute(env.XDG_DATA_HOME)) readable.add(path.join(path.resolve(env.XDG_DATA_HOME), 'opencode', 'shell'));
+  for (const dir of String(env.HARNESS_PROTECTED_DIRS ?? '').split(':').filter(Boolean)) add(dir);
+  return { roots: [...roots], readable: [...readable] };
+}
+
+// Reason an absolute path is a protected location (undefined: not protected). Lexical, plus an
+// existence check for a Chrome `Local State` file in each ancestor (a user-data dir).
+export function protectedLocation(target, { exists = fs.existsSync, roots = protectedRoots() } = {}) {
+  if (typeof target !== 'string' || !path.isAbsolute(target)) return undefined;
+  const resolved = path.resolve(target);
+  const parts = resolved.split('/').filter(Boolean);
+  for (let k = 0; k < parts.length; k++) {
+    const part = parts[k];
+    if (BROWSER_DATA_FILE.test(part)) return `browser profile data ${JSON.stringify(part)}`;
+    if (PROFILE_DIR.test(part) && parts.slice(0, k).some(p => CHROME_ANCESTOR.test(p))) return 'browser profile directory';
+  }
+  for (const parent of PROFILE_PARENTS) {
+    if (strictlyInside(parent, resolved) && resolved.slice(parent.length + 1).split('/').some(part => /profile/i.test(part))) return 'browser profile copy';
+  }
+  for (let k = parts.length; k >= 1; k--) {
+    const dir = '/' + parts.slice(0, k).join('/');
+    try { if (exists(path.join(dir, 'Local State'))) return 'browser user-data directory'; } catch {}
+  }
+  if (roots.readable.some(dir => contains(dir, resolved))) return undefined;
+  const root = roots.roots.find(dir => contains(dir, resolved));
+  return root ? `harness/agent-profile location ${root}` : undefined;
+}
+
+// Search tools (grep, codesearch) on a directory that contains a protected root read it too.
+export function containsProtected(target, { roots = protectedRoots() } = {}) {
+  if (typeof target !== 'string' || !path.isAbsolute(target)) return false;
+  const resolved = path.resolve(target);
+  return [...roots.roots, ...PROFILE_PARENTS].some(root => strictlyInside(resolved, root));
+}
+
+// Path-like words and redirect targets of one local segment that name a protected location.
+// Relative words are resolved against every possible cwd; unknown variables are skipped.
+function segmentProtectedReasons(segment, words, ctx, text) {
+  const reasons = [];
+  const skip = nonFileWords(segment.words);
+  const candidates = [];
+  words.forEach((word, k) => { if (!skip.has(k)) candidates.push(word.replace(/^(--?[\w-]+|[A-Za-z_][A-Za-z0-9_]*)=/, '')); });
+  for (const redirect of segment.redirects) if (redirect.file && redirect.target) candidates.push(redirect.target);
+  const roots = protectedRoots();
+  const check = target => protectedLocation(target, { roots });
+  for (const raw of candidates) {
+    if (!raw || raw.startsWith('-') && !raw.includes('/')) continue;
+    let word = raw.replace(/^(\$\{HOME\}|\$HOME)(?=\/|$)/, '~');
+    if (word === '~' || word.startsWith('~/')) word = ctx.home ? path.join(ctx.home, word.slice(2)) : '';
+    if (!word || word.includes('$') || /^~/.test(word)) continue;
+    const targets = path.isAbsolute(word) ? [word] : [...(ctx.cwds ?? [])].map(cwd => path.resolve(cwd, word));
+    for (const target of targets) {
+      const why = check(target) ?? check(realish(target));
+      if (why) { reasons.push(`${text}: names protected path ${JSON.stringify(raw.slice(0, 120))} (${why})`); break; }
+    }
+  }
+  if (segment.hasCommand !== false && ctx.cwds) for (const cwd of ctx.cwds) {
+    const why = check(cwd);
+    if (why) { reasons.push(`${text}: runs inside protected directory ${JSON.stringify(cwd)} (${why})`); break; }
+  }
+  return reasons;
 }
 
 let cache = { key: undefined, projects: [] };
@@ -639,6 +728,7 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     const garageOk = !remote && depth === 0 && garageSshSegment(command, segments, n);
     const skip = new Set([...(envReads.get(n) ?? []), ...(garageOk ? sshRemoteWords(words) : [])]);
     reasons.push(...segmentSecretReasons(segment, text, { skip }));
+    if (!remote) reasons.push(...segmentProtectedReasons(segment, words.map(word => { const values = /\$/.test(word) ? expandVariables(word, vars) : undefined; return values?.length === 1 ? values[0] : word; }), ctx, text));
     const unit = garageUnitDanger(segment);
     if (unit) reasons.push(`${text}: ${unit}`);
     for (const redirect of redirects) {

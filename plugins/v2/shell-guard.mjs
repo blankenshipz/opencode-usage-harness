@@ -32,6 +32,11 @@ const SECRET_BASENAME = [
 ];
 // Named like a secret only with a dot (client_secret.json, secrets.yaml, .git-credentials).
 const SECRET_NAMED_FILE = /secret|credentials/i;
+// 0.3.4 (r36): source and test files named like that (credentials.py, AgentSearchCredentials.test.tsx)
+// are code, not secrets. Must match configure.py CODE_EXTENSIONS. Only the dotted-name rule is
+// relaxed: .env*, *.pem, *.key, auth.json, bare credentials/secrets and secret*/ dirs still count.
+export const CODE_EXTENSIONS = ['py', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'kt', 'swift', 'go', 'rb', 'java'];
+const CODE_FILE = new RegExp(`^[^.].*\\.(${CODE_EXTENSIONS.join('|')})$`);
 // Files under ~/.ssh that are not private keys.
 const SSH_PUBLIC = /(\.pub|^known_hosts.*|^authorized_keys.*|^config)$/i;
 // A token that can name a file: no regex/code punctuation such as | ( ) \ ^ ' " ; or spaces.
@@ -63,7 +68,7 @@ export function isSecretPath(target) {
   if (SECRET_SCAN_REPORT.test(base) && !dirs.some(part => /secret|credentials/i.test(part)) && !dirs.includes('.ssh')) return false;
   if (!isEnvTemplatePath(target)) {
     if (SECRET_BASENAME.some(pattern => pattern.test(base))) return true;
-    if (base.includes('.') && SECRET_NAMED_FILE.test(base)) return true;
+    if (base.includes('.') && SECRET_NAMED_FILE.test(base) && !CODE_FILE.test(base)) return true;
   }
   if (dirs.includes('.ssh') && !SSH_PUBLIC.test(base)) return true;
   // Directory components named like secrets (e.g. secrets/token.txt, gateway/secrets/x).
@@ -98,7 +103,7 @@ function commandIndex(words) {
 
 // Indexes of words that are patterns/programs (grep/rg/sed/awk patterns, -e values) or an
 // ssh/scp -i identity (the key is used, not read out); they are not file arguments.
-function nonFileWords(words) {
+export function nonFileWords(words) {
   const skip = new Set();
   const c = commandIndex(words);
   let name = (words[c] ?? '').replace(/^.*\//, ''), start = c + 1;
@@ -799,8 +804,11 @@ export async function installShellGuard(ctx, { tools = ['shell', 'bash'], fullAu
     const result = analyzeShellCommand(command, rules);
     const secrets = shellSecretReasons(command, { envFiles: false });
     // Secret paths the native wildcards miss (id_rsa, ~/.ssh/x) in a command the rules would allow.
+    // 0.3.4: also when the whole command is allowed (`cat credentials.json x.py` matches the
+    // `*credentials*.py` code-file allow).
     if (secrets.length && result.action !== 'deny' && rules.length
-        && scanShell(command).segments.every(segment => !segment.hasCommand || explicitShellEffect(segment.text, rules)?.effect === 'allow')) {
+        && (explicitShellEffect(command, rules)?.effect === 'allow'
+          || scanShell(command).segments.every(segment => !segment.hasCommand || explicitShellEffect(segment.text, rules)?.effect === 'allow'))) {
       result.action = 'ask'; result.reasons.push(...secrets);
     }
     if (result.action !== 'deny') {

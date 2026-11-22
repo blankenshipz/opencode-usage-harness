@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { isSecretPath, markers, scanShell } from './shell-guard.mjs';
-import { realish, fullAutoProjectFor, fullAutoShellCheck } from './full-auto.mjs';
+import { realish, fullAutoProjectFor, fullAutoShellCheck, protectedLocation, containsProtected } from './full-auto.mjs';
 import { statePath } from './paths.mjs';
 
 export const LISTABLE_DIRS = ['/opt', '/snap/bin', '/bin', '/sbin', '/usr/bin', '/usr/local/bin'];
@@ -26,10 +26,13 @@ const BACKGROUND = { test: startsBackground };
 const LS = /^ls((?:\s+-[1ad]+)*)\s+(\S+?)\/?$/;
 const contains = (root, target) => target === root || target.startsWith(root + '/');
 
-function credentialPath(target, home) {
+// 0.3.4: also browser profile data, agent browser profiles and the harness install (protectedLocation
+// in full-auto.mjs; <state>/check-receipts, harness code and shell output stay readable).
+export function credentialPath(target, home = os.homedir(), { exists } = {}) {
   const creds = ['.ssh', '.aws', '.config', '.gnupg', '.docker', '.kube'].map(d => path.join(home, d));
   if (creds.some(c => contains(c, target))) return true;
   if (/(^|\/)gateway\/secrets(\/|$)/.test(target)) return true;
+  if (protectedLocation(target, exists ? { exists } : {})) return true;
   return isSecretPath(target) || target.split('/').some(part => part && isSecretPath(part));
 }
 
@@ -61,6 +64,8 @@ export function committedClean(repo, target, { run = execFileSync } = {}) {
     return Boolean(String(tracked).trim());
   } catch { return false; }
 }
+// Recursive content search: a directory that contains a protected location reads it too.
+const SEARCH_TOOLS = new Set(['grep', 'codesearch']);
 export function decideFullAutoExternal({ action, resources, tool, input, project, directory, home = os.homedir(), realpath = fs.realpathSync, exists = fs.existsSync, clean = committedClean } = {}) {
   const res = Array.isArray(resources) ? resources.map(String) : [];
   if (!res.length) return { decision: 'ask', reason: 'no_resources' };
@@ -71,6 +76,8 @@ export function decideFullAutoExternal({ action, resources, tool, input, project
     const lexical = path.resolve(directory ?? '/', stripGlob(r).replace(/\/\*\*$/, ''));
     for (const candidate of [lexical, realish(lexical, { realpath })]) {
       if (credentialPath(candidate, home)) return { decision: 'ask', reason: 'credential_path' };
+      if (SEARCH_TOOLS.has(tool) && (containsProtected(candidate) || ['.ssh', '.aws', '.config', '.gnupg'].some(d => contains(candidate, path.join(home, d)))))
+        return { decision: 'ask', reason: 'search_covers_credential_path' };
       const other = otherProjectOf(candidate, project, { exists });
       if (other && (shell || !clean(other, candidate))) return { decision: 'ask', reason: shell ? 'other_project_shell' : 'other_project_uncommitted' };
     }

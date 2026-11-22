@@ -235,6 +235,18 @@ Park and yield: the stall is logged on the first 10 s tick after an ask (a tick 
 
 Still asking from the r34 log (by design): `git commit --amend` of a commit that cannot be verified as unpushed on a feature branch (1), `rm -rf` of a `/tmp/opencode` scratch directory, which is a delete outside the repo (2; adding `/tmp/opencode` as a `data_dirs` entry would allow it), and the garage-server `.env` read in a remote command that also has `$(...)` and a `for` loop, which the 0.3.2 exemption deliberately does not cover (2).
 
+## 0.3.4: protected reads and source files named like secrets
+
+From the r36 review. Under full-auto, read tools (`read`, `glob`, `grep`, `list`, …) and shell commands ask when they name a protected location, even read-only. The same check runs in the full-auto shell guard (path-like words, redirect targets and the working directory of every local segment, after literal variable expansion, inside `bash -c`/`eval` too) and in the auto-permission `external_directory` rule, so a command such as `sqlite3 …/Default/Cookies .dump` or `cat workrelay-bridge.json` asks once, from the guard. Protected:
+
+- browser profile data: `Cookies`, `Extension Cookies`, `Safe Browsing Cookies`, `Login Data`, `Login Data For Account`, `Web Data`, `Local State` (with `-journal`, `-wal`, `-shm`) anywhere; `Default`, `Profile N`, `Guest Profile`, `System Profile` under a directory named like `chrom*`, `user-data` or `*-profile*`; anything below a directory that contains a `Local State` file;
+- `/home/box/work/agent-profiles/**`, and every path under `/workspace/browser-probe` with a `*profile*` component;
+- the harness install `/home/box/work/ocharness/**`, the state dir (`HARNESS_STATE_DIR`, and its parent when it is named `state`), `$OCH`, `$CLAUDE_CONFIG_DIR`, and directories listed in `HARNESS_PROTECTED_DIRS` (colon-separated).
+
+Exceptions that stay readable: `<state>/check-receipts/**`, the harness code `<install>/harness/**` (the check runner `harness/releases/<v>/src/check_receipt.py`) and OpenCode's shell-output files `<install>/xdg/data/opencode/shell/**`. `grep` and `codesearch` on a directory that contains a protected location or `~/.ssh`/`~/.aws`/`~/.config`/`~/.gnupg` ask (`/home/box/work`, `/workspace`); `/workspace/browser-probe` itself stays searchable. Remote paths in `ssh` commands are not checked. Non-full-auto projects already ask for anything in the home directory outside the repo; protected locations are also credential paths there.
+
+Source files named like secrets: a dotted, non-dot-file name containing `secret` or `credentials` whose extension is `.py`, `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.kt`, `.swift`, `.go`, `.rb` or `.java` is not a secret path (`credentials.py`, `AgentSearchCredentials.test.tsx`, `secret_utils.ts`). The permissive native rules allow `*credentials*.<ext>` and `*secret*.<ext>` (with or without trailing arguments) after `*credentials*`/`*secret*`, then repeat the other secret asks so `.env`, `.pem`, `.key`, `auth.json` still ask natively. Because native resources are whole commands, `cat credentials.json x.py` matches the allow; the shell guard asks for it, since a real secret path in a command the rules allow always re-asks.
+
 ## Pending asks after a config reload
 
 OpenCode 2.0.30 re-evaluates pending asks only after an "always" reply. An ask raised

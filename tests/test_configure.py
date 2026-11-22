@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from configure import profile, namespace_harness_agents, DANGEROUS_SHELL_ASK, ENV_TEMPLATE_SHELL_ALLOW, ALLOWLIST_SHELL_ALLOW, BUILDER_FILE_WRITE_GUIDANCE, atomic_write_text
+from configure import profile, namespace_harness_agents, DANGEROUS_SHELL_ASK, ENV_TEMPLATE_SHELL_ALLOW, SECRET_CODE_SHELL_ALLOW, SECRET_REASSERT_SHELL_ASK, ALLOWLIST_SHELL_ALLOW, BUILDER_FILE_WRITE_GUIDANCE, atomic_write_text
 
 class ConfigureTests(unittest.TestCase):
     def test_roles_and_safe_public_defaults(self):
@@ -150,6 +150,12 @@ class ConfigureTests(unittest.TestCase):
                     self.assertEqual(native(builder, 'shell', command), 'allow', command)
                 for command in ('cat .env','cat .env.local','cat .env.example.bak','rm -rf .env.example','git commit -m x .env.example'):
                     self.assertEqual(native(builder, 'shell', command), 'ask', command)
+                # 0.3.4: source/test files named like secrets are code; real secret files still ask.
+                for command in ('cat backend/app/agent_search/credentials.py','head -5 app/secret_utils.ts | cat','grep -n x mobile/src/creds/credentials.tsx'):
+                    self.assertEqual(native(builder, 'shell', command), 'allow', command)
+                for command in ('cat credentials.json','cat secrets.yaml','cat client_secret.json','cat .env x.py','cat server.pem app.py','cat a.key b.ts','cat ~/.aws/credentials',
+                                'git add backend/app/agent_search/credentials.py'):
+                    self.assertEqual(native(builder, 'shell', command), 'ask', command)
             else:
                 self.assertFalse(any(r['resource'] in ENV_TEMPLATE_SHELL_ALLOW for r in builder if r['action']=='shell'))
 
@@ -289,8 +295,8 @@ class ConfigureTests(unittest.TestCase):
         shell=[r for r in permissive['permissions'] if r['action']=='shell']
         self.assertEqual(shell[0],{'action':'shell','resource':'*','effect':'allow'})
         asks=[r['resource'] for r in shell[1:] if r['effect']=='ask']
-        self.assertEqual(sorted(asks),sorted(DANGEROUS_SHELL_ASK))
-        self.assertTrue(all(r['effect']=='ask' or r['resource'] in ENV_TEMPLATE_SHELL_ALLOW for r in shell[1:]))
+        self.assertEqual(sorted(asks),sorted(DANGEROUS_SHELL_ASK+SECRET_REASSERT_SHELL_ASK))
+        self.assertTrue(all(r['effect']=='ask' or r['resource'] in ENV_TEMPLATE_SHELL_ALLOW+SECRET_CODE_SHELL_ALLOW for r in shell[1:]))
         for required in ('git push *--force*','git push * +*','sudo *','rm -rf *','*.env*','bash -*','eval *','git commit*'):
             self.assertIn(required,DANGEROUS_SHELL_ASK)
         # Read-only roles keep their agent-level shell deny, which follows the global allow.
