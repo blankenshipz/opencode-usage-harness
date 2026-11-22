@@ -7,12 +7,35 @@
 // shell guard's evaluate hook turns from ask into deny, so a probe never creates
 // a new ask) and replies "once" only when the current rules now allow it.
 // Requests forced by the harness shell guard always stay with a human.
-import { markers } from './shell-guard.mjs';
+import { markers, isSecretPath } from './shell-guard.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { statePath } from './paths.mjs';
 import { PROBE_TOOL } from './read-scope.mjs';
+import { parkLogger } from './park-yield.mjs';
+
+// r40 H7: a guard-verified call's native ask is answered "once" only when it is the shell/bash
+// permission itself and names nothing secret. external_directory asks and *.env* / *secret* /
+// credential-name asks for the same call are rejected immediately as a hard deny.
+const SHELL_ASK = new Set(['bash', 'shell']);
+const SECRET_NAME = /(^|[^a-z])(\.?env(\.|$)|[^/]*\.env\b|secret|credential|\.netrc|\.npmrc|\.pgpass|id_rsa|id_ed25519|\.ssh\/|\.aws\/|\.kube\/|\.docker\/config|gh\/hosts)/i;
+export function secretLookingAsk(data = {}) {
+  const items = [...(Array.isArray(data.resources) ? data.resources : []), ...(Array.isArray(data.patterns) ? data.patterns : [])].map(String);
+  return items.some(item => SECRET_NAME.test(item) || item.split(/[\s/]+/).some(part => part && isSecretPath(part)));
+}
+export function guardAskDisposition(data = {}) {
+  const action = String(data.action ?? data.permission ?? '');
+  if (action === 'external_directory') return { decision: 'reject', rule: 'external_directory_after_guard' };
+  // Native secret-name asks stay a backstop (Fable r40 H7): a secret-named path word rejects.
+  if (secretLookingAsk(data)) return { decision: 'reject', rule: 'secret_read' };
+  if (SHELL_ASK.has(action)) return { decision: 'once', rule: 'guard_verified_shell' };
+  return { decision: 'pending', rule: 'not_shell_ask' };
+}
+export function guardHardDenyMessage(rule) {
+  return `HARD DENY (harness auto-approve policy; rule: ${rule}): this permission is denied immediately and will not be asked. `
+    + 'Do not retry variants or workarounds. Record a resumable blocker carrying the exact command and continue with other work.';
+}
 
 // r20 items 2/3: the pending map is persisted per location, so a plugin hot reload (deploy) can
 // re-check asks raised under the previous release. Decisions are approve-only and logged.
@@ -120,7 +143,8 @@ const listData = value => Array.isArray(value) ? value : Array.isArray(value?.da
 export async function installPermissionReevaluation(ctx, { delays = [1500, 6000], setTimer = setTimeout, clearTimer = clearTimeout,
   store = ctx?.location?.directory ? pendingStore(ctx.location.directory) : undefined,
   log = ctx?.location?.directory ? reevaluationLogger() : () => {}, now = () => Date.now(),
-  sweep = store?.root ? () => sweepEmptyPending({ root: store.root }) : undefined } = {}) {
+  sweep = store?.root ? () => sweepEmptyPending({ root: store.root }) : undefined,
+  hardDenyLog = ctx?.location?.directory ? parkLogger() : () => {} } = {}) {
   const permission = ctx?.permission;
   if (typeof ctx?.event?.subscribe !== 'function' || typeof permission?.hook !== 'function' || typeof permission?.assert !== 'function' ||
       typeof permission?.list !== 'function' || typeof permission?.reply !== 'function') return { stop() {}, recheck: async () => [] };
@@ -215,12 +239,23 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
           // Guard-forced asks (GUARD_MARKER) always stay with a human.
           if (data.source?.id && !data.metadata?.[markers.GUARD_MARKER] && guardVerified(data.sessionID, data.source.id, now())) {
             const key = `${data.sessionID}\0${data.source.id}`;
-            try {
-              await permission.reply({ sessionID: data.sessionID, requestID: data.id, decision: 'once' });
-              guardDecisions.delete(key);
-              log({ at: new Date(now()).toISOString(), trigger: 'guard_decided', sessionID: data.sessionID, requestID: data.id, action: data.action, outcome: 'approved_once' });
-              continue;
-            } catch { /* fall through: track it like any other pending ask */ }
+            const disposition = guardAskDisposition(data);
+            if (disposition.decision === 'once') {
+              try {
+                await permission.reply({ sessionID: data.sessionID, requestID: data.id, decision: 'once' });
+                guardDecisions.delete(key);
+                log({ at: new Date(now()).toISOString(), trigger: 'guard_decided', sessionID: data.sessionID, requestID: data.id, action: data.action, outcome: 'approved_once' });
+                continue;
+              } catch { /* fall through: track it like any other pending ask */ }
+            } else if (disposition.decision === 'reject') {
+              try {
+                await permission.reply({ sessionID: data.sessionID, requestID: data.id, decision: 'reject', message: guardHardDenyMessage(disposition.rule) });
+                const at = new Date(now()).toISOString();
+                log({ at, trigger: 'guard_decided', sessionID: data.sessionID, requestID: data.id, action: data.action, outcome: 'hard_denied', rule: disposition.rule });
+                hardDenyLog({ at, event: 'ask_hard_denied', sessionID: data.sessionID, permissionID: data.id, rule: disposition.rule, action: data.action ?? data.permission ?? null, source: 'permission_reevaluate' });
+                continue;
+              } catch { /* fall through: track it like any other pending ask */ }
+            }
           }
           pending.set(data.id, data.sessionID);
           const call = data.source?.id ? callAgents.get(`${data.sessionID}\0${data.source.id}`) : undefined;

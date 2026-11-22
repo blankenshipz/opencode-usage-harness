@@ -26,11 +26,13 @@ def args(**overrides):
 
 
 class FakeRunner:
-    def __init__(self, release="0.4.0", resume_available=False):
-        self.calls, self.release, self.resume_available = [], release, resume_available
+    def __init__(self, release="0.4.0", resume_available=False, fail_on=None):
+        self.calls, self.release, self.resume_available, self.fail_on = [], release, resume_available, fail_on
 
     def __call__(self, argv, cwd=None, timeout=60):
         self.calls.append(list(argv))
+        if self.fail_on and self.fail_on in " ".join(argv):
+            return 1, ""
         if "/api/plugin" in argv:
             return 0, '{"id":"x","path":"/p/releases/%s/plugins"}' % self.release
         if "--help" in argv:
@@ -74,7 +76,7 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(json.loads(self.bridge.read_text())["guard_entry"], "old")
 
     def test_wait_polls_until_idle(self):
-        states = iter([{"pending": {}, "busy": 1}, {"pending": {}, "busy": 1}, {"pending": {}, "busy": 0}])
+        states = iter([{"pending": {}, "busy": 1}, {"pending": {}, "busy": 1}, {"pending": {}, "busy": 0}, {"busy": 0}])
         ticks = iter(range(100))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -126,7 +128,7 @@ class DeployTests(unittest.TestCase):
     def test_resume_hook_absent_is_skipped(self):
         code, out, err, _ = self.run_deploy(lambda: {"busy": 0}, resume_command="wr resume")
         self.assertEqual(code, 0, err)
-        self.assertIn("resume hook unavailable, skipped", out)
+        self.assertIn("resume hook unavailable", out)
 
     def test_dry_run_changes_nothing(self):
         code, out, err, _ = self.run_deploy(lambda: self.fail("probe must not run"), dry_run=True, restart=True)
@@ -141,6 +143,98 @@ class DeployTests(unittest.TestCase):
     def test_cli_dispatch_refuses_busy_via_force_false(self):
         parsed = INSTALL.parser().parse_args(["--prefix", str(self.prefix), "deploy", "0.4.0", "--wait", "5", "--restart", "--dry-run"])
         self.assertEqual((parsed.release, parsed.wait, parsed.restart, parsed.dry_run), ("0.4.0", 5.0, True, True))
+
+    def flat(self, runner):
+        return [" ".join(c) for c in runner.calls]
+
+    def test_configure_runs_new_release_with_models_and_state(self):
+        code, out, err, runner = self.run_deploy(lambda: {"busy": 0})
+        self.assertEqual(code, 0, err)
+        cmd = [c for c in self.flat(runner) if "configure.py" in c][0]
+        self.assertIn(str(self.prefix / "releases/0.4.0/configure.py"), cmd)
+        self.assertIn("--models %s" % (self.root / "models.json"), cmd)
+        self.assertIn("--state-dir %s" % (self.root / "state"), cmd)
+        self.assertTrue(cmd.endswith("--replace"))
+
+    def test_configure_failure_rolls_back(self):
+        code, out, err, _ = self.run_deploy(lambda: {"busy": 0}, runner=FakeRunner(fail_on="configure.py"))
+        self.assertEqual(code, 5)
+        self.assertEqual(Path(os.readlink(self.prefix / "current")).name, "0.3.9")
+        self.assertEqual(json.loads(self.bridge.read_text())["guard_entry"], "old")
+
+    def test_idle_recheck_before_switch_aborts(self):
+        states = iter([{"busy": 0}, {"busy": 1}])
+        code, out, err, runner = self.run_deploy(lambda: next(states))
+        self.assertEqual(code, 3)
+        self.assertIn("before switch", err)
+        self.assertEqual(Path(os.readlink(self.prefix / "current")).name, "0.3.9")
+        self.assertFalse(any("configure.py" in c for c in self.flat(runner)))
+
+    def test_idle_recheck_before_restart_reverts_switch(self):
+        states = iter([{"busy": 0}, {"busy": 0}, {"pending": {self.project: 1}}])
+        code, out, err, runner = self.run_deploy(lambda: next(states), restart=True)
+        self.assertEqual(code, 3)
+        self.assertIn("before restart", err)
+        self.assertEqual(Path(os.readlink(self.prefix / "current")).name, "0.3.9")
+        self.assertFalse((self.prefix / "previous").is_symlink())
+        self.assertEqual(json.loads(self.bridge.read_text())["guard_entry"], "old")
+        self.assertFalse(any("service" in c for c in self.flat(runner)))
+
+    def test_restart_failure_rolls_back_to_previous(self):
+        code, out, err, _ = self.run_deploy(lambda: {"busy": 0}, restart=True, runner=FakeRunner(fail_on="service start"))
+        self.assertEqual(code, 5)
+        self.assertIn("rolled current back to 0.3.9", err)
+        self.assertEqual(Path(os.readlink(self.prefix / "current")).name, "0.3.9")
+
+    def test_workrelay_fast_forward_step(self):
+        wr = str(self.root / "wr")
+        code, out, err, runner = self.run_deploy(lambda: {"busy": 0}, workrelay_dir=wr, workrelay_ref="origin/main")
+        self.assertEqual(code, 0, err)
+        flat = self.flat(runner)
+        self.assertIn("git -C %s fetch origin" % wr, flat)
+        self.assertIn("git -C %s merge --ff-only origin/main" % wr, flat)
+        self.assertFalse(any("stash" in c or "reset" in c or "checkout" in c for c in flat))
+        self.assertIn("workrelay fast-forwarded", out)
+
+    def test_workrelay_conflict_aborts_step_only(self):
+        code, out, err, runner = self.run_deploy(lambda: {"busy": 0}, workrelay_dir=str(self.root / "wr"),
+                                                 workrelay_ref="origin/main", runner=FakeRunner(fail_on="--ff-only"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("workrelay update aborted", out)
+        self.assertIn("nothing was discarded", out)
+
+    def test_default_resume_calls_resume_interrupted_all(self):
+        (self.root / "workrelay/src/workrelay").mkdir(parents=True)
+        self.bridge.write_text(json.dumps({"guard_entry": "old", "authorized_owner": "owner1"}))
+        runner = FakeRunner(resume_available=True)
+        code, out, err, _ = self.run_deploy(lambda: {"busy": 0}, resume_command=None, runner=runner)
+        self.assertEqual(code, 0, err)
+        flat = self.flat(runner)
+        self.assertTrue(any(c.endswith("workrelay.cli --config %s resume-interrupted --help" % self.bridge) for c in flat))
+        run = [c for c in flat if "--all-interrupted" in c][0]
+        self.assertIn("resume-interrupted --owner owner1 --restart-id deploy-", run)
+        self.assertIn("PYTHONPATH=%s" % (self.root / "workrelay/src"), run)
+        self.assertIn("resume hook exit 0", out)
+
+    def test_projects_from_full_auto_config(self):
+        (self.root / "state/config/configure-choices.json").write_text(json.dumps(
+            {"full_auto_projects": [{"directory": self.project}, "/abs/other"]}))
+        context = INSTALL.DeployContext(self.prefix, args())
+        self.assertEqual(context.projects, [self.project, "/abs/other"])
+
+    def test_no_projects_refused_without_force(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = INSTALL.deploy(self.prefix, args(), probe=lambda: {"busy": 0}, runner=FakeRunner(), sleep=lambda s: None)
+        self.assertEqual(code, 3)
+        self.assertIn("no projects", err.getvalue())
+
+    def test_count_pending_parses_json(self):
+        self.assertEqual(INSTALL.count_pending('[{"id": "per_1"}, {"id":"per_2"}, {"id": "x"}]'), 2)
+        self.assertEqual(INSTALL.count_pending('{"data": [{"id": "per_1"}]}'), 1)
+        self.assertEqual(INSTALL.count_pending(''), 0)
+        with self.assertRaises(INSTALL.InstallError):
+            INSTALL.count_pending("not json")
 
 
 @unittest.skipUnless(shutil.which("git"), "git required")

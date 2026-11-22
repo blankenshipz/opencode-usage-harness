@@ -401,7 +401,8 @@ def rollback(prefix: Path) -> str:
 # scripts.  Every external effect goes through a runner so tests can inject it;
 # command output is never echoed because env.sh-sourced commands may see secrets.
 DEPLOY_BUSY_EXIT = 3
-DEFAULT_RESUME_COMMAND = "python3 -m workrelay.cli resume-after-restart"
+DEFAULT_RESUME_COMMAND = "python3 -m workrelay.cli --config <bridge> resume-interrupted --owner <owner> --restart-id <id> --all-interrupted"
+DEPLOY_FAILED_EXIT = 5
 COMMIT_HOOK_MARKER = "# harness: prepare-commit-msg attribution"
 
 
@@ -414,11 +415,48 @@ class DeployContext:
         self.gateway = Path(args.gateway_dir).expanduser() if args.gateway_dir else self.root / "gateway"
         self.db = Path(args.opencode_db).expanduser() if args.opencode_db else self.root / "xdg/data/opencode/opencode.db"
         env_projects = [p for p in os.environ.get("HARNESS_DEPLOY_PROJECTS", "").split(":") if p]
-        self.projects = [str(Path(p).expanduser()) for p in (args.project or env_projects)]
+        self.models = Path(getattr(args, "models", None) or prefix.parent / "models.json").expanduser()
+        self.state_dir = Path(getattr(args, "deploy_state_dir", None) or prefix.parent / "state").expanduser()
+        self.projects = [str(Path(p).expanduser()) for p in (args.project or env_projects)] or self.configured_projects()
+        wr = getattr(args, "workrelay_dir", None)
+        self.workrelay_dir = Path(wr).expanduser() if wr else None
+        self.workrelay_ref = getattr(args, "workrelay_ref", None)
+        self.resume_owner = getattr(args, "resume_owner", None)
         self.backups = Path(args.backup_dir).expanduser() if args.backup_dir else self.root / "backups"
         self.config_files = [self.root / "state/config/opencode.json", self.root / "state/config/configure-choices.json", self.bridge, self.gateway / "mcp.json"]
-        resume = args.resume_command if args.resume_command is not None else os.environ.get("HARNESS_DEPLOY_RESUME_COMMAND", DEFAULT_RESUME_COMMAND)
+        resume = args.resume_command if args.resume_command is not None else os.environ.get("HARNESS_DEPLOY_RESUME_COMMAND")
+        self.resume_default = resume is None
         self.resume_command = shlex.split(resume) if resume else []
+
+    def configured_projects(self) -> list[str]:
+        """full_auto_projects from the persisted configure choices (state/config)."""
+        try:
+            data = json.loads((self.state_dir / "config/configure-choices.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        entries = data.get("full_auto_projects") if isinstance(data, dict) else None
+        found = []
+        for entry in entries if isinstance(entries, list) else []:
+            directory = entry.get("directory") if isinstance(entry, dict) else entry
+            if isinstance(directory, str) and directory.startswith("/"):
+                found.append(directory)
+        return found
+
+    def default_resume(self, restart_id: str) -> list[str]:
+        """workrelay's real resume-interrupted, roots found by workrelay itself (--all-interrupted)."""
+        owner = self.resume_owner
+        if not owner:
+            try:
+                owner = json.loads(self.bridge.read_text(encoding="utf-8")).get("authorized_owner")
+            except (OSError, ValueError, AttributeError):
+                owner = None
+        if not isinstance(owner, str) or not owner:
+            return []
+        base = ["python3", "-m", "workrelay.cli", "--config", str(self.bridge), "resume-interrupted"]
+        workrelay = self.workrelay_dir or self.root / "workrelay"
+        if (workrelay / "src/workrelay").is_dir():
+            base = ["env", "PYTHONPATH=%s" % (workrelay / "src"), *base]
+        return [*base, "--owner", owner, "--restart-id", restart_id, "--all-interrupted"]
 
     def wrapped(self, argv: list[str]) -> list[str]:
         """Run argv with env.sh sourced (when present), output kept private."""
@@ -451,6 +489,19 @@ def count_busy_sessions(db: Path, window_hours: float = 6) -> int:
         connection.close()
 
 
+def count_pending(out: str) -> int:
+    """Parse the /api/permission/request JSON (a list, or an object with data/items)."""
+    try:
+        data = json.loads(out or "[]")
+    except ValueError:
+        raise InstallError("could not parse pending asks response") from None
+    if isinstance(data, dict):
+        data = data.get("data", data.get("items", data.get("requests", [])))
+    if not isinstance(data, list):
+        raise InstallError("unexpected pending asks response")
+    return sum(1 for item in data if isinstance(item, dict) and str(item.get("id", "")).startswith("per_"))
+
+
 def default_probe(context: DeployContext, runner=default_runner) -> dict[str, object]:
     """Pending permission asks per project (r7-pending.sh) plus busy sessions."""
     pending: dict[str, int] = {}
@@ -458,7 +509,7 @@ def default_probe(context: DeployContext, runner=default_runner) -> dict[str, ob
         code, out = runner(context.wrapped(["opencode", "api", "GET", "/api/permission/request", "-H", "x-opencode-directory:%s" % project]), cwd=project, timeout=10)
         if code != 0:
             raise InstallError("could not query pending asks for %s" % project)
-        pending[project] = out.count('"id":"per_')
+        pending[project] = count_pending(out)
     return {"pending": pending, "busy": count_busy_sessions(context.db)}
 
 
@@ -520,7 +571,11 @@ def deploy_plan(context: DeployContext, release: str, args) -> list[str]:
     if args.restart:
         plan += ["stop gateway (%s/gateway.pid)" % context.gateway, "opencode service stop; opencode service start", "start gateway (%s/start-gateway.sh)" % context.gateway]
     plan.append("warm plugins and verify releases/%s is loaded in: %s" % (release, ", ".join(context.projects) or "(no projects)"))
-    plan.append("resume hook: %s" % (" ".join(context.resume_command) if context.resume_command else "(disabled)"))
+    plan.insert(4, "regenerate native config: %s/configure.py --models %s --state-dir %s --replace" % (release, context.models, context.state_dir))
+    if context.workrelay_dir and context.workrelay_ref:
+        plan.insert(5, "git -C %s fetch origin; merge --ff-only %s" % (context.workrelay_dir, context.workrelay_ref))
+    resume = context.default_resume("<restart-id>") if context.resume_default else context.resume_command
+    plan.append("resume hook: %s" % (" ".join(resume) if resume else "(disabled)"))
     return plan
 
 
@@ -561,14 +616,51 @@ def warm_and_verify(context: DeployContext, release: Path, runner) -> dict[str, 
     return loaded
 
 
-def run_resume_hook(context: DeployContext, runner) -> str:
-    if not context.resume_command:
-        return "resume hook disabled"
-    code, _ = runner(context.wrapped([*context.resume_command, "--help"]), cwd=str(context.root), timeout=30)
+def run_resume_hook(context: DeployContext, runner, restart_id: str) -> str:
+    command = context.default_resume(restart_id) if context.resume_default else context.resume_command
+    if not command:
+        return "resume hook disabled" if not context.resume_default else "resume hook skipped: no workrelay owner (set --resume-owner)"
+    help_argv = command[:command.index("--owner")] + ["--help"] if context.resume_default else [*command, "--help"]
+    code, _ = runner(context.wrapped(help_argv), cwd=str(context.root), timeout=30)
     if code != 0:
-        return "resume hook unavailable, skipped"
-    code, _ = runner(context.wrapped(context.resume_command), cwd=str(context.root), timeout=120)
+        return "resume hook unavailable (--help exit %d), skipped" % code
+    code, _ = runner(context.wrapped(command), cwd=str(context.root), timeout=120)
     return "resume hook exit %d" % code
+
+
+def run_configure(context: DeployContext, release: Path, runner) -> int:
+    code, _ = runner(context.wrapped(["python3", str(release / "configure.py"), "--models", str(context.models),
+                                      "--state-dir", str(context.state_dir), "--replace"]), cwd=str(context.root), timeout=180)
+    return code
+
+
+def update_workrelay(context: DeployContext, runner) -> str:
+    """git fetch + merge --ff-only; never stashes or discards local changes."""
+    if not context.workrelay_dir or not context.workrelay_ref:
+        return "workrelay update not requested"
+    directory = str(context.workrelay_dir)
+    code, _ = runner(["git", "-C", directory, "fetch", "origin"], cwd=directory, timeout=120)
+    if code != 0:
+        return "workrelay update aborted: git fetch failed (exit %d); checkout unchanged" % code
+    code, _ = runner(["git", "-C", directory, "merge", "--ff-only", context.workrelay_ref], cwd=directory, timeout=120)
+    if code != 0:
+        return ("workrelay update aborted: merge --ff-only %s failed (exit %d): not a fast-forward or uncommitted "
+                "changes conflict; nothing was discarded or stashed, resolve by hand" % (context.workrelay_ref, code))
+    return "workrelay fast-forwarded to %s" % context.workrelay_ref
+
+
+def restore_switch(context: DeployContext, prefix: Path, backup: Path, current: Path | None, previous: Path | None) -> None:
+    """Put current/previous and the backed-up config files back."""
+    if current:
+        atomic_link(prefix / "current", current)
+    if previous:
+        atomic_link(prefix / "previous", previous)
+    elif current and (prefix / "previous").is_symlink():
+        (prefix / "previous").unlink()
+    for target in context.config_files:
+        saved = backup / target.name
+        if saved.is_file():
+            shutil.copy2(saved, target)
 
 
 def deploy(prefix: Path, args, probe=None, runner=default_runner, sleep=time.sleep, clock=time.monotonic) -> int:
@@ -582,18 +674,34 @@ def deploy(prefix: Path, args, probe=None, runner=default_runner, sleep=time.sle
         for number, step in enumerate(deploy_plan(context, args.release, args), 1):
             print("%d. %s" % (number, step))
         return 0
+    if not context.projects and not args.force:
+        print("deploy refused: no projects (--project, HARNESS_DEPLOY_PROJECTS or full_auto_projects in %s); "
+              "pending asks cannot be checked, use --force to override" % context.state_dir, file=sys.stderr)
+        return DEPLOY_BUSY_EXIT
     probe_fn = probe or (lambda: default_probe(context, runner))
+
+    def still_idle(stage: str) -> bool:
+        reasons = busy_reasons(probe_fn())
+        if reasons and not args.force:
+            print("deploy refused %s, busy: %s" % (stage, "; ".join(reasons)), file=sys.stderr)
+            return False
+        return True
+
     reasons = wait_until_idle(probe_fn, float(args.wait or 0), sleep=sleep, clock=clock)
     if reasons and not args.force:
         print("deploy refused, busy: %s" % "; ".join(reasons), file=sys.stderr)
         return DEPLOY_BUSY_EXIT
     if not args.skip_validate:
         validate_release(release)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    restart_id = re.sub(r"[^A-Za-z0-9._:-]", "-", "deploy-%s-%s" % (stamp, args.release))[:80]
     lock = lock_prefix(prefix)
     try:
+        if not still_idle("before switch"):
+            return DEPLOY_BUSY_EXIT
         current = link_target(prefix, "current") if not args.skip_validate else ((prefix / "current").resolve() if (prefix / "current").is_symlink() else None)
         previous = (prefix / "previous").resolve() if (prefix / "previous").is_symlink() else None
-        backup = backup_config(context, current, previous, time.strftime("%Y%m%d-%H%M%S"))
+        backup = backup_config(context, current, previous, stamp)
         print("backup %s" % backup)
         if current and current != release.resolve():
             atomic_link(prefix / "previous", current)
@@ -602,17 +710,34 @@ def deploy(prefix: Path, args, probe=None, runner=default_runner, sleep=time.sle
         if context.bridge.is_file():
             write_bridge_guard_entry(context.bridge, release.absolute())
             print("guard_entry updated")
+        code = run_configure(context, release, runner)
+        if code != 0:
+            restore_switch(context, prefix, backup, current, previous)
+            print("deploy failed: configure.py exit %d; rolled back to %s" % (code, current.name if current else "none"), file=sys.stderr)
+            return DEPLOY_FAILED_EXIT
+        print("native permission config regenerated")
+        if args.restart and not still_idle("before restart"):
+            restore_switch(context, prefix, backup, current, previous)
+            print("switch reverted to %s; nothing restarted" % (current.name if current else "none"), file=sys.stderr)
+            return DEPLOY_BUSY_EXIT
+        print(update_workrelay(context, runner))
+        if args.restart:
+            try:
+                restart_services(context, runner, sleep=sleep)
+            except InstallError as error:
+                restore_switch(context, prefix, backup, current, previous)
+                print("deploy failed: restart: %s; rolled current back to %s (services may need a manual restart)"
+                      % (error, current.name if current else "none"), file=sys.stderr)
+                return DEPLOY_FAILED_EXIT
+            print("restarted opencode service and gateway")
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
-    if args.restart:
-        restart_services(context, runner, sleep=sleep)
-        print("restarted opencode service and gateway")
     loaded = warm_and_verify(context, release, runner)
     missing = [p for p, n in loaded.items() if n == 0]
     for project, count in sorted(loaded.items()):
         print("%s: %d plugin(s) from %s" % (project, count, release.name))
-    print(run_resume_hook(context, runner))
+    print(run_resume_hook(context, runner, restart_id))
     if missing:
         print("deploy: release not loaded in: %s" % ", ".join(missing), file=sys.stderr)
         return 4
@@ -698,6 +823,11 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--opencode-db", help="opencode.db for busy sessions (default <root>/xdg/data/opencode/opencode.db)")
     command.add_argument("--backup-dir", help="backup directory (default <root>/backups)")
     command.add_argument("--resume-command", default=None, help="resume-after-restart command; empty string disables (default $HARNESS_DEPLOY_RESUME_COMMAND or %s)" % DEFAULT_RESUME_COMMAND)
+    command.add_argument("--models", help="models.json for configure.py (default <prefix>/../models.json)")
+    command.add_argument("--state-dir", dest="deploy_state_dir", help="state dir for configure.py (default <prefix>/../state)")
+    command.add_argument("--workrelay-dir", help="live workrelay git checkout to fast-forward (with --workrelay-ref)")
+    command.add_argument("--workrelay-ref", help="ref to merge --ff-only after git fetch origin, e.g. origin/main")
+    command.add_argument("--resume-owner", help="workrelay owner for resume-interrupted (default authorized_owner in the bridge config)")
     command.add_argument("--skip-validate", action="store_true", help="skip manifest validation of the release")
     command = sub.add_parser("install-commit-hook", help="install the prepare-commit-msg attribution hook into a repo")
     command.add_argument("repo", type=Path)

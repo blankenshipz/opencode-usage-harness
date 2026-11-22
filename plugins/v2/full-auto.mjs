@@ -173,10 +173,25 @@ export function loadFullAutoProjects({ choicesPath = path.join(managedConfigRoot
 }
 
 // 0.4.0: any project directory not listed gets the same auto-approve + hard-deny policy.
-export function defaultFullAutoProject(directory) {
-  if (typeof directory !== 'string' || !path.isAbsolute(directory) || directory === '/' ) return undefined;
-  const resolved = path.resolve(directory);
-  if (resolved === path.resolve(os.homedir())) return undefined;
+// r40 M5: the fallback root must be a real project directory, never a broad parent. The path is
+// resolved and realpath'd first (so `/.`, `//` and symlinked aliases are judged by their target).
+// Allowed: strictly under $HOME with at least 3 components, or strictly under /workspace or /tmp;
+// never a directory that equals or contains $HOME, $HOME/work or /workspace.
+const FALLBACK_REFUSED = ['/', '/home', '/workspace', '/opt', '/etc', '/usr', '/var', '/tmp', '/root', '/srv', '/mnt', '/media'];
+export function defaultFullAutoProject(directory, { home = os.homedir(), realpath = fs.realpathSync } = {}) {
+  if (typeof directory !== 'string' || !path.isAbsolute(directory)) return undefined;
+  const real = p => realish(path.resolve(p), { realpath });
+  const resolved = real(directory);
+  const homeReal = typeof home === 'string' && path.isAbsolute(home) ? real(home) : undefined;
+  const depth = resolved.split('/').filter(Boolean).length;
+  const refused = new Set([...FALLBACK_REFUSED, ...FALLBACK_REFUSED.map(real)]);
+  if (refused.has(resolved)) return undefined;
+  const parents = ['/workspace', real('/workspace')];
+  if (homeReal) parents.push(homeReal, path.join(homeReal, 'work'), path.resolve(home), path.join(path.resolve(home), 'work'));
+  if (parents.some(parent => contains(resolved, parent))) return undefined; // equals or contains a known parent
+  const under = root => strictlyInside(root, resolved);
+  const allowed = (homeReal && under(homeReal) && depth >= 3) || under('/workspace') || under(real('/workspace')) || under('/tmp') || under(real('/tmp'));
+  if (!allowed) return undefined;
   return { directory: resolved, roots: [resolved], implicit: true };
 }
 export function fullAutoProjectFor(directory, projects = loadFullAutoProjects()) {
@@ -716,17 +731,131 @@ function segmentCwds(segments, base, home) {
   return cwds;
 }
 
+// ---- 0.4.0 hard-deny classification on parsed words (never on reason text) ----
+// A redirect onto an existing directory fails; it truncates nothing.
+const isDirectory = target => { try { return path.isAbsolute(target) && fs.statSync(target).isDirectory(); } catch { return false; } };
+const resetHeadOnly = words => {
+  const k = words.findIndex(isGitWord); if (k < 0) return false;
+  const { sub, rest } = git(words, k);
+  return sub === 'reset' && rest.every(arg => /^(-q|--quiet|--hard|HEAD|@)$/.test(arg));
+};
+const READERS = /(^|\/)(cat|tac|less|more|head|tail|grep|egrep|fgrep|rg|strings|base64|xxd|od|hexdump|nl|sed|awk|jq|bat|source|\.|cp|scp|nc|openssl)$/;
+const CRED_PATH = /(^|\/)(\.netrc|\.npmrc|\.pypirc|\.pgpass|\.git-credentials|hosts\.yml|config\.json|\.kube\/config|[^/]*\.p12|[^/]*\.pfx|service-account[^/]*\.json|[^/]*\.tfstate(\.backup)?|token[^/]*\.txt|environ)$/;
+const SECRET_GLOB = /(^|\/)[.\[]?[\[\]?*]*\.?\[?e[\]?*]|(^|\/)\.[^/]*[*?[]/;
+const isDynamic = word => /[$`]/.test(word);
+// The next segment only counts or tests matches (`printenv | grep -c X`, `| wc -l`): nothing is printed.
+const quietPipe = (segments, n) => { const next = segments[n + 1]; return next?.prevSep === '|' && (/^(wc)$/.test(next.words[0]) && next.words.some(w => /^-[a-zA-Z]*[clmw]/.test(w)) || (/^grep$/.test(next.words[0]) && next.words.some(w => /^-[a-zA-Z]*[cq]/.test(w)))) && !segments[n + 2]?.prevSep?.startsWith('|'); };
+function hardExtras(segment, segments, n, ctx, vars) {
+  const out = [];
+  const { words } = segment;
+  const cmd = words.findIndex(word => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) && !['sudo', 'env', 'time', 'nice', 'nohup', 'command', 'timeout'].includes(word));
+  const head = cmd >= 0 ? words[cmd] : '';
+  const args = cmd >= 0 ? words.slice(cmd + 1) : [];
+  // Undeterminable command word (G=git; $G ...), eval, xargs feeding dangerous commands.
+  if (isDynamic(head)) out.push(['history', `command word ${JSON.stringify(head)} is not literal`]);
+  if (/(^|\/)xargs$/.test(head) && args.some(arg => /(^|\/)(git|rm|rmdir|unlink|cat|sh|bash|curl|mv|shred|truncate)$/.test(arg))) out.push(['delete', 'xargs feeds input to a push, delete, shell or reader']);
+  if (head === 'eval' && args.some(isDynamic)) out.push(['delete', 'eval of a non-literal string']);
+  // Git: fail closed on pushes with dynamic args, aliases, remote.*.push config, more rewrites.
+  for (let k = 0; k < words.length; k++) {
+    if (!isGitWord(words[k])) continue;
+    const { sub, rest, chdirs } = git(words, k);
+    const globals = words.slice(k + 1, words.indexOf(sub, k + 1));
+    if (globals.some(arg => /^alias\./i.test(arg) || /^pull\.rebase=(true|i|m|interactive|merges)/i.test(arg))) out.push(['history', 'git -c alias/pull.rebase can rewrite history']);
+    if (sub === undefined || isDynamic(sub)) { if (sub !== undefined) out.push(['history', 'git subcommand is not literal']); continue; }
+    const has = re => rest.some(arg => re.test(arg));
+    if (sub === 'push' && rest.some(isDynamic)) out.push(['history', 'git push with non-literal arguments']);
+    if (sub === 'push' && has(/^(-[a-zA-Z]*[fd]|--force|--force-with-lease|--delete|--prune|--mirror)/)) out.push(['history', 'git push force/delete']);
+    if (sub === 'push' && rest.some(arg => /^\+|^:/.test(arg))) out.push(['history', 'git push forced or deleting refspec']);
+    if (sub === 'config' && has(/^remote\..*\.push$|^alias\./i)) out.push(['history', 'git config redefines push or aliases']);
+    if (sub === 'pull' && has(/^(-r|--rebase(=(true|i|interactive|merges))?)$/)) out.push(['history', 'git pull --rebase rewrites history']);
+    if (sub === 'reset' && has(/^--keep$/)) out.push(['history', 'git reset --keep rewrites the branch']);
+    if (sub === 'reset' && has(/^--hard$/) && !resetHeadOnly(words.slice(k))) out.push(['history', 'git reset --hard to another commit']);
+    if (sub === 'update-ref') out.push(['history', 'git update-ref rewrites a ref']);
+    if (sub === 'branch' && has(/^(-[a-zA-Z]*[fD]|--force|--delete)$/)) out.push(['history', 'git branch -f/-D rewrites or deletes a branch']);
+    if ((sub === 'checkout' || sub === 'switch') && has(/^(-B|-C|--force-create)$/)) out.push(['history', `git ${sub} -B resets a branch`]);
+    if (sub === 'send-pack' && has(/^(--force|-f|--mirror)$/)) out.push(['history', 'git send-pack --force']);
+    if (sub === 'clean' && (chdirs.length || rest.some(isDynamic))) out.push(['delete', 'git clean in another repository']);
+    if (['rebase', 'filter-branch', 'filter-repo', 'replace'].includes(sub)) out.push(['history', `git ${sub} rewrites history`]);
+  }
+  if (/(^|\/)gh$/.test(head) && args[0] === 'api' && /\/git\/refs/.test(args.join(' ')) && (args.some(a => /^(-XDELETE|DELETE|--method=DELETE)$/i.test(a)) || args.some(a => /^force=true$/.test(a)))) out.push(['history', 'gh api deletes or force-updates a ref']);
+  // Deletes the old checks miss.
+  if (/(^|\/)(mv|truncate|tar)$/.test(head) && ctx.cwds) {
+    const targets = head === 'truncate' ? args.filter(a => !a.startsWith('-') && !/^\d+[KMG]?$/.test(a)) : head === 'mv' ? args.filter(a => !a.startsWith('-')).slice(0, -1) : args.some(a => /^--remove-files/.test(a)) ? args.filter(a => !a.startsWith('-')) : [];
+    for (const t of targets) { const why = deleteTargetDanger(t, ctx); if (why) out.push(['delete', `${head}: ${why}`]); }
+  }
+  if ((/(^|\/)python[0-9.]*$/.test(head) && args.includes('-c')) || (/(^|\/)perl$/.test(head) && args.some(a => /^-[a-zA-Z]*e$/.test(a)))) {
+    const code = args.join(' ');
+    if (/rmtree|unlink|rmdir|os\.remove|\bremove\(|truncate/.test(code)) {
+      const lits = [...code.matchAll(/['"]((?:\/|~)[^'"]*)['"]|q\(([^)]*)\)/g)].map(m => m[1] ?? m[2]);
+      if (!lits.length) out.push(['delete', 'interpreter deletes an undeterminable path']);
+      for (const lit of lits) { const why = deleteTargetDanger(lit, ctx); if (why) out.push(['delete', `interpreter delete: ${why}`]); }
+    }
+    if (/environ|open\([^)]*["'][^"']*(\.env|netrc|npmrc|\.e["']\s*\+)/.test(code)) out.push(['secret', 'interpreter reads environment or secrets']);
+  }
+  // Symlink created earlier in this command, then deleted through.
+  if (/(^|\/)(rm|rmdir|unlink|find|rsync)$/.test(head)) {
+    const links = segments.slice(0, n).filter(s => s.words[0] === 'ln' && s.words.some(w => /^-[a-zA-Z]*s/.test(w))).map(s => s.words.filter(w => !w.startsWith('-')).at(-1));
+    if (links.some(link => args.some(a => a === link || a.startsWith(link.replace(/\/$/, '') + '/')))) out.push(['delete', 'deletes through a symlink created in the same command']);
+  }
+  if (head === 'rm' && args.some(a => /(^|\/)\.git\/?$/.test(a))) out.push(['history', 'rm of .git destroys history']);
+  // Secrets.
+  if (/(^|\/)(printenv|env|export|set|declare)$/.test(head) && !args.some(a => !a.startsWith('-') && !/=/.test(a)) && !(head === 'export' && args.length) && !(head === 'set' && args.length) && !(head === 'declare' && args.length) && !quietPipe(segments, n)) out.push(['secret', `${head} prints the environment`]);
+  if (/(^|\/)gh$/.test(head) && args[0] === 'auth' && args[1] === 'token') out.push(['secret', 'gh auth token prints a token']);
+  if (/(^|\/)(echo|printf)$/.test(head) && args.some(a => /\$\{?[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)/i.test(a)) && !quietPipe(segments, n)) out.push(['secret', 'prints a secret environment variable']);
+  if (/(^|\/)curl$/.test(head) && args.some((a, i) => /^@/.test(a) && /^(-d|--data[a-z-]*|-F|--form|-T|--upload-file)$/.test(args[i - 1] ?? '') && (isDynamic(a) || isSecretPath(a.slice(1)) || CRED_PATH.test(a.slice(1)) || /[*?[]/.test(a)) || /^(-d|-F|--data[a-z-]*|--form)=?.*=?@(\.env|.*[$`*?])/.test(a) || /^[A-Za-z0-9_]+=@/.test(a) && (isSecretPath(a.split('@')[1]) || isDynamic(a)))) out.push(['secret', 'curl uploads a secret file']);
+  if (/(^|\/)(tar|zip|scp|rsync)$/.test(head)) {
+    const pos = args.filter(a => !a.startsWith('-'));
+    const whole = pos.some(a => a === '.' || a === './' || a === '*' || (ctx.roots.some(r => r === a)));
+    const remoteOrOut = head === 'tar' ? args.some((a, i) => a === '-' || /f$/.test(a) && args[i + 1] === '-') || segment.redirects.some(r => r.file) || segments[n + 1]?.prevSep === '|' : pos.some(a => /^[^/.~][^/]*:/.test(a));
+    if (whole && (remoteOrOut || head === 'tar' || head === 'zip')) out.push(['secret', `${head} copies the whole repository (including secrets) out`]);
+  }
+  const READ = READERS.test(head);
+  // The first positional of awk/sed/jq/grep/rg is a program or pattern, not a file.
+  const programIndex = /(^|\/)(awk|sed|jq|grep|egrep|fgrep|rg)$/.test(head) && !args.some(a => /^(-e|-f|--regexp|--file)$/.test(a)) ? args.findIndex(a => !a.startsWith('-')) : -1;
+  for (const [i, a] of args.entries()) {
+    if (a.startsWith('-') && !a.includes('/')) continue;
+    if (i === programIndex) continue;
+    if (/(^|\/)proc\/[^/]+\/environ$/.test(a) || /(^|\/)proc\/[*?]/.test(a)) out.push(['secret', 'reads a process environment']);
+    else if (CRED_PATH.test(a) && (READ || /(^|\/)(curl|tar|zip|rsync)$/.test(head))) out.push(['secret', `reads credential file ${JSON.stringify(a)}`]);
+    else if (READ && isDynamic(a) && !/^\$\{?(HOME|PWD|TMPDIR)\}?(\/|$)/.test(a)) out.push(['secret', `reader argument ${JSON.stringify(a)} is not literal`]);
+    else if (READ && /[*?[]/.test(a) && /(^|\/)[^/]*(\.|\[\.?)?[^/]*[*?[]/.test(a) && /(^|\/)\.?\[?\.?[eE*?[]/.test(a.split('/').at(-1)) && /^[.[*?]/.test(a.split('/').at(-1))) out.push(['secret', `reader glob ${JSON.stringify(a)} can match a secret file`]);
+  }
+  // A reader whose file arguments come from a command substitution (`cat \`ls | grep env\``) is undeterminable.
+  if (READ && segments[n + 1]?.sub === true && segments[n + 1]?.prevSep === '`') out.push(['secret', `${head} reads files named by a command substitution`]);
+  // find -exec/-execdir/-ok <reader> over a name glob that can match a secret (`find . -name ".e*" -exec cat {} +`).
+  if (/(^|\/)find$/.test(head)) {
+    const execs = args.flatMap((a, i) => /^-(exec|execdir|ok|okdir)$/.test(a) ? [args[i + 1]] : []);
+    const names = args.flatMap((a, i) => /^-(i?name|i?path|regex)$/.test(a) ? [args[i + 1] ?? ''] : []);
+    if (execs.some(x => x && (READERS.test(x) || SHELL_WORD.test(x))) && (!names.length || names.some(nm => isDynamic(nm) || isSecretPath(nm.replace(/[*?]/g, 'x')) || /^(\.|\[\.)/.test(nm) || /\.env|\.pem$|\.key$|netrc|credentials|secret/i.test(nm))))
+      out.push(['secret', 'find -exec reader over files that can be secrets']);
+  }
+  // Input piped into a shell, or `sh` reading a pipe.
+  if (SHELL_WORD.test(head) && segment.prevSep === '|' && !args.some(a => /^-[a-zA-Z]*c/.test(a))) out.push(['delete', `${head} runs piped input`]);
+  // Garage exemption is a single file: a recursive grep over the directory reads .env too.
+  if (words.some(w => /^-[a-zA-Z]*[rR]/.test(w)) && words.some(w => /^\/opt\/wncscanner-docker\/?$/.test(w))) out.push(['secret', 'recursive read over /opt/wncscanner-docker']);
+  return out;
+}
+
+// Structured hard-deny check: [{ rule: 'history'|'delete'|'secret', reason }] (empty: allow).
+export function hardDenyCheck(command, cwd, project, opts = {}) {
+  const hard = [];
+  fullAutoShellCheck(command, cwd, project, { ...opts, hard });
+  const seen = new Set();
+  return hard.filter(entry => { const k = entry.rule + entry.reason; if (seen.has(k)) return false; seen.add(k); return true; });
+}
+
 // Returns the reasons a full-auto project must still ask for a raw command (empty: allow).
 // cwd: the shell's working directory; project: from fullAutoProjectFor. paths:false skips the
 // path-dependent checks (used to re-check parsed native resources in the evaluate hook).
 // amendOk only applies to top-level local segments; amends in sh -c/eval/heredoc/ssh bodies still ask.
 // garage: this is the remote command of a local `ssh garage-server` (set by the recursion only).
-export function fullAutoShellCheck(command, cwd, project, { home = process.env.HOME || os.homedir(), remote = false, paths = true, depth = 0, amendOk = false, garage = false } = {}) {
-  if (typeof command !== 'string') return ['command is not a string'];
-  if (depth > 4) return ['commands nested too deeply to inspect'];
+export function fullAutoShellCheck(command, cwd, project, { home = process.env.HOME || os.homedir(), remote = false, paths = true, depth = 0, amendOk = false, garage = false, hard } = {}) {
+  const H = (rule, reason) => { if (hard) hard.push({ rule, reason }); return reason; };
+  if (typeof command !== 'string') return [H('secret', 'command is not a string')];
+  if (depth > 4) return [H('delete', 'commands nested too deeply to inspect')];
   const { segments } = scanShell(command);
   const reasons = [];
-  const ctx = { cwds: remote ? new Set([REMOTE_HOME]) : segmentCwds(segments, cwd, home), roots: project?.roots ?? [], home, remote };
+  const ctx = { cwds: remote ? new Set([REMOTE_HOME]) : segmentCwds(segments, cwd, home), roots: [...(project?.roots ?? []), ...(hard ? ['/tmp'] : [])], home, remote };
   if (remote) { const tracked = segmentCwds(segments, REMOTE_HOME, REMOTE_HOME); ctx.cwds = tracked; ctx.home = REMOTE_HOME; }
   const nested = [];
   const envReads = garage && remote && depth > 0 ? garageEnvReads(command, segments) : new Map();
@@ -738,20 +867,21 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     const { words, redirects } = segment;
     const text = JSON.stringify(segment.text.slice(0, 160));
     const push = gitPushDanger(words);
-    if (push) reasons.push(`${text}: ${push}`);
+    if (push) reasons.push(H('history', `${text}: ${push}`));
     const history = gitHistoryDanger(words, { amendOk: amendOk && depth === 0 && !remote });
-    if (history) reasons.push(`${text}: ${history}`);
+    if (history) { const r = `${text}: ${history}`; reasons.push(r); if (hard && !resetHeadOnly(words)) H('history', r); }
+    if (hard) for (const [rule, why] of hardExtras(segment, segments, n, ctx, vars)) reasons.push(H(rule, `${text}: ${why}`));
     const disk = words.find(word => DISK_COMMANDS.test(word) || BLOCK_DEVICE.test(word) || /^of=\/dev\//.test(word));
-    if (disk) reasons.push(`${text}: ${disk} writes disks or devices`);
+    if (disk) reasons.push(H('delete', `${text}: ${disk} writes disks or devices`));
     const garageOk = !remote && depth === 0 && garageSshSegment(command, segments, n);
     const skip = new Set([...(envReads.get(n) ?? []), ...(garageOk ? sshRemoteWords(words) : [])]);
-    reasons.push(...segmentSecretReasons(segment, text, { skip }));
-    if (!remote) reasons.push(...segmentProtectedReasons(segment, words.map(word => { const values = /\$/.test(word) ? expandVariables(word, vars) : undefined; return values?.length === 1 ? values[0] : word; }), ctx, text));
+    reasons.push(...segmentSecretReasons(segment, text, { skip }).map(r => H('secret', r)));
+    if (!remote) reasons.push(...segmentProtectedReasons(segment, words.map(word => { const values = /\$/.test(word) ? expandVariables(word, vars) : undefined; return values?.length === 1 ? values[0] : word; }), ctx, text).map(r => H('secret', r)));
     const unit = garageUnitDanger(segment);
     if (unit) reasons.push(`${text}: ${unit}`);
     for (const redirect of redirects) {
       if (!redirect.file) continue;
-      if (BLOCK_DEVICE.test(redirect.target ?? '')) reasons.push(`${text}: redirect writes device ${redirect.target}`);
+      if (BLOCK_DEVICE.test(redirect.target ?? '')) reasons.push(H('delete', `${text}: redirect writes device ${redirect.target}`));
       if (paths && !remote && (['>', '>|', '&>', '<>'].includes(redirect.op) || /^\d+>$/.test(redirect.op))) {
         const raw = redirect.target ?? '';
         const expanded = expandVariables(raw, vars);
@@ -761,7 +891,7 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
           // Relative targets that resolve into /tmp (cd /tmp/x && cmd > out) are scratch writes too.
           if (!path.isAbsolute(target) && !target.includes('$') && !target.startsWith('~') && ctx.cwds?.size && [...ctx.cwds].every(cwd => SAFE_WRITE_TARGET.test(path.resolve(cwd, target)))) continue;
           const why = deleteTargetDanger(target, ctx);
-          if (why && !/is git metadata/.test(why)) reasons.push(`${text}: truncating redirect ${redirect.op} ${JSON.stringify(raw)} (${why.replace('/__write_entry__', '/…')})`);
+          if (why && !/is git metadata/.test(why)) { const r = `${text}: truncating redirect ${redirect.op} ${JSON.stringify(raw)} (${why.replace('/__write_entry__', '/…')})`; reasons.push(r); if (hard && /resolves outside|reaches \/|globs over|not a literal|no known home/.test(why) && !isDirectory(target)) H('delete', r); }
         }
       }
     }
@@ -769,15 +899,17 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     if (service) reasons.push(`${text}: ${service}`);
     // Delete targets with literal variables (B=/x; rm -rf $B) are judged by their expansion.
     const expandedWords = words.map(word => { const values = /\$/.test(word) ? expandVariables(word, vars) : undefined; return values?.length === 1 ? values[0] : word; });
-    if (paths) reasons.push(...[...rmDanger(expandedWords, ctx), ...findDanger(expandedWords, ctx), ...rsyncDanger(words, ctx, nested)].map(why => `${text}: ${why}`));
-    reasons.push(...nestedCommands(segment, nested, ctx, { garageOk }).map(why => `${text}: ${why}`));
+    if (paths) reasons.push(...[...rmDanger(expandedWords, ctx), ...findDanger(expandedWords, ctx), ...rsyncDanger(words, ctx, nested)].map(why => /is git metadata/.test(why) ? H('history', `${text}: ${why}`) : H('delete', `${text}: ${why}`)));
+    reasons.push(...nestedCommands(segment, nested, ctx, { garageOk }).map(why => H('delete', `${text}: ${why}`)));
   });
   for (const inner of nested) {
+    const sub = hard ? [] : undefined;
     const innerCwd = inner.remote ? undefined : ctx.cwds && ctx.cwds.size === 1 ? [...ctx.cwds][0] : undefined;
     const innerReasons = innerCwd || inner.remote || !paths
-      ? fullAutoShellCheck(inner.command, innerCwd, project, { home, remote: inner.remote || remote, paths, depth: depth + 1, garage: inner.garage === true })
-      : fullAutoShellCheck(inner.command, undefined, project, { home, remote, paths, depth: depth + 1 });
+      ? fullAutoShellCheck(inner.command, innerCwd, project, { home, remote: inner.remote || remote, paths, depth: depth + 1, garage: inner.garage === true, hard: sub })
+      : fullAutoShellCheck(inner.command, undefined, project, { home, remote, paths, depth: depth + 1, hard: sub });
     reasons.push(...innerReasons.map(why => `${inner.remote ? 'remote ' : 'nested '}${why}`));
+    if (hard) hard.push(...sub.map(entry => ({ ...entry, reason: `${inner.remote ? 'remote ' : 'nested '}${entry.reason}` })));
   }
   return [...new Set(reasons)];
 }
@@ -833,7 +965,7 @@ export function downgradeFullAutoShell(event, project) {
   if (!entry || entry.expires <= Date.now() || !Array.isArray(event.resources) || !event.resources.length) return false;
   for (const resource of event.resources) {
     if (typeof resource !== 'string') return false;
-    if (hardDenyReasons(fullAutoShellCheck(resource, undefined, project, { paths: false, amendOk: entry.amendOk })).length) return false;
+    if (hardDenyCheck(resource, undefined, project, { paths: false, amendOk: entry.amendOk }).length) return false;
   }
   event.effect = 'allow';
   return true;

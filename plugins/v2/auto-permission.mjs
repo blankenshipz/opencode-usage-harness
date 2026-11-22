@@ -9,8 +9,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { isSecretPath, markers, scanShell } from './shell-guard.mjs';
-import { realish, fullAutoProjectFor, fullAutoShellCheck, protectedLocation, containsProtected, toolOutputFileRead, defaultFullAutoProject } from './full-auto.mjs';
+import { realish, fullAutoProjectFor, fullAutoShellCheck, protectedLocation, containsProtected, toolOutputFileRead, defaultFullAutoProject, hardDenyCheck, hardDenyMessage } from './full-auto.mjs';
 import { statePath } from './paths.mjs';
+import { parkLogger } from './park-yield.mjs';
 
 export const LISTABLE_DIRS = ['/opt', '/snap/bin', '/bin', '/sbin', '/usr/bin', '/usr/local/bin'];
 // 0.3.3: a real background job only (`cmd &`, nohup/setsid/disown, `$!`); `&&` and `2>&1` are not.
@@ -66,34 +67,41 @@ export function committedClean(repo, target, { run = execFileSync } = {}) {
 }
 // Recursive content search: a directory that contains a protected location reads it too.
 const SEARCH_TOOLS = new Set(['grep', 'codesearch']);
+// r40 M4: in full-auto this never returns `ask`. Credential/secret paths and edits outside the
+// project and /tmp deny immediately with a resumable-blocker message; everything else is allowed
+// (shell deletes and pushes are owned by the shell guard's hard-deny classifier).
+export function fullAutoDenyMessage(reason, subject) {
+  return `HARD DENY (harness auto-approve policy; rule: ${reason}): this permission is denied immediately and will not be asked. `
+    + `Do not retry variants or workarounds. Record a resumable blocker naming ${JSON.stringify(String(subject ?? '').slice(0, 200))} and continue with other work.`;
+}
 export function decideFullAutoExternal({ action, resources, tool, input, project, directory, home = os.homedir(), realpath = fs.realpathSync, exists = fs.existsSync, clean = committedClean } = {}) {
   const res = Array.isArray(resources) ? resources.map(String) : [];
-  if (!res.length) return { decision: 'ask', reason: 'no_resources' };
-  if (!['external_directory', 'read'].includes(action)) return { decision: 'ask', reason: 'full_auto_action_not_covered' };
+  const deny = (reason, subject = res.join(' ')) => ({ decision: 'deny', reason, message: fullAutoDenyMessage(reason, subject) });
+  if (!res.length) return deny('no_resources', action);
   const shell = SHELL_TOOLS.has(tool);
-  if (!shell && !READ_ONLY_TOOLS.has(tool)) return { decision: 'ask', reason: 'full_auto_tool_not_read_only' };
+  const readOnly = READ_ONLY_TOOLS.has(tool);
+  const editLike = action === 'edit' || (!shell && !readOnly);
+  if (!editLike && !['external_directory', 'read'].includes(action)) return { decision: 'allow', reason: 'full_auto_action_auto_approved' };
+  const roots = [...(project?.roots ?? []), ...(project?.directory ? [project.directory] : [])];
   for (const r of res) {
     const lexical = path.resolve(directory ?? '/', stripGlob(r).replace(/\/\*\*$/, ''));
     // 0.4.0 (4.2): the read tool may open a single OpenCode tool-output tool_* file.
     if (tool === 'read' && action === 'read' && toolOutputFileRead('read', lexical)) continue;
     for (const candidate of [lexical, realish(lexical, { realpath })]) {
-      if (credentialPath(candidate, home)) return { decision: 'ask', reason: 'credential_path' };
+      if (credentialPath(candidate, home)) return deny('credential_path', r);
       if (SEARCH_TOOLS.has(tool) && (containsProtected(candidate) || ['.ssh', '.aws', '.config', '.gnupg'].some(d => contains(candidate, path.join(home, d)))))
-        return { decision: 'ask', reason: 'search_covers_credential_path' };
-      const other = otherProjectOf(candidate, project, { exists });
-      if (other && (shell || !clean(other, candidate))) return { decision: 'ask', reason: shell ? 'other_project_shell' : 'other_project_uncommitted' };
+        return deny('search_covers_credential_path', r);
+      if (editLike && !roots.some(root => contains(root, candidate)) && !(candidate.startsWith('/tmp/')))
+        return deny('edit_outside_project', r);
     }
   }
+  if (editLike) return { decision: 'allow', reason: 'full_auto_edit_inside_project_or_tmp' };
   if (shell) {
     const command = typeof input?.command === 'string' ? input.command : undefined;
-    if (command === undefined) return { decision: 'ask', reason: 'shell_without_command' };
+    if (command === undefined) return deny('shell_without_command');
     const workdir = typeof input?.workdir === 'string' && input.workdir ? path.resolve(directory ?? '/', input.workdir) : directory;
-    if (fullAutoShellCheck(command, workdir, project).length) return { decision: 'ask', reason: 'full_auto_shell_reasons' };
-    // Words naming another project's files (cat ../yrdsale/x) ask: a shell may write them.
-    for (const word of command.split(/[\s'"=:;|&()<>]+/).filter(word => word.startsWith('/') || word.startsWith('..'))) {
-      const target = path.resolve(workdir ?? '/', word);
-      if (otherProjectOf(target, project, { exists })) return { decision: 'ask', reason: 'other_project_shell' };
-    }
+    const hard = hardDenyCheck(command, workdir, project);
+    if (hard.length) return { decision: 'deny', reason: 'full_auto_shell_hard_deny', message: hardDenyMessage(hard, command) };
     return { decision: 'allow', reason: 'full_auto_shell_external' };
   }
   return { decision: 'allow', reason: 'full_auto_read_only_external' };
@@ -162,7 +170,7 @@ export function autoPermissionLogger({ file = statePath('telemetry', 'auto-permi
   };
 }
 
-export async function installAutoPermission(ctx, { log = autoPermissionLogger(), now = () => Date.now(), home = os.homedir(), realpath = fs.realpathSync, fullAutoProjects, defaultFullAuto = true } = {}) {
+export async function installAutoPermission(ctx, { log = autoPermissionLogger(), now = () => Date.now(), home = os.homedir(), realpath = fs.realpathSync, fullAutoProjects, defaultFullAuto = true, hardDenyLog = ctx?.location?.directory ? parkLogger() : () => {} } = {}) {
   const permission = ctx?.permission;
   if (typeof permission?.hook !== 'function') return { stop() {} };
   const calls = new Map(); // `${sessionID}\0${callID}` -> {tool, input}
@@ -178,15 +186,21 @@ export async function installAutoPermission(ctx, { log = autoPermissionLogger(),
     if (event?.effect !== 'ask' || event.metadata?.[markers.GUARD_MARKER]) return;
     const call = event.source?.id ? calls.get(`${event.sessionID}\0${event.source.id}`) : undefined;
     if (!call) return; // unknown tool/input: leave it with the human
-    let verdict;
+    let verdict, project;
     try {
-      const project = event.metadata?.[markers.PROBE_MARKER] ? undefined : (fullAutoProjectFor(ctx.location?.directory, ...(fullAutoProjects ? [fullAutoProjects()] : [])) ?? (defaultFullAuto ? defaultFullAutoProject(ctx.location?.directory) : undefined));
+      project = event.metadata?.[markers.PROBE_MARKER] ? undefined : (fullAutoProjectFor(ctx.location?.directory, ...(fullAutoProjects ? [fullAutoProjects()] : [])) ?? (defaultFullAuto ? defaultFullAutoProject(ctx.location?.directory) : undefined));
       verdict = decideAutoPermission({ action: event.action, resources: event.resources, tool: call.tool, input: call.input, directory: ctx.location?.directory, home, realpath, fullAutoProject: project });
     } catch { verdict = { decision: 'ask', reason: 'error' }; }
     const subject = typeof call.input?.command === 'string' ? call.input.command : (event.resources ?? []).join(' ');
     log({ time: new Date(now()).toISOString(), sessionID: event.sessionID, tool: call.tool, pattern: String(subject).slice(0, 200),
-      decision: verdict.decision === 'allow' ? 'allow' : 'decline_to_auto', reason: verdict.reason });
+      decision: verdict.decision === 'allow' ? 'allow' : verdict.decision === 'deny' && project ? 'deny' : 'decline_to_auto', reason: verdict.reason });
     if (verdict.decision === 'allow') event.effect = 'allow';
+    else if (verdict.decision === 'deny' && project) {
+      // r40 M4: full-auto hard deny, immediately and without a pending ask.
+      event.effect = 'deny';
+      if (verdict.message) event.message = verdict.message;
+      hardDenyLog({ at: new Date(now()).toISOString(), event: 'ask_hard_denied', sessionID: event.sessionID, permissionID: event.id ?? null, callID: event.source?.id ?? null, rule: verdict.reason, action: event.action, source: 'auto_permission' });
+    }
   });
   return { stop() { calls.clear(); } };
 }

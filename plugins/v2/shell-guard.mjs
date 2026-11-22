@@ -18,7 +18,7 @@ import { execFile } from 'node:child_process';
 import { recordGuardDecision } from './permission-reevaluate.mjs'; // runtime-only use; safe ESM cycle
 import os from 'node:os';
 import path from 'node:path';
-import { fullAutoProjectFor, defaultFullAutoProject, fullAutoShellCheck, rememberFullAuto, downgradeFullAutoShell, pathResourcesInside, PATH_ACTIONS, realish, shellSecretReasons, hardDenyReasons, hardDenyMessage } from './full-auto.mjs';
+import { fullAutoProjectFor, defaultFullAutoProject, fullAutoShellCheck, rememberFullAuto, downgradeFullAutoShell, pathResourcesInside, PATH_ACTIONS, realish, shellSecretReasons, hardDenyReasons, hardDenyCheck, hardDenyMessage } from './full-auto.mjs';
 
 // Native shell secret asks; must match configure.py SECRET_SHELL_ASK (tests/v2-full-auto.test.mjs
 // checks). They match the whole command string (`*.key*` also hits `d.keys()`); the guard drops an
@@ -783,19 +783,19 @@ export async function installShellGuard(ctx, { tools = ['shell', 'bash'], fullAu
     if (project) {
       // Full-auto: no branch gating and no ask-rule re-checks; only the still-dangerous forms ask.
       const fullAuto = analyzeShellCommand(command, rules, { fullAuto: true });
-      let reasons = [...fullAuto.reasons, ...fullAutoShellCheck(command, base, project)];
+      const reasons = [...fullAuto.reasons, ...fullAutoShellCheck(command, base, project)];
       if (fullAuto.action === 'deny') throw new Error(`Harness shell guard denied this command: ${reasons.join('; ')}. Split it into separate commands or use the edit/write tools.`);
+      // 0.4.0 auto-approve: classify on the parsed command (structured rules from the source sites).
+      let hard = hardDenyCheck(command, base, project);
       let amendOk = false;
-      if (reasons.length) {
-        // The only remaining asks are top-level amends: allow them on unpushed feature-branch HEADs.
-        const withoutAmend = [...fullAuto.reasons, ...fullAutoShellCheck(command, base, project, { amendOk: true })];
+      if (hard.length) {
+        // Top-level amends are allowed on unpushed feature-branch HEADs (checkFullAutoAmends).
+        const withoutAmend = hardDenyCheck(command, base, project, { amendOk: true });
         if (!withoutAmend.length) {
           const amend = await checkFullAutoAmends(command, base, project, options);
-          if (amend.ok) { reasons = withoutAmend; amendOk = true; } else reasons.push(...amend.reasons);
+          if (amend.ok) { hard = withoutAmend; amendOk = true; } else hard.push(...amend.reasons.map(reason => ({ rule: 'history', reason })));
         }
       }
-      // 0.4.0 auto-approve: only the hard-deny classes stop a command, immediately and without an ask.
-      const hard = hardDenyReasons(reasons);
       if (hard.length) { recordGuardDecision(event.sessionID, event.id, { verified: false }); throw new Error(`Harness shell guard: ${hardDenyMessage(hard, command)}`); }
       // 4.3: one decision per call; a native ask for this same call is answered once by permission-reevaluate.
       recordGuardDecision(event.sessionID, event.id, { verified: true });

@@ -60,3 +60,16 @@ test('r26 fable: shell tool and relative secret paths never auto-allow', async (
   assert.equal(decideAutoPermission({ tool: 'read', resources: ['.review/.env'], input: {}, directory: real, home: '/home/box' }).decision, 'ask');
   assert.equal(decideAutoPermission({ tool: 'read', resources: ['.review/notes.txt'], input: {}, directory: real, home: '/home/box' }).decision, 'allow');
 });
+
+import { decideFullAutoExternal } from '../plugins/v2/auto-permission.mjs';
+test('r40 M4: full-auto external decisions never ask', () => {
+  const project = { directory: '/home/box/work/p', roots: ['/home/box/work/p'] };
+  const base = { project, directory: '/home/box/work/p', home: '/home/box', realpath: p => p, exists: () => true, clean: () => false };
+  const cred = decideFullAutoExternal({ ...base, action: 'external_directory', resources: ['/home/box/.ssh/*'], tool: 'read' });
+  assert.equal(cred.decision, 'deny'); assert.equal(cred.reason, 'credential_path'); assert.match(cred.message, /HARD DENY.*resumable blocker/);
+  assert.equal(decideFullAutoExternal({ ...base, action: 'external_directory', resources: ['/home/box/work/other/src/*'], tool: 'read' }).decision, 'allow');
+  assert.equal(decideFullAutoExternal({ ...base, action: 'external_directory', resources: ['/home/box/work/other/a.js'], tool: 'edit' }).decision, 'deny');
+  assert.equal(decideFullAutoExternal({ ...base, action: 'external_directory', resources: ['/tmp/x/a.js'], tool: 'edit' }).decision, 'allow');
+  for (const args of [{ action: 'external_directory', resources: [], tool: 'read' }, { action: 'external_directory', resources: ['/etc/hosts'], tool: 'write' }, { action: 'webfetch', resources: ['x'], tool: 'webfetch' }])
+    assert.notEqual(decideFullAutoExternal({ ...base, ...args }).decision, 'ask', JSON.stringify(args));
+});

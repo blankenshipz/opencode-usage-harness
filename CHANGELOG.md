@@ -16,6 +16,26 @@ Zach's decision (2026-11-22): "let's not need approvals, let's bias to auto-appr
 - **Attribution:** commits made by agents get `Agent:`, `Harness-Role:` and `Workrelay-Session:` trailers (`plugins/v2/agent-attribution.mjs`, `scripts/git-hooks/prepare-commit-msg`). Author and committer are unchanged.
 - **Ops:** `harness-manage deploy` switches releases only when no ask is pending and no session is busy (`--wait`, `--restart`, `--dry-run`), then warms plugins and triggers the workrelay resume. The `dispatch_runtime.py` timeout is 20 s with one retry (was 5 s).
 
+### Fable review fixes (r40b, before release)
+
+The first 0.4.0 build (`b2897a9`) was not tagged or deployed: Fable found 8 High and 9 Medium issues, most of them hard-deny bypasses.
+- **Hard denies come from the parsed command.** They no longer come from reason text that echoes the command. `hardDenyCheck` returns structured `{rule, reason}` entries (`history`, `delete`, `secret`) emitted where each segment's words are inspected. It fails closed when a push, delete or secret-read target cannot be determined. Fixes H1-H6, H8, M1 and M2:
+  - `git push -f`, `--force-with-lease` and `origin +main` are denied;
+  - `cat .en*`, `rm -rf $HOME/x` and history rewrites are denied;
+  - the "truncating redirect" phrase no longer bypasses anything;
+  - `rm -rf /tmp/x` and `systemctl restart token-service` are no longer false denies.
+
+  See `docs/SHELL-PERMISSIONS.md` and `tests/v2-hard-deny.test.mjs`.
+- **Native asks keep backstopping the guard (H7).** Only the same call's shell ask is answered `once`. `external_directory` asks and secret-named asks are rejected at once with the resumable-blocker message.
+- **No pending asks under full-auto (M4).** `decideFullAutoExternal` denies credential paths and edits outside the project or `/tmp`, and allows everything else.
+- **15-minute safety net (M3).**
+  - A failed reject is retried.
+  - Asks pending across a reload are found through `permission.list`.
+  - The reject function is kept per project.
+  - Timeouts and hard denies write `ask_timeout_denied` and `ask_hard_denied` to `permission-park.jsonl`, and the workrelay notifier reports them as `permission_auto_denied`.
+- **Unlisted-project fallback (M5).** The fallback is realpath-resolved and refuses `/`, `/home`, `/workspace`, `/opt`, `/etc`, `/usr`, `/var`, `/tmp` and anything containing `$HOME`, `$HOME/work` or `/workspace`.
+- **Not fixed: M6.** After `cd X;`, later segments are judged in `X` only, so a `cd` that fails at runtime is not modelled.
+
 ## 0.3.4 — protected reads, source files named like secrets (r37)
 
 Two fixes from the r36 log review.

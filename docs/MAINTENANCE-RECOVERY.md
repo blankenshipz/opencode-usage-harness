@@ -58,25 +58,39 @@ harness-manage deploy 0.4.0 --dry-run --restart     # print the plan, change not
 ```
 
 1. Idle check: no pending permission asks (`opencode api GET /api/permission/request`
-   per project) and no busy sessions (read-only `session_v2` query on
+   per project, JSON parsed) and no busy sessions (read-only `session_v2` query on
    `<root>/xdg/data/opencode/opencode.db`). When busy it exits 3 and names what
    is busy; `--wait SECONDS` polls every 15 s first. `--force` skips the refusal.
+   The check is repeated inside the prefix lock right before the switch and
+   right before `--restart`; busy at either point exits 3 with the switch undone.
 2. Backs up `state/config/opencode.json`, `configure-choices.json`,
    `workrelay-bridge.json` and `gateway/mcp.json` to `<root>/backups/deploy-<stamp>/`
    (mode 700) with the old `current`/`previous` names.
 3. Points `current` at the release and `previous` at the old `current`, then
    rewrites `guard_entry` in `workrelay-bridge.json` atomically (mode kept).
-4. With `--restart`: stops the gateway (`gateway/gateway.pid`), runs
+4. Regenerates the native permission config with the new release's
+   `configure.py --models <models> --state-dir <state> --replace` (`--models`
+   default `<prefix>/../models.json`, `--state-dir` default `<prefix>/../state`).
+   A failure restores the links and config from the backup (exit 5).
+5. With `--workrelay-dir DIR --workrelay-ref REF`: `git -C DIR fetch origin` and
+   `git -C DIR merge --ff-only REF`. Unrelated uncommitted files are kept; if they
+   conflict or it is not a fast-forward, only this step is aborted with a message.
+   Nothing is ever stashed or discarded.
+6. With `--restart`: stops the gateway (`gateway/gateway.pid`), runs
    `opencode service stop` and `start`, and runs `gateway/start-gateway.sh`.
-5. Warms each project's plugins (`GET /api/plugin` twice) and verifies the
+   If that fails, `current` is rolled back to the old release (exit 5).
+7. Warms each project's plugins (`GET /api/plugin` twice) and verifies the
    release path is loaded; exit 4 when a project does not load it.
-6. Runs the resume-after-restart hook (`--resume-command`, default
-   `$HARNESS_DEPLOY_RESUME_COMMAND` or `python3 -m workrelay.cli resume-after-restart`)
-   only if `<command> --help` succeeds; otherwise it reports it skipped.
+8. Resume hook: by default `python3 -m workrelay.cli --config <bridge>
+   resume-interrupted --owner <owner> --restart-id deploy-<stamp>-<release>
+   --all-interrupted` (owner: `--resume-owner` or `authorized_owner` in the bridge
+   config; `PYTHONPATH=<workrelay>/src`). It runs only if its `--help` succeeds.
+   `--resume-command` or `$HARNESS_DEPLOY_RESUME_COMMAND` override it; `""` disables.
 
 `<root>` defaults to the parent of the prefix; commands run with `<root>/env.sh`
 sourced and their output is never printed. Projects come from `--project` or
-`$HARNESS_DEPLOY_PROJECTS` (colon separated). Roll back with `harness-manage rollback`.
+`$HARNESS_DEPLOY_PROJECTS` (colon separated), else from `full_auto_projects` in
+`<state>/config/configure-choices.json`; with none found it refuses unless `--force`. Roll back with `harness-manage rollback`.
 
 ## Commit attribution
 

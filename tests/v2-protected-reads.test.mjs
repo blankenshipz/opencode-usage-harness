@@ -133,7 +133,7 @@ test('full-auto read tools ask for protected locations; check-receipts and fixtu
     ['grep', '/home/box/work/agent-profiles/*'], ['read', `${OCH}/workrelay-bridge.json`], ['read', `${OCH}/gateway/mcp.json`], ['list', `${OCH}/gateway/*`],
     ['read', `${OCH}/xdg/data/opencode/opencode.db`], ['read', `${OCH}/claude-config/settings.json`], ['glob', `${OCH}/*`], ['read', `${OCH}/state/config/configure-choices.json`],
     ['read', `${RECEIPTS}/../config/opencode.json`], ['grep', '/home/box/work/*'], ['grep', '/workspace/*'], ['read', path.join(UD, 'Default/Bookmarks')]];
-  for (const [tool, resource] of asks) assert.equal(ext(tool, resource).decision, 'ask', `${tool} ${resource}`);
+  for (const [tool, resource] of asks) assert.equal(ext(tool, resource).decision, 'deny', `${tool} ${resource}`);
   const allows = [['read', `${RECEIPTS}/mobile-jest-8k3dussh/stdout.log`], ['glob', `${RECEIPTS}/*`], ['grep', `${RECEIPTS}/mobile-jest-8k3dussh/*`],
     ['read', `${OCH}/xdg/data/opencode/shell/abc/sh_1`], ['read', '/workspace/browser-probe/html-cdp/box-mercari-search.html'], ['glob', '/workspace/browser-probe/*'],
     ['grep', '/workspace/browser-probe/*'], ['read', '/usr/share/doc/x']];
@@ -153,7 +153,7 @@ test('full-auto read-only shell asks for protected locations (guard and external
   for (const command of asks) {
     assert.notDeepEqual(fullAutoShellCheck(command, P, project), [], command);
     assert.equal(await decide(command), 'deny', command); // 0.4.0: hard deny (secret)
-    assert.equal(ext('bash', '/home/box/work/*', { command }).decision, 'ask', command);
+    assert.equal(ext('bash', '/home/box/work/*', { command }).decision, 'deny', command);
   }
   const allows = [`cat ${RECEIPTS}/mobile-jest-1/stdout.log`, `cd ${RECEIPTS}/mobile-jest-1 && grep -c FAIL stdout.log stderr.log`, `ls ${RECEIPTS}`,
     `python3 ${OCH}/harness/releases/0.3.3-286543a/src/check_receipt.py --label t -- npm test`, 'ls -la /workspace/browser-probe/html-cdp',

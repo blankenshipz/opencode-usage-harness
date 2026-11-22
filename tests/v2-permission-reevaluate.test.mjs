@@ -197,3 +197,13 @@ test('Fable r32: a stranded .sweep file is restored (non-empty) or dropped (empt
   assert.match(fs.readFileSync(path.join(root, 'aaaaaaaaaaaaaaaaaaaaaaaa.json'), 'utf8'), /per_k/);
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+import { guardAskDisposition } from '../plugins/v2/permission-reevaluate.mjs';
+test('r40 H7: guard-verified auto-answer applies only to the plain shell ask', () => {
+  assert.equal(guardAskDisposition({ action: 'bash', resources: ['git status'] }).decision, 'once');
+  assert.equal(guardAskDisposition({ action: 'external_directory', resources: ['/home/box/*'] }).decision, 'reject');
+  assert.equal(guardAskDisposition({ action: 'bash', resources: ['cat ~/.netrc'] }).decision, 'reject');
+  assert.equal(guardAskDisposition({ action: 'bash', resources: ['cat .env.local'] }).decision, 'reject');
+  assert.equal(guardAskDisposition({ action: 'read', resources: ['config/client_secret.json'] }).decision, 'reject');
+  assert.equal(guardAskDisposition({ action: 'edit', resources: ['src/a.js'] }).decision, 'pending');
+});

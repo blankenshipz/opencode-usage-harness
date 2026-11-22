@@ -62,20 +62,19 @@ test('background detection ignores && and 2>&1', () => {
   for (const text of ['npm run dev &', 'nohup x', 'a & b', 'echo $!', '(server &) && curl x']) assert.equal(startsBackground(text), true, text);
 });
 
-test('full-auto external_directory: read-only tools anywhere but credentials and dirty other projects', () => {
+test('full-auto external_directory: never asks; credentials and outside edits deny', () => {
   const decide = (tool, resources, input = {}, extra = {}) => decideAutoPermission({ action: 'external_directory', resources, tool, input, directory: P, home: '/home/nobody', fullAutoProject: project, ...extra }).decision;
   assert.equal(decide('glob', ['/usr/local/*'], { pattern: '**/initdb', path: '/usr/local' }), 'allow');
   assert.equal(decide('read', ['/var/lib/x/shell/*']), 'allow');
-  assert.equal(decide('read', ['/home/nobody/.ssh/*']), 'ask');
-  assert.equal(decide('read', ['/srv/app/.env']), 'ask');
-  assert.equal(decide('edit', ['/etc/x/*']), 'ask');
-  // Another project: a dirty/untracked path asks (the temp repo has no commits, so nothing is clean).
-  assert.equal(decide('read', [`${OTHER}/src/*`]), 'ask');
-  assert.equal(decideAutoPermission({ action: 'external_directory', resources: [`${OTHER}/a/*`], tool: 'read', directory: P, fullAutoProject: project, home: '/home/nobody' }).reason, 'other_project_uncommitted');
+  assert.equal(decide('read', ['/home/nobody/.ssh/*']), 'deny');
+  assert.equal(decide('read', ['/srv/app/.env']), 'deny');
+  assert.equal(decide('edit', ['/etc/x/*']), 'deny');
+  // 0.4.0 (r40b, Fable M4): full-auto never asks. Reading another project is allowed.
+  assert.equal(decide('read', [`${OTHER}/src/*`]), 'allow');
   // Shell: allowed when the full-auto check is clean (cd ../web from a nested dir) and names no other project.
   assert.equal(decide('shell', [`${root}/web/*`], { command: 'cd backend && npx tsc --noEmit; cd ../web && npx tsc --noEmit 2>&1 | tail -3' }), 'allow');
-  assert.equal(decide('shell', ['/opt/x/*'], { command: 'sudo ls /opt/x' }), 'ask');
-  assert.equal(decide('shell', [`${OTHER}/*`], { command: `cat ${OTHER}/notes.md` }), 'ask');
+  assert.equal(decide('shell', ['/opt/x/*'], { command: 'sudo ls /opt/x' }), 'allow');
+  assert.equal(decide('shell', [`${OTHER}/*`], { command: `cat ${OTHER}/notes.md` }), 'allow');
 });
 
 // 0.4.0: cd T; cmd keeps T exact; only hard-deny classes stop commands.

@@ -74,6 +74,10 @@ export function createParkMonitor({ now = Date.now, notifyAfter = NOTIFY_AFTER_M
   const asks = new Map(); // requestID -> {sessionID, since, action, stalled, parked}
   const waiters = new Set();
   let ticking = false;
+  // r40 M3: one reject function per project directory, so the last ctx never answers another
+  // project's asks. `reject` (or setReject without a directory) serves asks with no directory.
+  const rejects = new Map();
+  const rejectFor = ask => (ask.directory !== undefined ? rejects.get(ask.directory) : undefined) ?? (ask.directory === undefined || rejects.size === 0 ? reject : undefined);
   const parkedRecord = (id, ask) => ({ requestID: id, sessionID: ask.sessionID, action: ask.action, ...(ask.summary ? { summary: ask.summary } : {}), pendingMs: now() - ask.since });
   const sync = () => { try { publish([...asks].map(([id, ask]) => ({ requestID: id, ...ask }))); } catch { /* ignore */ } };
   const offer = async record => {
@@ -85,14 +89,14 @@ export function createParkMonitor({ now = Date.now, notifyAfter = NOTIFY_AFTER_M
     }
   };
   return {
-    asked({ id, sessionID, action, summary, since = now() }) {
+    asked({ id, sessionID, action, summary, since = now(), directory }) {
       if (!id || !sessionID || asks.has(id)) return;
       if (asks.size >= 4096) asks.delete(asks.keys().next().value);
-      asks.set(id, { sessionID, action, ...(summary ? { summary } : {}), since, stalled: false, parked: false });
+      asks.set(id, { sessionID, action, ...(summary ? { summary } : {}), ...(directory ? { directory } : {}), since, stalled: false, parked: false });
       sync();
     },
     replied(id) { if (asks.delete(id)) sync(); },
-    setReject(fn) { reject = fn; },
+    setReject(fn, directory) { if (directory) rejects.set(directory, fn); else reject = fn; },
     pending() { return [...asks].map(([id, ask]) => ({ requestID: id, ...ask })); },
     forgetSession(sessionID) { let changed = false; for (const [id, ask] of asks) if (ask.sessionID === sessionID) changed = asks.delete(id) || changed; if (changed) sync(); },
     async tick() {
@@ -116,17 +120,22 @@ export function createParkMonitor({ now = Date.now, notifyAfter = NOTIFY_AFTER_M
         }
       }
       // Safety net: deny (never approve) asks pending past askTimeout. Needs a reject function.
-      if (typeof reject === 'function' && askTimeout > 0) {
+      // r40 M3: timedOut is set only after a successful reject; a failed reply is retried next tick.
+      if (askTimeout > 0) {
         for (const [id, ask] of [...asks]) {
           if (ask.timedOut || at - ask.since < askTimeout) continue;
-          ask.timedOut = true;
+          const deny = rejectFor(ask);
+          if (typeof deny !== 'function') continue;
           const base = parkedRecord(id, ask);
           const message = askTimeoutMessage(base);
           let denied = false;
-          try { await reject({ sessionID: ask.sessionID, requestID: id, message }); denied = true; } catch { /* already answered elsewhere */ }
-          const record = { at: new Date(at).toISOString(), event: 'ask_timeout_denied', outcome: denied ? 'ask_timeout_denied' : 'ask_timeout_reply_failed', ...base };
-          log(record); events.push(record);
-          if (denied) asks.delete(id);
+          try { await deny({ sessionID: ask.sessionID, requestID: id, message }); denied = true; } catch { /* retried on the next tick */ }
+          const record = { at: new Date(at).toISOString(), event: denied ? 'ask_timeout_denied' : 'ask_timeout_reply_failed', outcome: denied ? 'ask_timeout_denied' : 'ask_timeout_reply_failed',
+            ...base, permissionID: id, rule: 'ask_timeout', ...(ask.failures ? { attempt: ask.failures + 1 } : {}) };
+          if (denied) { ask.timedOut = true; asks.delete(id); }
+          else ask.failures = (ask.failures ?? 0) + 1;
+          // Log the first failure and the success, not one failure line per tick.
+          if (denied || ask.failures === 1) { log(record); events.push(record); }
         }
       }
       if (events.length) sync();
@@ -148,16 +157,36 @@ export const parkMonitor = createParkMonitor({ log: parkLogger(), publish: pendi
 export function installParkYield(ctx, { monitor = parkMonitor, tickMs = PARK_TICK_MS, setTimer = setInterval, clearTimer = clearInterval } = {}) {
   if (typeof ctx?.event?.subscribe !== 'function') return { stop() {} };
   // The shared monitor is created without a permission client; attach the deny path here.
+  const directory = ctx?.location?.directory;
   if (typeof ctx?.permission?.reply === 'function' && typeof monitor.setReject === 'function')
-    monitor.setReject(({ sessionID, requestID, message }) => ctx.permission.reply({ sessionID, requestID, decision: 'reject', message }));
+    monitor.setReject(({ sessionID, requestID, message }) => ctx.permission.reply({ sessionID, requestID, decision: 'reject', message }), directory);
   const controller = new AbortController();
-  const timer = setTimer(() => { void monitor.tick().catch(() => {}); }, tickMs);
+  // r40 M3: asks pending across a reload never produce a new permission.asked event; list them on
+  // startup and on each sweep (permission.list, all sessions, then known sessions) so they time out.
+  const listPending = async () => {
+    if (typeof ctx?.permission?.list !== 'function') return;
+    const listData = value => Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
+    const queries = [{}, ...new Set(monitor.pending().map(ask => ask.sessionID))].map(q => typeof q === 'string' ? { sessionID: q } : q);
+    for (const query of queries) {
+      let requests;
+      try { requests = listData(await ctx.permission.list(query)); } catch { continue; }
+      for (const data of requests) {
+        if (!data?.id || !data?.sessionID) continue;
+        const created = Number(data.time?.created ?? data.createdAt);
+        monitor.asked({ id: data.id, sessionID: data.sessionID, action: data.action ?? data.permission, summary: askSummary(data), directory,
+          ...(Number.isFinite(created) && created > 0 ? { since: created } : {}) });
+      }
+    }
+  };
+  const sweep = async () => { try { await listPending(); } catch { /* best effort */ } await monitor.tick(); };
+  void sweep().catch(() => {});
+  const timer = setTimer(() => { void sweep().catch(() => {}); }, tickMs);
   timer?.unref?.();
   void (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         const data = event?.data ?? {};
-        if (event?.type === 'permission.asked' && data.id && data.sessionID) { monitor.asked({ id: data.id, sessionID: data.sessionID, action: data.action ?? data.permission, summary: askSummary(data) }); void monitor.tick().catch(() => {}); }
+        if (event?.type === 'permission.asked' && data.id && data.sessionID) { monitor.asked({ id: data.id, sessionID: data.sessionID, action: data.action ?? data.permission, summary: askSummary(data), directory }); void monitor.tick().catch(() => {}); }
         else if (event?.type === 'permission.replied') monitor.replied(data.requestID ?? data.id);
         // An aborted or deleted session's asks can no longer be answered; never park on them.
         else if (['session.deleted', 'session.execution.interrupted'].includes(event?.type) && (data.sessionID ?? data.id)) monitor.forgetSession(data.sessionID ?? data.id);

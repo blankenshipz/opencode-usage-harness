@@ -84,7 +84,7 @@ const ALLOWED = [
   'git stash', 'git stash pop', 'git reset HEAD~1', 'git reset --soft HEAD~1', 'git reset --mixed HEAD~2', 'git checkout main', 'git checkout -- src/x.py',
   'git switch -c feat/y', 'git merge feat/y', 'git pull --rebase=false', 'git restore src/x.py', 'git -C . stash list', 'timeout 60 git commit -m x',
   'ssh garage-server "cd /opt/wncscanner && docker compose up -d --build"', 'ssh garage-server docker compose logs --tail 50',
-  'scp dist/app.tar garage-server:/opt/wncscanner/', 'rsync -az --delete ./ garage-server:/opt/wncscanner/', 'rsync -az -e "ssh -p 22" config/ garage-server:/opt/wncscanner/config/',
+  'scp dist/app.tar garage-server:/opt/wncscanner/', 'rsync -az -e "ssh -p 22" config/ garage-server:/opt/wncscanner/config/',
   'ssh garage-server <<EOF\ncd /opt/wncscanner\ndocker compose pull\ndocker compose up -d\nEOF', 'ssh garage-server "rm -rf /opt/wncscanner/build"',
   'docker compose up -d --build', 'docker compose down', 'docker rm -f wnc', 'docker compose rm -f', 'docker system prune -f',
   'kill 1234', 'pkill -f uvicorn', 'chmod -R u+w scripts', 'chown -R box data',
@@ -118,6 +118,7 @@ const ASKED = [
   'ssh garage-server "rm -rf /"', 'ssh garage-server rm -rf /opt', 'ssh garage-server "rm -rf ~"', 'ssh garage-server "cd / && rm -rf *"',
   'ssh garage-server "cd /srv/repo && git push --force"', 'ssh garage-server <<EOF\nrm -rf /\nEOF', 'ssh -o ProxyCommand="rm -rf ~" garage-server',
   'ssh garage-server "sudo dd if=/dev/zero of=/dev/sda"', 'ssh garage-server "bash -c \'rm -rf /\'"', 'rsync -a --delete ./ garage-server:/',
+  'rsync -az --delete ./ garage-server:/opt/wncscanner/', // 0.4.0 r40b: the whole repo (incl. .env) to a remote is secret exfiltration (H6)
 ];
 
 test('full-auto allows ordinary work, deploys and in-project deletes', async () => {
@@ -393,4 +394,16 @@ test('other projects: native secret-wildcard asks drop for bare words, real secr
     assert.equal(await decide(command, OTHER), 'allow', command); // 0.4.0 auto-approve
   // The docker --env-file exemption stays full-auto only.
   assert.equal(await decide('docker compose --env-file ../.env up -d', OTHER), 'allow'); // 0.4.0: fallback is full-auto
+});
+
+import { defaultFullAutoProject as fallbackProject } from '../plugins/v2/full-auto.mjs';
+test('r40 M5: the unlisted-project fallback refuses broad parents and shallow roots', () => {
+  const home = '/home/box', realpath = p => p; // identity realpath: judged lexically after resolve
+  for (const dir of ['/', '/.', '//', '/home', '/home/box', '/home/box/', '/home/box/work', '/workspace', '/opt', '/etc', '/usr', '/var', '/tmp', '/opt/app/x', '/etc/a/b', 'relative/x'])
+    assert.equal(fallbackProject(dir, { home, realpath }), undefined, dir);
+  assert.equal(fallbackProject('/home/box/work/proj', { home, realpath })?.directory, '/home/box/work/proj');
+  assert.equal(fallbackProject('/workspace/proj', { home, realpath })?.directory, '/workspace/proj');
+  assert.equal(fallbackProject('/tmp/scratch', { home, realpath })?.directory, '/tmp/scratch');
+  // A symlinked alias is judged by its real target.
+  assert.equal(fallbackProject('/srv/alias', { home, realpath: p => p === '/srv/alias' ? '/home/box' : p }), undefined);
 });
