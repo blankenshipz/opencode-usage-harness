@@ -22,6 +22,7 @@
 // wncscanner-stack unit (systemctl restart/stop/edit/..., writes to its unit file) always ask.
 
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { managedConfigRoot, stateRoot } from './paths.mjs';
@@ -564,11 +565,20 @@ function gitHistoryDanger(words, { amendOk = false } = {}) {
 
 // Classifies one delete target. ctx: { cwds (Set|undefined), roots, home, remote }.
 function deleteTargetDanger(target, ctx) {
+  if (typeof target === 'string' && !ctx.remote) {
+    const home = ctx.home, cwd = ctx.cwds?.size === 1 ? [...ctx.cwds][0] : undefined;
+    let t = target.replace(/^\$\{?TMPDIR\}?(?=\/|$)/, process.env.TMPDIR || '/tmp');
+    if (home) t = t.replace(/^\$\{?HOME\}?(?=\/|$)/, home);
+    if (cwd) t = t.replace(/^\$\{?PWD\}?(?=\/|$)/, cwd);
+    if (t !== target) return deleteTargetDanger(t, ctx);
+    if (/\{[^{}]*[,.][^{}]*\}/.test(target) && !/[$`]/.test(target)) { const all = braceExpand(target); if (all.length > 1) { for (const one of all) { const why = deleteTargetDanger(one, ctx); if (why) return why; } return undefined; } }
+  }
   if (!target || /[$`{}]/.test(target) || /^~[^/]/.test(target)) return `delete target ${JSON.stringify(target)} is not a literal path`;
   const home = ctx.remote ? REMOTE_HOME : ctx.home;
   const expanded = target === '~' || target.startsWith('~/') ? (home ? path.join(home, target.slice(2)) : undefined) : target;
   if (!expanded) return `delete target ${JSON.stringify(target)} has no known home`;
-  const candidates = path.isAbsolute(expanded) ? [path.resolve(expanded)] : ctx.cwds ? [...ctx.cwds].map(cwd => path.resolve(cwd, expanded)) : undefined;
+  const resolve = (cwd, t) => ctx.remote ? path.resolve(cwd, t) : physicalResolve(cwd, t);
+  const candidates = path.isAbsolute(expanded) ? [resolve('/', expanded)] : ctx.cwds ? [...ctx.cwds].map(cwd => resolve(cwd, expanded)) : undefined;
   if (!candidates) return `delete target ${JSON.stringify(target)} is relative to an unknown directory`;
   for (const candidate of candidates) {
     // A glob in the last component deletes the parent's contents: judge the parent.
@@ -707,8 +717,8 @@ function segmentCwdList(segments, base, home, roots = []) {
       const from = exact ?? (!moved && base ? new Set([base]) : undefined);
       moved = true;
       const target = from && from.size === 1 ? cdTarget([...from][0], words, home) : undefined;
-      exact = target ? new Set([target]) : undefined;
-      exactKeep = Boolean(target && roots.some(root => contains(root, target)) && /^[A-Za-z0-9_./@%+=:,~-]+$/.test(words[1] ?? '') && (() => { try { return fs.statSync(target).isDirectory(); } catch { return false; } })());
+      exact = target ? new Set([realish(target)]) : undefined;
+      exactKeep = Boolean(target && roots.some(root => contains(root, target)) && /^[A-Za-z0-9_./@%+=:,~-]+$/.test(words[1] ?? '') && (() => { try { fs.accessSync(target, fs.constants.X_OK); return fs.statSync(target).isDirectory(); } catch { return false; } })()); // M6: only a cd that will succeed (existing, enterable directory) stays exact
     } else if (words.some(word => ['cd', 'pushd', 'popd', 'chdir'].includes(word))) { exact = undefined; exactKeep = false; moved = true; }
   }
   return list;
@@ -724,7 +734,7 @@ function segmentCwds(segments, base, home) {
       if (word !== 'cd') continue;
       if (!cwds) return undefined;
       const next = new Set(cwds);
-      for (const cwd of cwds) { const target = cdTarget(cwd, words, home); if (!target) return undefined; next.add(target); }
+      for (const cwd of cwds) { const target = cdTarget(cwd, words, home); if (!target) return undefined; next.add(realish(target)); }
       cwds = next;
     }
   }
@@ -740,11 +750,261 @@ const resetHeadOnly = words => {
   return sub === 'reset' && rest.every(arg => /^(-q|--quiet|--hard|HEAD|@)$/.test(arg));
 };
 const READERS = /(^|\/)(cat|tac|less|more|head|tail|grep|egrep|fgrep|rg|strings|base64|xxd|od|hexdump|nl|sed|awk|jq|bat|source|\.|cp|scp|nc|openssl)$/;
-const CRED_PATH = /(^|\/)(\.netrc|\.npmrc|\.pypirc|\.pgpass|\.git-credentials|hosts\.yml|config\.json|\.kube\/config|[^/]*\.p12|[^/]*\.pfx|service-account[^/]*\.json|[^/]*\.tfstate(\.backup)?|token[^/]*\.txt|environ)$/;
+const CRED_PATH = /(^|\/)(\.netrc|\.npmrc|\.pypirc|\.pgpass|\.git-credentials|hosts\.yml|\.docker\/config\.json|\.kube\/config|\.[A-Za-z0-9_]*_history|\.histfile|shadow|gshadow|[^/]*\.p12|[^/]*\.pfx|service-account[^/]*\.json|[^/]*\.tfstate(\.backup)?|token[^/]*\.txt|environ)$/;
 const SECRET_GLOB = /(^|\/)[.\[]?[\[\]?*]*\.?\[?e[\]?*]|(^|\/)\.[^/]*[*?[]/;
 const isDynamic = word => /[$`]/.test(word);
 // The next segment only counts or tests matches (`printenv | grep -c X`, `| wc -l`): nothing is printed.
 const quietPipe = (segments, n) => { const next = segments[n + 1]; return next?.prevSep === '|' && (/^(wc)$/.test(next.words[0]) && next.words.some(w => /^-[a-zA-Z]*[clmw]/.test(w)) || (/^grep$/.test(next.words[0]) && next.words.some(w => /^-[a-zA-Z]*[cq]/.test(w)))) && !segments[n + 2]?.prevSep?.startsWith('|'); };
+// ---- 0.4.0 (r40c): second-review hard-deny additions ----
+// Environment variable names that hold secrets (GH_PAT, OPENAI_API_KEY, DATABASE_URL); TOKEN_COUNT, KEYBOARD, total_tokens are not.
+const SECRET_TOKEN = /^(KEY|APIKEY|TOKEN|SECRET|SECRETS|PASSWORD|PASSWD|PASS|PAT|CREDENTIAL|CREDENTIALS|DSN|WEBHOOK|COOKIE|PRIVATE|PASSPHRASE|BEARER)$/;
+const NOT_SECRET_NEXT = /^(COUNT|COUNTS|LIMIT|LIMITS|LEN|LENGTH|USAGE|BUDGET|SIZE|MAX|MIN|TYPE|NAME|ID|FILE|PATH|DIR|URL_BASE)$/;
+export function secretVarName(name) {
+  const up = String(name).toUpperCase();
+  if (/(^|_)(DATABASE|DB|REDIS|MONGO[A-Z]*|POSTGRES[A-Z]*|PG|AMQP|SENTRY|MYSQL)_(URL|URI|DSN)$/.test(up)) return true;
+  if (/^[A-Z0-9]*(APIKEY|TOKEN|SECRET|PASSWORD)$/.test(up)) return true;
+  const toks = up.split('_').filter(Boolean);
+  return toks.some((t, i) => SECRET_TOKEN.test(t) && !NOT_SECRET_NEXT.test(toks[i + 1] ?? ''));
+}
+// Names expanded in a word: [{ name, indirect }]. `${!X}` / `${!X*}` are indirect (undeterminable).
+const expansions = word => [...String(word).matchAll(/\$(?:\{(!?)([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))/g)].map(m => ({ name: m[2] ?? m[3], indirect: m[1] === '!' }));
+const secretExpansion = word => expansions(word).some(e => e.indirect || secretVarName(e.name));
+// Brace expansion (bash order), capped.
+export function braceExpand(word, limit = 64) {
+  const m = /^(.*?)\{([^{}]*)\}(.*)$/s.exec(word);
+  if (!m) return [word];
+  let items;
+  const range = /^(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])$/.exec(m[2]);
+  if (m[2].includes(',')) items = m[2].split(',');
+  else if (range) { const num = /\d/.test(range[1]); const a = num ? +range[1] : range[1].charCodeAt(0), b = num ? +range[2] : range[2].charCodeAt(0); items = []; for (let i = a; a <= b ? i <= b : i >= b; i += a <= b ? 1 : -1) { items.push(num ? String(i) : String.fromCharCode(i)); if (items.length > limit) break; } }
+  else return [word];
+  const out = [];
+  for (const item of items) for (const rest of braceExpand(m[1] + item + m[3], limit)) { out.push(rest); if (out.length > limit) return out; }
+  return out;
+}
+// Names a glob could match that are secrets (dotglob off: a pattern not starting with `.` misses dotfiles).
+const SECRET_CANDIDATES = ['.env', '.env.local', '.env.production', '.netrc', '.npmrc', '.pgpass', '.git-credentials', '.bash_history', 'id_rsa', 'id_ed25519', 'server.key', 'cert.pem', 'credentials', 'credentials.json', 'secrets.yaml', 'secret.txt', 'prod.env', 'auth.json', 'service-account.json', 'terraform.tfstate', 'environ', 'token.txt'];
+export function globCanMatchSecret(pattern) {
+  if (/[$`]/.test(pattern)) return true;
+  let re = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else if (c === '[') { const j = pattern.indexOf(']', i + 2); if (j < 0) { re += '\\['; continue; } re += '[' + pattern.slice(i + 1, j).replace(/^!/, '^').replace(/\\/g, '\\\\') + ']'; i = j; }
+    else re += c.replace(/[.+^${}()|\\]/g, '\\$&');
+  }
+  let rx; try { rx = new RegExp('^' + re + '$'); } catch { return true; }
+  return SECRET_CANDIDATES.some(name => (!name.startsWith('.') || pattern.startsWith('.') || pattern.startsWith('[')) && rx.test(name));
+}
+const secretFile = word => braceExpand(word).some(w => isSecretPath(w) || CRED_PATH.test(w) || /(^|\/)proc\/[^/]+\/environ$/.test(w) || (/[*?[]/.test(w.split('/').at(-1)) && globCanMatchSecret(w.split('/').at(-1))));
+const TMP_ROOTS = ['/tmp', '/var/tmp', '/dev/shm'];
+const PRINT_CALL = /\b(print|pprint|dumps?|console\.(log|error|info|dir)|puts|pp|p\s|say|warn|die|write|stringify|inspect|repr|str\(|items|keys|values|to_h|to_a|each|Dumper|log)\b/;
+const SHELL_OUT = /\b(os\.(system|popen|exec\w*|spawn\w*)|subprocess|commands\.getoutput|pty\.spawn|child_process|execSync|execFileSync|execFile|spawnSync|spawn|exec|system|IO\.popen|Open3|Kernel\.(exec|system|spawn)|shell_exec|passthru|proc_open|popen|Deno\.(run|Command)|Bun\.(spawn|\$))\b|`|%x[({[]|qx[({[/]|\$`/;
+const FILE_CHANGE = /\b(shutil\.(rmtree|move|copy\w*)|rmtree|remove_tree|os\.(remove|unlink|rmdir|removedirs|rename|replace|truncate)|unlinkSync|unlink|rmSync|rmdirSync|rmdir|rimraf|rm_rf|rm_r|rm_f|FileUtils\.\w+|File\.(delete|unlink|write|rename|truncate)|Dir\.(delete|rmdir|unlink)|renameSync|rename|writeFileSync|writeFile|appendFileSync|copyFileSync|cpSync|copyFile|write_text|write_bytes|truncate|Deno\.(remove|writeTextFile|writeFile|rename))\b|open\s*\([^)]*,\s*['"][wax+]|\.rm\s*\(|\bfsp?\.(rm|rmdir|unlink)\b/;
+const stringLiterals = code => [...code.matchAll(/'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)"|`((?:[^`\\]|\\.)*)`|q[qw]?\(([^)]*)\)/g)].map(m => m[1] ?? m[2] ?? m[3] ?? m[4]);
+const INTERPRETER = /(^|\/)(python[0-9.]*|pypy[0-9.]*|node|nodejs|ruby|perl|php|deno|bun|Rscript|lua|osascript|tclsh|irb)$/;
+// Inline program text of an interpreter invocation, or undefined when it runs a script file.
+function interpreterCode(head, args, segment) {
+  const base = head.split('/').at(-1);
+  const input = segment.redirects.find(r => r.heredoc || r.herestring);
+  const flag = /^python|^pypy/.test(base) ? /^-[a-zA-Z]*c$/ : /^php/.test(base) ? /^-r$/ : /^(deno)$/.test(base) ? /^eval$/ : /^-[a-zA-Z]*[eEp]$|^--(eval|print)$/;
+  const i = args.findIndex(a => flag.test(a) || (/^--(eval|print)=/.test(a)));
+  if (i >= 0) return /=/.test(args[i]) && args[i].startsWith('--') ? args[i].slice(args[i].indexOf('=') + 1) : (args[i + 1] ?? '');
+  const positional = args.filter(a => !a.startsWith('-'));
+  if ((positional.length === 0 || positional[0] === '-') && input) return input.body ?? '';
+  if ((positional.length === 0 || positional[0] === '-') && segment.prevSep === '|') return null; // program piped in: undeterminable
+  return undefined;
+}
+// Physical resolution: `..` after a symlinked directory goes to the link target's parent, as the kernel does.
+function physicalResolve(base, rel) {
+  let cur = path.isAbsolute(rel) ? '/' : base;
+  for (const part of rel.split('/')) {
+    if (!part || part === '.') continue;
+    cur = part === '..' ? path.dirname(realish(cur)) : path.join(cur, part);
+  }
+  return cur;
+}
+function writeTargetDanger(target, ctx, what) {
+  if (SAFE_WRITE_TARGET.test(target) || target === '-') return undefined;
+  const why = deleteTargetDanger(target, ctx);
+  return why && !/is git metadata/.test(why) ? `${what}: ${why.replace('delete target', 'write target')}` : undefined;
+}
+// Files a command overwrites in place: cp/mv/install/ln -f destinations, tee (not -a), sed -i / perl -i files, dd of=.
+function overwriteTargets(head, args) {
+  const base = head.split('/').at(-1);
+  const pos = []; let endOpts = false, targetDir;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!endOpts && a === '--') { endOpts = true; continue; }
+    if (!endOpts && /^-t$|^--target-directory$/.test(a) && /^(cp|mv|install|ln)$/.test(base)) { targetDir = args[++i]; continue; }
+    if (!endOpts && /^--target-directory=/.test(a)) { targetDir = a.split('=').slice(1).join('='); continue; }
+    if (!endOpts && /^(-S|--suffix|-m|--mode|-o|--owner|-g|--group)$/.test(a) && /^(cp|mv|install|ln)$/.test(base)) { i++; continue; }
+    if (!endOpts && a.startsWith('-') && a !== '-') continue;
+    pos.push(a);
+  }
+  const intoDir = (dir, sources) => { let isDir = false; try { isDir = fs.statSync(dir).isDirectory(); } catch {} return isDir || dir.endsWith('/') ? sources.map(s => path.join(dir, path.basename(s))) : [dir]; };
+  if (/^(cp|mv|install)$/.test(base) || (base === 'ln' && args.some(a => /^-[a-zA-Z]*f|^--force$/.test(a)))) {
+    if (targetDir !== undefined) return pos.map(s => path.join(targetDir, path.basename(s)));
+    if (pos.length < 2) return [];
+    return intoDir(pos.at(-1), pos.slice(0, -1));
+  }
+  if (base === 'tee') return args.some(a => /^-[a-zA-Z]*a|^--append$/.test(a)) ? [] : pos;
+  if (base === 'sed' && args.some(a => /^-[a-zA-Z]*i|^--in-place/.test(a))) {
+    const hasScript = args.some(a => /^(-e|-f|--expression|--file)/.test(a));
+    const files = []; let skip = false;
+    for (let i = 0; i < args.length; i++) { const a = args[i]; if (skip) { skip = false; continue; } if (/^(-e|-f|--expression|--file|-l)$/.test(a)) { skip = true; continue; } if (a.startsWith('-')) continue; files.push(a); }
+    return hasScript ? files : files.slice(1);
+  }
+  if (base === 'perl' && args.some(a => /^-[a-zA-Z]*i/.test(a))) {
+    const files = []; let skip = false;
+    for (const a of args) { if (skip) { skip = false; continue; } if (/^-[a-zA-Z]*[eE]$/.test(a)) { skip = true; continue; } if (a.startsWith('-')) continue; files.push(a); }
+    return args.some(a => /^-[a-zA-Z]*[eE]$/.test(a)) ? files : files.slice(1);
+  }
+  if (base === 'dd') return args.filter(a => a.startsWith('of=')).map(a => a.slice(3));
+  return [];
+}
+const GIT_BUILTINS = new Set('add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore check-mailmap check-ref-format checkout checkout-index cherry cherry-pick citool clean clone column commit commit-graph commit-tree config count-objects credential describe diff diff-files diff-index diff-tree difftool fast-export fast-import fetch fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo format-patch fsck gc get-tar-commit-id grep gui hash-object help hook index-pack init instaweb interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes pack-objects pack-refs patch-id prune prune-packed pull push range-diff read-tree rebase reflog remote repack replace request-pull rerere reset restore rev-list rev-parse revert rm send-email send-pack shortlog show show-branch show-index show-ref sparse-checkout stash status stripspace submodule switch symbolic-ref tag unpack-file unpack-objects update-index update-ref update-server-info var verify-commit verify-pack verify-tag version whatchanged worktree write-tree lfs filter-repo'.split(' '));
+const GIT_CONFIG_DANGER = /^(alias\.|remote\..*\.(push|mirror)$|push\.default$|pull\.rebase$|branch\..*\.rebase$|include\.path$|includeif\.)/i;
+function gitAlias(sub, cwd) {
+  if (!cwd || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(sub)) return undefined;
+  try { return execFileSync('git', ['config', '--get', `alias.${sub}`], { cwd, encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim() || undefined; } catch { return undefined; }
+}
+const insideRoots = (target, ctx) => { if (!target || /[$`{}*?]/.test(target)) return false; const t = target === '~' || target.startsWith('~/') ? path.join(ctx.home ?? '/nonexistent', target.slice(2)) : target; const abs = path.isAbsolute(t) ? t : ctx.cwds?.size === 1 ? path.resolve([...ctx.cwds][0], t) : undefined; if (!abs) return false; const real = realish(abs); return ctx.roots.some(r => contains(r, abs) && contains(r, real)); };
+
+function hardExtras2(segment, segments, n, ctx, { head, args, cmd, READ }) {
+  const out = [];
+  const { words, redirects } = segment;
+  const base = head.split('/').at(-1);
+  const quiet = quietPipe(segments, n);
+  const inner = (command, label) => { for (const e of ctx.inner?.(command) ?? []) out.push([e.rule, `${label}: ${e.reason}`]); };
+  // -- secrets: environment prints
+  for (let k = 0; k < words.length; k++) {
+    if (words[k] !== 'env' && !/\/env$/.test(words[k])) continue;
+    if (words.slice(0, k).some(w => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) && !/^(sudo|time|nice|nohup|command|exec|-\S*)$/.test(w))) break;
+    let rest = false;
+    for (let i = k + 1; i < words.length; i++) {
+      const a = words[i];
+      if (/^(-u|--unset|-C|--chdir)$/.test(a)) { i++; continue; }
+      if (/^(-S|--split-string)$/.test(a)) { inner(words[i + 1] ?? '', 'env -S'); rest = true; break; }
+      if (/^--split-string=|^-S./.test(a)) { inner(a.replace(/^--split-string=|^-S/, ''), 'env -S'); rest = true; break; }
+      if (a.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) continue;
+      rest = true; break;
+    }
+    if (!rest && !quiet) out.push(['secret', 'env prints the environment']);
+    break;
+  }
+  if (/^(export|declare|typeset|local|readonly)$/.test(base)) {
+    const names = args.filter(a => !a.startsWith('-') && !a.includes('='));
+    if (!quiet && (!args.length && base !== 'local' || (args.length && args.every(a => a.startsWith('-')) && args.some(a => /p|x/.test(a))))) out.push(['secret', `${base} ${args.join(' ')} prints the environment`.replace('  ', ' ')]);
+    if (args.some(a => /^-[a-zA-Z]*p/.test(a)) && names.some(secretVarName)) out.push(['secret', `${base} -p prints a secret variable`]);
+  }
+  if (base === 'printenv' && args.some(a => !a.startsWith('-') && secretVarName(a)) && !quiet) out.push(['secret', 'printenv prints a secret variable']);
+  if (/^(echo|printf|print|cat|tee|logger|wall)$/.test(base) && args.some(secretExpansion) && !quiet) out.push(['secret', `${base} prints a secret environment variable`]);
+  for (const r of redirects) if (r.herestring && secretExpansion(r.body ?? '')) out.push(['secret', 'here-string expands a secret environment variable']);
+  if (/^(curl|wget|nc|ncat|http|https|xh)$/.test(base)) {
+    const valueOpts = /^(-H|--header|-u|--user|--oauth2-bearer|-A|--user-agent|-b|--cookie|-o|--output|-x|--proxy|-K|--config|--cacert|--cert|--key|-e|--referer|--max-time|-m|-w|--write-out|--connect-timeout|-X|--request|--retry|--resolve)$/;
+    for (let i = 0; i < args.length; i++) { const a = args[i]; if (valueOpts.test(a)) { i++; continue; } if (/^-/.test(a) && !/^(-d|--data\S*|-F|--form\S*|--json|--url|--url-query)$/.test(a) && !/^(-d|-F)./.test(a)) continue; const v = /^(-d|--data\S*|-F|--form\S*|--json|--url|--url-query)$/.test(a) ? args[++i] ?? '' : a; if (secretExpansion(v)) { out.push(['secret', `${base} sends a secret environment variable in the URL or body`]); break; } }
+  }
+  if (/^(gh)$/.test(base) && args[0] === 'auth' && args[1] === 'status' && args.some(a => /^(-t|--show-token)$/.test(a))) out.push(['secret', 'gh auth status --show-token prints a token']);
+  for (let k = 0; k < words.length; k++) if (isGitWord(words[k])) { const { sub, rest } = git(words, k); if (/^credential(-store|-cache)?$/.test(sub ?? '') && rest.some(a => /^(fill|get)$/.test(a))) out.push(['secret', 'git credential fill prints stored credentials']); }
+  for (const r of redirects) if (!r.heredoc && !r.herestring && r.file && /^(\d*<|<>)$/.test(r.op) && r.target && (/(^|\/)proc\/[^/*?]+\/environ$/.test(r.target) || secretFile(r.target))) out.push(['secret', `input redirect reads ${JSON.stringify(r.target)}`]);
+  // Brace-expanded reader arguments (`cat .en{v,}`).
+  if (READ) for (const a of args) if (/\{/.test(a) && braceExpand(a).length > 1 && secretFile(a)) out.push(['secret', `reader argument ${JSON.stringify(a)} expands to a secret file`]);
+  // -- secrets: uploads
+  if (base === 'curl' || base === 'wget') {
+    const refs = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      let opt = a, val;
+      const eq = a.startsWith('--') ? a.indexOf('=') : -1;
+      if (eq > 0) { opt = a.slice(0, eq); val = a.slice(eq + 1); }
+      else if (/^-[dFT]./.test(a)) { opt = a.slice(0, 2); val = a.slice(2); }
+      if (!/^(-d|--data|--data-binary|--data-ascii|--data-urlencode|--json|-F|--form|-T|--upload-file|--post-file|--body-file)$/.test(opt)) continue;
+      if (val === undefined) val = args[++i] ?? '';
+      if (/^(-T|--upload-file|--post-file|--body-file)$/.test(opt)) refs.push(val);
+      else if (/^(-F|--form)$/.test(opt)) { const m = /^[^=]*=([@<])([^;]*)/.exec(val); if (m) refs.push(m[2].replace(/^"|"$/g, '')); }
+      else if (opt === '--data-urlencode') { const m = /^([^=@]*)@(.*)$/.exec(val); if (m) refs.push(m[2]); }
+      else if (val.startsWith('@')) refs.push(val.slice(1));
+    }
+    for (const ref of refs) {
+      if (ref === '-' || ref === '/dev/stdin') { const r = redirects.find(r => r.file && /^0?<$/.test(r.op)); if (r && (isDynamic(r.target ?? '') || secretFile(r.target ?? ''))) out.push(['secret', `${base} uploads stdin from ${JSON.stringify(r.target)}`]); continue; }
+      if (isDynamic(ref)) out.push(['secret', `${base} uploads a file whose name is not literal`]);
+      else if (secretFile(ref)) out.push(['secret', `${base} uploads secret file ${JSON.stringify(ref)}`]);
+    }
+  }
+  // -- deletes/writes through a symlink created in this command (ln -s TARGET LINK; ...; rm -rf LINK/x / cd LINK)
+  const changes = /^(rm|rmdir|unlink|find|rsync|mv|truncate|cp|tee|sed|dd|install|shred|perl|ln)$/.test(base) || redirects.some(r => r.file && /^(\d*>|>\||&>|<>|\d*>>|&>>)$/.test(r.op));
+  if (changes) {
+    for (const s of segments.slice(0, n)) {
+      const k = s.words.findIndex(w => /(^|\/)ln$/.test(w) || /(^|\/)cp$/.test(w));
+      if (k < 0 || !s.words.slice(k + 1).some(w => /^-[a-zA-Z]*s|^--symbolic/.test(w))) continue;
+      const pos = s.words.slice(k + 1).filter(w => !w.startsWith('-'));
+      const linkTarget = pos[0];
+      const linkDir = pos.length > 1 && !pos.at(-1).endsWith('/') ? path.dirname(pos.at(-1)) : '.';
+      const resolvedTarget = linkTarget && !path.isAbsolute(linkTarget) && !linkTarget.startsWith('~') ? path.join(linkDir, linkTarget) : linkTarget;
+      if (!insideRoots(resolvedTarget, ctx)) { out.push(['delete', `writes or deletes after creating symlink ${JSON.stringify(pos.at(-1) ?? linkTarget)} to ${JSON.stringify(linkTarget)} outside the project`]); break; }
+    }
+  }
+  // -- interpreters: inline code that shells out, deletes/overwrites files or prints secrets
+  if (INTERPRETER.test(head)) {
+    const code = interpreterCode(head, args, segment);
+    if (code === null) out.push(['delete', `${base} runs a program piped from another command`]);
+    else if (typeof code === 'string' && code) {
+      const lits = stringLiterals(code);
+      if (SHELL_OUT.test(code)) {
+        if (!lits.length) out.push(['delete', `${base} code runs a shell command that is not literal`]);
+        for (const lit of new Set([...lits, lits.join(' ')])) if (/\s|^(git|rm|sh|bash)$/.test(lit)) inner(lit.replace(/\\(.)/g, '$1'), `${base} shell-out`);
+        if (/\b(git|gh)\b/.test(code) && /\bpush\b/.test(code) && !/\bpush\b/.test(lits.join(' '))) out.push(['history', `${base} code builds a git push it does not spell out`]);
+      }
+      if (FILE_CHANGE.test(code)) {
+        const paths = lits.filter(l => /^(\/|~|\.\.?\/)|\//.test(l) && !/\s/.test(l) && !/^(https?|wss?):/.test(l));
+        if (!lits.length) out.push(['delete', `${base} code deletes or writes a path that is not literal`]);
+        for (const p of paths) { const why = deleteTargetDanger(p, ctx); if (why && !/is git metadata/.test(why)) out.push(['delete', `${base} code: ${why}`]); }
+      }
+      const envNames = [...code.matchAll(/environ(?:\.get)?\s*[\[(]\s*['"](\w+)|getenv\s*\(\s*['"](\w+)|process\.env(?:\.(\w+)|\[\s*['"](\w+))|ENV\s*(?:\[\s*['"]|\.fetch\(\s*['"])(\w+)|\$ENV\{\s*['"]?(\w+)/g)].map(m => m.slice(1).find(Boolean));
+      const bareEnv = /os\.environ(?!\s*(\.get|\[|\.copy|\.setdefault|\.pop|\.update))|process\.env(?!\s*[.\[])|\bENV\b(?!\s*[\[.])|%ENV|Deno\.env\.toObject/.test(code);
+      if (PRINT_CALL.test(code) && (bareEnv || envNames.some(secretVarName))) out.push(['secret', `${base} code prints the environment or a secret variable`]);
+      if (/open\s*\(|readFile|read_text|File\.read|IO\.read|slurp/.test(code) && lits.some(l => secretFile(l))) out.push(['secret', `${base} code reads a secret file`]);
+    }
+  }
+  if (base === 'alias') for (const a of args) { const eq = a.indexOf('='); if (eq > 0) inner(a.slice(eq + 1), `alias ${a.slice(0, eq)}`); }
+  // -- git environment, globals and configuration
+  for (const w of words.slice(0, Math.max(cmd, 0)).concat(base === 'export' ? args : [])) {
+    const m = /^(GIT_[A-Z_]+)=(.*)$/.exec(w); if (!m) continue;
+    if (/^GIT_(DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|NAMESPACE)$/.test(m[1]) && !insideRoots(m[2], ctx)) out.push(['delete', `${m[1]} points git outside the project`]);
+    if (/^GIT_(CONFIG\w*|EXEC_PATH|ALTERNATE_OBJECT_DIRECTORIES)$/.test(m[1])) out.push(['history', `${m[1]} injects git configuration`]);
+  }
+  for (let k = 0; k < words.length; k++) {
+    if (!isGitWord(words[k])) continue;
+    const g = words.slice(k + 1);
+    for (let i = 0; i < g.length && g[i].startsWith('-'); i++) {
+      const a = g[i];
+      const m = /^--(work-tree|git-dir)(?:=(.*))?$/.exec(a);
+      if (m) { const v = m[2] ?? g[++i]; if (!insideRoots(v, ctx)) out.push(['delete', `git --${m[1]} outside the project`]); continue; }
+      if (a === '-c' && GIT_CONFIG_DANGER.test((g[i + 1] ?? '').split('=')[0])) out.push(['history', `git -c ${(g[i + 1] ?? '').split('=')[0]} can turn a push into a force push or rewrite`]);
+      if (/^(-c|-C|--namespace|--exec-path|--super-prefix|--config-env)$/.test(a)) { if (a === '--config-env') out.push(['history', 'git --config-env injects configuration']); i++; }
+    }
+    const { sub, rest } = git(words, k);
+    if (sub === 'config') {
+      const pos = rest.filter(a => !a.startsWith('-'));
+      const reading = rest.some(a => /^(--get|--get-all|--get-regexp|-l|--list|--unset|--unset-all|--show-origin)$/.test(a));
+      if (!reading && pos.length >= 2 && GIT_CONFIG_DANGER.test(pos[0])) out.push(['history', `git config ${pos[0]} can turn a push into a force push or rewrite`]);
+    }
+    if (sub && !sub.startsWith('-') && !isDynamic(sub) && !GIT_BUILTINS.has(sub)) {
+      const cwd = ctx.cwds?.size === 1 ? [...ctx.cwds][0] : undefined;
+      const value = gitAlias(sub, cwd);
+      if (value) inner(value.startsWith('!') ? value.slice(1) : `git ${value} ${rest.join(' ')}`, `git alias ${sub}`);
+    }
+  }
+  // -- overwrites outside the project or /tmp (cp/mv/install/ln -f dest, tee, sed -i, perl -i, dd of=)
+  if (ctx.cwds || words.some(w => path.isAbsolute(w) || w.startsWith('~'))) {
+    const c = { ...ctx, cwds: ctx.cwds ?? new Set(['/nonexistent-cwd']) };
+    for (const t of overwriteTargets(head, args)) { const why = writeTargetDanger(t, c, `${base} overwrites`); if (why) out.push(['delete', why]); }
+  }
+  return out;
+}
+
 function hardExtras(segment, segments, n, ctx, vars) {
   const out = [];
   const { words } = segment;
@@ -783,7 +1043,7 @@ function hardExtras(segment, segments, n, ctx, vars) {
     const targets = head === 'truncate' ? args.filter(a => !a.startsWith('-') && !/^\d+[KMG]?$/.test(a)) : head === 'mv' ? args.filter(a => !a.startsWith('-')).slice(0, -1) : args.some(a => /^--remove-files/.test(a)) ? args.filter(a => !a.startsWith('-')) : [];
     for (const t of targets) { const why = deleteTargetDanger(t, ctx); if (why) out.push(['delete', `${head}: ${why}`]); }
   }
-  if ((/(^|\/)python[0-9.]*$/.test(head) && args.includes('-c')) || (/(^|\/)perl$/.test(head) && args.some(a => /^-[a-zA-Z]*e$/.test(a)))) {
+  if (false) {
     const code = args.join(' ');
     if (/rmtree|unlink|rmdir|os\.remove|\bremove\(|truncate/.test(code)) {
       const lits = [...code.matchAll(/['"]((?:\/|~)[^'"]*)['"]|q\(([^)]*)\)/g)].map(m => m[1] ?? m[2]);
@@ -799,9 +1059,8 @@ function hardExtras(segment, segments, n, ctx, vars) {
   }
   if (head === 'rm' && args.some(a => /(^|\/)\.git\/?$/.test(a))) out.push(['history', 'rm of .git destroys history']);
   // Secrets.
-  if (/(^|\/)(printenv|env|export|set|declare)$/.test(head) && !args.some(a => !a.startsWith('-') && !/=/.test(a)) && !(head === 'export' && args.length) && !(head === 'set' && args.length) && !(head === 'declare' && args.length) && !quietPipe(segments, n)) out.push(['secret', `${head} prints the environment`]);
+  if (/(^|\/)(printenv|set)$/.test(head) && !args.some(a => !a.startsWith('-') && !/=/.test(a)) && !(head === 'export' && args.length) && !(head === 'set' && args.length) && !(head === 'declare' && args.length) && !quietPipe(segments, n)) out.push(['secret', `${head} prints the environment`]);
   if (/(^|\/)gh$/.test(head) && args[0] === 'auth' && args[1] === 'token') out.push(['secret', 'gh auth token prints a token']);
-  if (/(^|\/)(echo|printf)$/.test(head) && args.some(a => /\$\{?[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)/i.test(a)) && !quietPipe(segments, n)) out.push(['secret', 'prints a secret environment variable']);
   if (/(^|\/)curl$/.test(head) && args.some((a, i) => /^@/.test(a) && /^(-d|--data[a-z-]*|-F|--form|-T|--upload-file)$/.test(args[i - 1] ?? '') && (isDynamic(a) || isSecretPath(a.slice(1)) || CRED_PATH.test(a.slice(1)) || /[*?[]/.test(a)) || /^(-d|-F|--data[a-z-]*|--form)=?.*=?@(\.env|.*[$`*?])/.test(a) || /^[A-Za-z0-9_]+=@/.test(a) && (isSecretPath(a.split('@')[1]) || isDynamic(a)))) out.push(['secret', 'curl uploads a secret file']);
   if (/(^|\/)(tar|zip|scp|rsync)$/.test(head)) {
     const pos = args.filter(a => !a.startsWith('-'));
@@ -818,7 +1077,7 @@ function hardExtras(segment, segments, n, ctx, vars) {
     if (/(^|\/)proc\/[^/]+\/environ$/.test(a) || /(^|\/)proc\/[*?]/.test(a)) out.push(['secret', 'reads a process environment']);
     else if (CRED_PATH.test(a) && (READ || /(^|\/)(curl|tar|zip|rsync)$/.test(head))) out.push(['secret', `reads credential file ${JSON.stringify(a)}`]);
     else if (READ && isDynamic(a) && !/^\$\{?(HOME|PWD|TMPDIR)\}?(\/|$)/.test(a)) out.push(['secret', `reader argument ${JSON.stringify(a)} is not literal`]);
-    else if (READ && /[*?[]/.test(a) && /(^|\/)[^/]*(\.|\[\.?)?[^/]*[*?[]/.test(a) && /(^|\/)\.?\[?\.?[eE*?[]/.test(a.split('/').at(-1)) && /^[.[*?]/.test(a.split('/').at(-1))) out.push(['secret', `reader glob ${JSON.stringify(a)} can match a secret file`]);
+    else if (READ && /[*?[]/.test(a) && globCanMatchSecret(a.split('/').at(-1))) out.push(['secret', `reader glob ${JSON.stringify(a)} can match a secret file`]);
   }
   // A reader whose file arguments come from a command substitution (`cat \`ls | grep env\``) is undeterminable.
   if (READ && segments[n + 1]?.sub === true && segments[n + 1]?.prevSep === '`') out.push(['secret', `${head} reads files named by a command substitution`]);
@@ -833,6 +1092,7 @@ function hardExtras(segment, segments, n, ctx, vars) {
   if (SHELL_WORD.test(head) && segment.prevSep === '|' && !args.some(a => /^-[a-zA-Z]*c/.test(a))) out.push(['delete', `${head} runs piped input`]);
   // Garage exemption is a single file: a recursive grep over the directory reads .env too.
   if (words.some(w => /^-[a-zA-Z]*[rR]/.test(w)) && words.some(w => /^\/opt\/wncscanner-docker\/?$/.test(w))) out.push(['secret', 'recursive read over /opt/wncscanner-docker']);
+  out.push(...hardExtras2(segment, segments, n, ctx, { head, args, cmd, READ }));
   return out;
 }
 
@@ -855,7 +1115,8 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
   if (depth > 4) return [H('delete', 'commands nested too deeply to inspect')];
   const { segments } = scanShell(command);
   const reasons = [];
-  const ctx = { cwds: remote ? new Set([REMOTE_HOME]) : segmentCwds(segments, cwd, home), roots: [...(project?.roots ?? []), ...(hard ? ['/tmp'] : [])], home, remote };
+  const ctx = { cwds: remote ? new Set([REMOTE_HOME]) : segmentCwds(segments, cwd, home), roots: [...(project?.roots ?? []), ...(hard ? TMP_ROOTS : [])], home, remote };
+  ctx.inner = inner => { const sub = []; const cw = ctx.cwds?.size === 1 ? [...ctx.cwds][0] : undefined; fullAutoShellCheck(inner, remote ? undefined : cw, project, { home, remote, paths, depth: depth + 1, hard: sub }); return sub; };
   if (remote) { const tracked = segmentCwds(segments, REMOTE_HOME, REMOTE_HOME); ctx.cwds = tracked; ctx.home = REMOTE_HOME; }
   const nested = [];
   const envReads = garage && remote && depth > 0 ? garageEnvReads(command, segments) : new Map();
@@ -871,7 +1132,7 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     const history = gitHistoryDanger(words, { amendOk: amendOk && depth === 0 && !remote });
     if (history) { const r = `${text}: ${history}`; reasons.push(r); if (hard && !resetHeadOnly(words)) H('history', r); }
     if (hard) for (const [rule, why] of hardExtras(segment, segments, n, ctx, vars)) reasons.push(H(rule, `${text}: ${why}`));
-    const disk = words.find(word => DISK_COMMANDS.test(word) || BLOCK_DEVICE.test(word) || /^of=\/dev\//.test(word));
+    const disk = words.find(word => (DISK_COMMANDS.test(word) && !(hard && word === 'dd')) || BLOCK_DEVICE.test(word) || (/^of=\/dev\//.test(word) && !/^of=\/dev\/(null|stdout|stderr|fd\/\d+)$/.test(word)));
     if (disk) reasons.push(H('delete', `${text}: ${disk} writes disks or devices`));
     const garageOk = !remote && depth === 0 && garageSshSegment(command, segments, n);
     const skip = new Set([...(envReads.get(n) ?? []), ...(garageOk ? sshRemoteWords(words) : [])]);

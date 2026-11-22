@@ -361,7 +361,8 @@ test('the profile reloads from configure-choices.json and fails closed on bad co
 const SECRET_FALSE_POSITIVES = [
   "ssh garage-server 'python3 - <<EOF\nimport json\nd = json.load(open(\"/opt/x/data.json\"))\nprint(list(d.keys()))\nEOF'",
   'python3 -c "import json; d = json.load(open(\'data.json\')); print(d.keys())"', 'python3 -c "print(cfg.key)"',
-  'env | grep -viE "secret|token|key|pass"', 'docker compose config | grep -viE "secret|token|key|pass"', 'grep -rn "SECRET_KEY" src/',
+  // r40c: 'env | grep -viE ...' is now a hard deny (env print; DATABASE_URL, GH_PAT survive the filter).
+  'docker compose config | grep -viE "secret|token|key|pass"', 'grep -rn "SECRET_KEY" src/',
   'grep -ri secret src', 'grep -c token logs/app.log', 'rg -n "api_key|password" src', 'git grep -n secret', 'sed -n "/secret/p" notes.txt',
   "sed 's/password=.*/password=***/' app.log", "awk '/key/ {print $1}' data.txt", 'git log --oneline | grep -i key', 'printenv | grep -c SECRET',
   'echo $SECRET_KEY | wc -c', 'grep -n KEY .env.example', 'ssh -i ~/.ssh/id_ed25519 garage-server uptime', 'grep -e key -e token src/app.py',
