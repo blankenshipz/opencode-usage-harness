@@ -81,6 +81,17 @@ export function renderCard(probe) {
   return lines.join('\n').slice(0, 899);
 }
 
+// parity 4.8: the project's review lessons (appended by the router from needs_fixes verdicts), bounded.
+export const LESSONS_MAX_BYTES = 4000;
+export function readReviewLessons(directory, { fsImpl = fs, maxBytes = LESSONS_MAX_BYTES } = {}) {
+  try {
+    const raw = fsImpl.readFileSync(path.join(directory, '.review', 'lessons.md'), 'utf8').trim();
+    if (!raw) return undefined;
+    // Keep the newest lessons (the file is appended) within the bound.
+    const body = raw.length > maxBytes ? '...\n' + raw.slice(raw.length - maxBytes) : raw;
+    return `Review lessons for this project (.review/lessons.md; avoid repeating these findings):\n${body}`;
+  } catch { return undefined; }
+}
 export function cardFile(directory) {
   return statePath('env-cards', crypto.createHash('sha256').update(String(directory)).digest('hex').slice(0, 16) + '.json');
 }
@@ -107,12 +118,12 @@ async function writeCardFile(directory, record) {
   await fs.promises.writeFile(file, JSON.stringify(record, null, 2) + '\n', { mode: 0o600 });
 }
 
-export async function installEnvCard(ctx, { cache = createEnvCardCache(), autoPermission = installAutoPermission } = {}) {
+export async function installEnvCard(ctx, { cache = createEnvCardCache(), autoPermission = installAutoPermission, readLessons = readReviewLessons } = {}) {
   const directory = ctx?.location?.directory;
   const stopAuto = await autoPermission(ctx);
   if (!directory) return { stop() { stopAuto?.stop?.(); } };
   const controller = new AbortController();
-  const pinned = new Map();
+  const pinned = new Map(), pinnedLessons = new Map();
   if (ctx.session?.hook) await ctx.session.hook('context', async event => {
     if (!CARD_ROLES.has(canonicalHarnessRole(event?.agent)) || !Array.isArray(event.system)) return;
     // Pin the card per session: a later refresh (new root session) must not change an
@@ -123,6 +134,12 @@ export async function installEnvCard(ctx, { cache = createEnvCardCache(), autoPe
       if (typeof event.sessionID === 'string') { if (pinned.size >= 2048) pinned.delete(pinned.keys().next().value); pinned.set(event.sessionID, text); }
     }
     if (text && !event.system.some(p => p?.text === text)) event.system.push({ type: 'text', text });
+    let lessons = pinnedLessons.get(event.sessionID);
+    if (lessons === undefined) {
+      lessons = readLessons(directory) ?? '';
+      if (typeof event.sessionID === 'string') { if (pinnedLessons.size >= 2048) pinnedLessons.delete(pinnedLessons.keys().next().value); pinnedLessons.set(event.sessionID, lessons); }
+    }
+    if (lessons && !event.system.some(p => p?.text === lessons)) event.system.push({ type: 'text', text: lessons });
   });
   if (typeof ctx.event?.subscribe === 'function') void (async () => {
     try {

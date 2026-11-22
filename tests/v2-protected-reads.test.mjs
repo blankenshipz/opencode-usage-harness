@@ -62,7 +62,7 @@ async function decide(command, base = P) {
   };
   await installShellGuard(ctx, { fullAutoProjects: PROJECTS });
   const call = { tool: 'shell', sessionID: 'ses_r37', agent: 'harness-builder', messageID: 'msg_r37', id: `call_${Math.random()}` };
-  try { await hooks['execute.before']({ ...call, input: { command } }); } catch { return 'deny'; }
+  try { await hooks['execute.before']({ ...call, input: { command } }); } catch (error) { return /HARD DENY \(harness auto-approve policy; rule: [^)]*secret/.test(error.message) && /resumable blocker/.test(error.message) ? 'deny' : `throw: ${error.message}`; }
   if (guardAsked) return 'guard-ask';
   const resources = scanShell(command).segments.filter(segment => segment.hasCommand && segment.words[0] !== 'cd').map(segment => segment.text);
   if (!resources.length) return 'allow';
@@ -107,7 +107,7 @@ test('code-extension exemption covers only dotted secret-like names of source fi
 
 test('full-auto: real secret files still ask in the project', async () => {
   for (const command of ['cat credentials.json', 'git add .env.production', 'cat config/secrets.yaml', 'git add certs/server.pem', 'cp tls.key /tmp/x', 'cat credentials.json backend/app/agent_search/credentials.py'])
-    assert.equal(await decide(command), 'guard-ask', command);
+    assert.equal(await decide(command), 'deny', command); // 0.4.0: hard deny (secret)
 });
 
 test('protected locations: browser profile data, agent profiles and the harness install', () => {
@@ -152,7 +152,7 @@ test('full-auto read-only shell asks for protected locations (guard and external
   ];
   for (const command of asks) {
     assert.notDeepEqual(fullAutoShellCheck(command, P, project), [], command);
-    assert.equal(await decide(command), 'guard-ask', command);
+    assert.equal(await decide(command), 'deny', command); // 0.4.0: hard deny (secret)
     assert.equal(ext('bash', '/home/box/work/*', { command }).decision, 'ask', command);
   }
   const allows = [`cat ${RECEIPTS}/mobile-jest-1/stdout.log`, `cd ${RECEIPTS}/mobile-jest-1 && grep -c FAIL stdout.log stderr.log`, `ls ${RECEIPTS}`,

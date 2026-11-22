@@ -95,6 +95,26 @@ export function reevaluationLogger({ file = statePath('telemetry', 'permission-r
   };
 }
 
+// 0.4.0 (parity 4.3): one decision per call. The shell guard records each call it has already
+// decided (verified/allowed, or hard-denied). If OpenCode's native rule then raises an ask for the
+// same session+callID, a verified call is replied "once" automatically; a hard-denied one never is.
+const GUARD_DECISION_TTL_MS = 10 * 60_000;
+export const guardDecisions = new Map(); // `${sessionID}\0${callID}` -> {verified, expires}
+export function recordGuardDecision(sessionID, callID, { verified = false, now = Date.now() } = {}) {
+  if (typeof sessionID !== 'string' || !sessionID || typeof callID !== 'string' || !callID) return;
+  const key = `${sessionID}\0${callID}`;
+  // A hard deny is sticky: a later "verified" record for the same call never upgrades it.
+  if (guardDecisions.get(key)?.verified === false && verified) return;
+  if (guardDecisions.size >= 4096) guardDecisions.delete(guardDecisions.keys().next().value);
+  guardDecisions.set(key, { verified: verified === true, expires: now + GUARD_DECISION_TTL_MS });
+}
+export function guardVerified(sessionID, callID, now = Date.now()) {
+  const entry = guardDecisions.get(`${sessionID}\0${callID}`);
+  if (!entry) return false;
+  if (entry.expires <= now) { guardDecisions.delete(`${sessionID}\0${callID}`); return false; }
+  return entry.verified === true;
+}
+
 const listData = value => Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
 
 export async function installPermissionReevaluation(ctx, { delays = [1500, 6000], setTimer = setTimeout, clearTimer = clearTimeout,
@@ -191,6 +211,17 @@ export async function installPermissionReevaluation(ctx, { delays = [1500, 6000]
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         const data = event?.data ?? {};
         if (event?.type === 'permission.asked' && data.id && data.sessionID) {
+          // One decision per call: the guard already verified this call, so answer the native re-ask once.
+          // Guard-forced asks (GUARD_MARKER) always stay with a human.
+          if (data.source?.id && !data.metadata?.[markers.GUARD_MARKER] && guardVerified(data.sessionID, data.source.id, now())) {
+            const key = `${data.sessionID}\0${data.source.id}`;
+            try {
+              await permission.reply({ sessionID: data.sessionID, requestID: data.id, decision: 'once' });
+              guardDecisions.delete(key);
+              log({ at: new Date(now()).toISOString(), trigger: 'guard_decided', sessionID: data.sessionID, requestID: data.id, action: data.action, outcome: 'approved_once' });
+              continue;
+            } catch { /* fall through: track it like any other pending ask */ }
+          }
           pending.set(data.id, data.sessionID);
           const call = data.source?.id ? callAgents.get(`${data.sessionID}\0${data.source.id}`) : undefined;
           askMeta.set(data.id, { agent: call?.agent, tool: call?.tool });

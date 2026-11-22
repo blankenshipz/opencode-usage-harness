@@ -41,7 +41,23 @@ export async function recordReviewVerdict({ agent, verdict, reviewedHead, summar
   const line = { tree, head, repo, verdict, sessionId, agent, ...(summary ? { summary: String(summary).slice(0, 300) } : {}), recordedAt: new Date(now).toISOString() };
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   await fs.appendFile(file, JSON.stringify(line) + '\n', { mode: 0o600 });
+  if (verdict === 'needs_fixes') await appendLesson(repo, line).catch(() => {});
   return line;
+}
+
+// parity 4.8: each needs_fixes verdict appends one short line to <repo>/.review/lessons.md
+// (injected into worker prompts by env-card.mjs). Bounded: keeps the newest LESSONS_MAX_LINES lines.
+export const LESSONS_MAX_LINES = 60;
+export async function appendLesson(repo, { summary, head, recordedAt } = {}, { maxLines = LESSONS_MAX_LINES } = {}) {
+  if (typeof repo !== 'string' || !repo) return;
+  const text = String(summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 240);
+  if (!text) return;
+  const dir = path.join(repo, '.review'), file = path.join(dir, 'lessons.md');
+  await fs.mkdir(dir, { recursive: true });
+  let lines = [];
+  try { lines = (await fs.readFile(file, 'utf8')).split('\n').filter(Boolean); } catch {}
+  lines.push(`- ${String(recordedAt ?? new Date().toISOString()).slice(0, 10)} needs_fixes @${String(head ?? '').slice(0, 12)}: ${text}`);
+  await fs.writeFile(file, lines.slice(-maxLines).join('\n') + '\n');
 }
 
 export async function installReviewVerdictTool(ctx, { loadSessions = runtimeSessions, record = recordReviewVerdict } = {}) {

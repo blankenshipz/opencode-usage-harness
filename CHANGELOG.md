@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0 — auto-approve by default, guard fixes, review quality, quota gate (r40)
+
+Zach's decision (2026-11-22): "let's not need approvals, let's bias to auto-approve mode". This overrides the ask-timeout and Harny-as-approver items of the parity plan (`parity-plan.md` 4.4, 5.1).
+
+- **Auto-approve is the default for every project** (yrdsale, demodirector, wncscanner, garage-audio, ocharness and any unlisted project), including `git push` and deploys. The guard no longer asks. `--full-auto-no-deploy` / `no_push_deploy` is still parsed but is a no-op.
+- **Hard denies, immediate, no human wait.** Each denial says which rule fired and tells the agent to record a resumable blocker with the exact command, continue other work and not retry variants:
+  1. force pushes and history rewrites (`push --force`, `--force-with-lease`, `--mirror`, `--delete`, `+refspec`, `filter-branch`, `filter-repo`, `rebase`, `reset --hard` to anything but `HEAD`, `commit --amend` of a pushed commit);
+  2. deletes outside the project roots or `/tmp`, and raw disk/device writes (`dd of=/dev/…`, `mkfs`, `wipefs`);
+  3. reading, printing or exfiltrating secrets (`.env*`, `*.pem`, `*.key`, token and `auth.json` files, the 0.3.4 protected locations). The garage-server `/opt/wncscanner-docker/.env` read-only exemption is unchanged.
+- **Safety net:** an ask that somehow stays pending is auto-denied (never approved) after 15 minutes (`HARNESS_ASK_TIMEOUT_MS`), and recorded as a resumable blocker.
+- **Guard fixes:** a top-level `cd T` to an existing directory inside the project keeps `T` as the working directory across `;` and newlines (`cd mobile; tsc > ../.review/x` is inside the project; 470.8 of 597.8 wait minutes since 0.3.3). The `read` tool may read a single OpenCode `xdg/data/opencode/tool-output/tool_*` file. One decision per call: the native rule no longer asks again for a call the guard already decided.
+- **Review quality:** builders self-check before review (re-read the diff, re-run bound checks at the final HEAD, answer a risk checklist); task intents carry `risks`; the env card injects `.review/lessons.md`. New `senior-builder` role (Opus) for high-risk work and after a second `needs_fixes`, never while the weekly brake is on. Reviewer and verifier rounds 2+ run on Sonnet unless the task is high-risk.
+- **Weekly brake and shared gate:** "ahead" now means projected over 100% at reset; while ahead, builder effort is not raised. Every quota sample is logged to `state/telemetry/quota-throttle.jsonl`. `node bin/subscription-quota.mjs --gate` prints `ok`, `slow` or `hold` from the cached snapshot with no network call (fails open), for `cc` and lane launchers.
+- **Attribution:** commits made by agents get `Agent:`, `Harness-Role:` and `Workrelay-Session:` trailers (`plugins/v2/agent-attribution.mjs`, `scripts/git-hooks/prepare-commit-msg`). Author and committer are unchanged.
+- **Ops:** `harness-manage deploy` switches releases only when no ask is pending and no session is busy (`--wait`, `--restart`, `--dry-run`), then warms plugins and triggers the workrelay resume. The `dispatch_runtime.py` timeout is 20 s with one retry (was 5 s).
+
 ## 0.3.4 — protected reads, source files named like secrets (r37)
 
 Two fixes from the r36 log review.

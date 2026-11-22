@@ -16,10 +16,20 @@ while True:
             raise SystemExit(1)
         time.sleep(0.02)
 `;
+export const RUNTIME_READ_TIMEOUT_MS = 20000;
+let runtimeExec = exec;
+// Test seam: replace the process runner used by runtime reads.
+export const setRuntimeExecForTest = fn => { runtimeExec = fn ?? exec; };
 const lockedEnvironment = () => Object.fromEntries(['HOME', 'PATH', 'LANG'].flatMap(name => process.env[name] === undefined ? [] : [[name, process.env[name]]]));
 const runtimeRead = async (args = []) => {
   if (!process.env.HARNESS_OPENCODE_DB) throw new Error('task-dispatch: HARNESS_OPENCODE_DB is required for read-only OpenCode session ownership lookup');
-  const { stdout } = await exec(configuredPython, [path.join(packageRoot, 'src/dispatch_runtime.py'), ...args], { timeout: 5000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, PATH: process.env.PATH, HOME: process.env.HOME, HARNESS_OPENCODE_DB: process.env.HARNESS_OPENCODE_DB } });
+  const options = { timeout: RUNTIME_READ_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, PATH: process.env.PATH, HOME: process.env.HOME, HARNESS_OPENCODE_DB: process.env.HARNESS_OPENCODE_DB } };
+  const argv = [path.join(packageRoot, 'src/dispatch_runtime.py'), ...args];
+  // Read-only lookup: under load one slow run must not kill a reviewer, so
+  // allow 20 s and retry exactly once before surfacing the error.
+  let stdout;
+  try { ({ stdout } = await runtimeExec(configuredPython, argv, options)); }
+  catch { ({ stdout } = await runtimeExec(configuredPython, argv, options)); }
   return JSON.parse(stdout);
 };
 export const runtimeSessions = () => runtimeRead();

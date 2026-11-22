@@ -1,0 +1,20 @@
+#!/bin/sh
+# harness: prepare-commit-msg attribution
+# Appends Agent:, Harness-Role: and Workrelay-Session: trailers from
+# HARNESS_AGENT, HARNESS_ROLE and WORKRELAY_SESSION_ID.  Unset variables are
+# skipped, existing trailers are never duplicated, and author/committer are
+# never touched.  A previous hook is chained as prepare-commit-msg.harness-chained.
+set -eu
+msg="$1"
+chained="$(dirname "$0")/prepare-commit-msg.harness-chained"
+if [ -x "$chained" ]; then "$chained" "$@"; fi
+case "${2:-}" in merge|squash) exit 0 ;; esac
+add() {
+  [ -n "$2" ] || return 0
+  value=$(printf '%s' "$2" | tr -d '\r\n')
+  if git interpret-trailers --parse "$msg" | grep -qi "^$1: "; then return 0; fi
+  git interpret-trailers --in-place --if-exists addIfDifferent --trailer "$1: $value" "$msg"
+}
+add Agent "${HARNESS_AGENT:-}"
+add Harness-Role "${HARNESS_ROLE:-}"
+add Workrelay-Session "${WORKRELAY_SESSION_ID:-}"

@@ -164,6 +164,7 @@ export function createV2TaskOutcomes({ dispatchOptions = {}, milestoneStore = cr
     const envCard = await (await import('./env-card.mjs')).installEnvCard(ctx); await installReviewVerdictTool(ctx); void envCard;
     const quotaSampler = installQuotaSampler(ctx, { read: dispatchOptions?.loadQuota ?? (ctx?.location?.directory ? readRoutingQuota : undefined) });
     await installRepoIdentity(ctx);
+    await (await import('./agent-attribution.mjs')).installAgentAttribution(ctx);
     const shared = await installTaskDispatch(ctx,dispatchOptions);
     if (ctx.session?.hook) await ctx.session.hook('context', async event => {
       hideCoordinatorMutationTools(event);

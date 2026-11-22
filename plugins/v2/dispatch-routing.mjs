@@ -144,6 +144,19 @@ function continuationEffortDecision({ input, record, child, selected, override, 
   if (!catalogHasVariant(catalog,medium)) return {...base,applied:false,selected,reason:'medium_variant_unavailable'};
   return {...base,applied:true,selected:medium.ref,reason:'same_model_medium_supported',catalog:'current_model_catalog'};
 }
+const tsMs=v=>typeof v==='number' ? (v>1e12 ? v : v*1000) : Date.parse(v);
+// Projected used percent at reset: explicit burn rate, else the window-to-date
+// average (derived from used_percent and pace_delta = used - expected elapsed).
+export function projectedAtReset(w, now=Date.now()) {
+  const used=Number.isFinite(w?.used_percent) ? w.used_percent : Number.isFinite(w?.remaining_percent) ? 100-w.remaining_percent : undefined;
+  if (!Number.isFinite(used)) return undefined;
+  const reset=tsMs(w.resets_at);
+  if (Number.isFinite(w.burn_rate_per_hour) && Number.isFinite(reset) && reset>now) return used+w.burn_rate_per_hour*(reset-now)/3600_000;
+  if (!Number.isFinite(w.pace_delta)) return undefined;
+  const elapsed=used-w.pace_delta;
+  if (!(elapsed>0)) return used>0 ? Infinity : used;
+  return used*100/elapsed;
+}
 export function quotaPace(quota, now=Date.now(), provider='openai') {
   const checked=Date.parse(quota?.pools ? quota.pools[provider]?.checked_at : quota?.checked_at);
   if (!Number.isFinite(checked) || now-checked>120000 || checked>now+5000) return 'unknown';
@@ -151,7 +164,9 @@ export function quotaPace(quota, now=Date.now(), provider='openai') {
   if (!windows.length) return 'unknown';
   // r20 item 4: a trailing weekly burn above the sustainable rate to reset also counts as ahead.
   if (burnAhead(provider,windows,now)) return 'ahead';
-  if (windows.some(w=>w.pace_delta>10
+  // parity 4.11: "ahead" means a window is projected over 100% at its reset, not pace_delta > 10.
+  const over=w=>{ const p=projectedAtReset(w,now); return p===undefined ? w.pace_delta>10 : p>100; };
+  if (windows.some(w=>over(w)
     || (w.remaining_percent<=10 && (!Number.isFinite(w.duration_minutes) || w.duration_minutes<10080)))) return 'ahead';
   if (windows.every(w=>w.pace_delta < -10)) return 'behind';
   return 'normal';
@@ -246,7 +261,7 @@ function selectDispatchModelBase({input,agent,agents,record,child,quota,hasActiv
 // r30 token saving (K, C). Each model has its own prompt cache, so changing the
 // model of a warm or running child re-reads its whole prefix uncached; effort
 // changes keep the cache on 5.5 models. See README "Token-saving strategies".
-export const ROLE_TIERS = Object.freeze({ router:'STRONG', coordinator:'BALANCED', scout:'FAST', 'quick-builder':'FAST', builder:'BALANCED',
+export const ROLE_TIERS = Object.freeze({ router:'STRONG', coordinator:'BALANCED', scout:'FAST', 'quick-builder':'FAST', builder:'BALANCED', 'senior-builder':'STRONG',
   'deep-debugger':'STRONG', architect:'STRONG', reviewer:'STRONG', verifier:'STRONG', maximum:'MAXIMUM' });
 const EFFORT_RANK = { minimal:0, low:1, medium:2, high:3, xhigh:4, max:5 };
 const baseModel = ref => modelReference(ref)?.split('#')[0];
@@ -288,6 +303,9 @@ function applyEffortMap(result, { input, quota, config }) {
   // Fable r30 #6: tier mappings only raise effort (STRONG/MAXIMUM at xhigh/max stay there).
   if (lower && target.basis === 'tier') return { ...result, effortMap: { ...base, applied: false, reason: 'tier_raise_only' } };
   if (taskFitContext({ input, policy: quota?.routingPolicy }).strict) return { ...result, effortMap: { ...base, applied: false, reason: 'strict_task_fit' } };
+  // parity 4.11: while the weekly pace is ahead, never raise builder effort (medium -> high carried most spend).
+  const role = canonicalHarnessRole(input?.agent) ?? input?.agent;
+  if (!lower && result.pace === 'ahead' && /build/.test(String(role ?? ''))) return { ...result, effortMap: { ...base, applied: false, reason: 'pace_ahead_no_raise' } };
   const next = { ...parts, variant: target.effort, ref: `${parts.providerID}/${parts.id}#${target.effort}` };
   if (!catalogHasVariant(quota?.catalog, next)) return { ...result, effortMap: { ...base, applied: false, reason: 'variant_unavailable' } };
   return { ...result, selected: next.ref, effortMap: { ...base, applied: true, reason: 'same_model_effort' } };
@@ -492,4 +510,29 @@ export function chooseCandidate({input,quota}) {
   return {...chosen,profile:policy.profiles?.[chosen.profile] ?? chosen.profile,reason:authorProvider&&chosen.independent?'cross_family_review':'subscription_pool_selection',
     taskFit:{taskType:fitContext.taskType,band:chosen.fit.band,evidenceStatus:chosen.fit.evidenceStatus,reason:chosen.fit.reason},
     explanation};
+}
+
+// parity 4.9 / 4.10: role escalation and re-review tiering.
+// reviewRounds: prior review verdicts on this task (oldest first), e.g. ['needs_fixes','needs_fixes'].
+// brakeOn: the weekly budget brake is active (no Opus builds while it is on).
+export function builderEscalation({ agent, risk, reviewRounds = [], brakeOn = false } = {}) {
+  const role = canonicalHarnessRole(agent) ?? agent;
+  if (role !== 'builder') return undefined;
+  const needsFixes = reviewRounds.filter(v => v === 'needs_fixes').length;
+  const reason = risk === 'high' ? 'risk_high' : needsFixes >= 2 ? 'second_needs_fixes' : undefined;
+  if (!reason) return undefined;
+  if (brakeOn) return { agent: role, escalated: false, reason: `${reason}_brake_on` };
+  return { agent: 'senior-builder', escalated: true, reason, freshChild: true };
+}
+// Reviewer/verifier tier: first pass and risk-high tasks stay STRONG (Opus); round 2+
+// of the same task uses BALANCED with a brief scoped to the diff since the last
+// reviewed tree plus the open findings.
+export function reviewRoundTier({ agent, risk, round = 1, lastReviewedTree, openFindings = [] } = {}) {
+  const role = canonicalHarnessRole(agent) ?? agent;
+  if (!['reviewer', 'verifier'].includes(role)) return undefined;
+  if (!(round >= 2) || risk === 'high') return { tier: 'STRONG', round, reason: risk === 'high' ? 'risk_high_stays_strong' : 'first_pass' };
+  const findings = openFindings.filter(f => typeof f === 'string' && f.trim()).slice(0, 20);
+  const scope = [`Re-review round ${round}: review only the diff since the last reviewed tree${lastReviewedTree ? ` ${String(lastReviewedTree).slice(0, 40)}` : ''} (git diff <last-reviewed>..HEAD) and confirm each open finding is resolved.`,
+    ...(findings.length ? ['Open findings:', ...findings.map(f => `- ${f.slice(0, 400)}`)] : [])].join('\n');
+  return { tier: 'BALANCED', round, reason: 'rereview_round', briefScope: scope };
 }

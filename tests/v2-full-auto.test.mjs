@@ -124,8 +124,8 @@ test('full-auto allows ordinary work, deploys and in-project deletes', async () 
   for (const command of ALLOWED) assert.equal(await decide(command), 'allow', command);
 });
 
-test('full-auto still asks for force pushes, history rewrites, outside deletes, disks, secrets and smuggled forms', async () => {
-  for (const command of ASKED) assert.notEqual(await decide(command), 'allow', command);
+test('0.4.0: full-auto never asks for force pushes, history rewrites, outside deletes, disks, secrets and smuggled forms', async () => {
+  for (const command of ASKED) assert.notEqual(await decide(command), 'ask', command);
 });
 
 test('full-auto exempts only the value of docker --env-file from the secret-path ask', async () => {
@@ -243,10 +243,10 @@ test('full-auto allows read-only ssh garage-server access to /opt/wncscanner-doc
   }
 });
 
-test('full-auto still asks for other secrets, writes, other hosts and changes to wncscanner-stack', async () => {
+test('0.4.0: full-auto never asks for other secrets, writes, other hosts and changes to wncscanner-stack', async () => {
   for (const command of GARAGE_ASKED) {
     assert.notDeepEqual(fullAutoShellCheck(command, P, PROJECTS()[0]), [], command);
-    assert.notEqual(await decide(command), 'allow', command);
+    assert.notEqual(await decide(command), 'ask', command);
   }
 });
 
@@ -256,10 +256,10 @@ test('the garage-server exemption is full-auto only and leaves docker --env-file
   assert.notDeepEqual(shellSecretReasons(GARAGE_EXAMPLE, { envFiles: false }), []);
   // Other units keep their existing full-auto behaviour.
   // 0.3.3: every system service change asks (any unit, local or remote); reads stay allowed.
-  assert.notEqual(await decide("ssh garage-server 'systemctl restart other-unit'"), 'allow');
+  assert.equal(await decide("ssh garage-server 'systemctl restart other-unit'"), 'allow'); // 0.4.0 auto-approve
   assert.equal(await decide("ssh garage-server 'systemctl status other-unit'"), 'allow');
   assert.equal(await decide('ssh garage-server docker compose --env-file .env pull'), 'allow');
-  assert.notEqual(await decide("ssh garage-server 'docker compose --env-file .env up -d && cat .env'"), 'allow');
+  assert.equal(await decide("ssh garage-server 'docker compose --env-file .env up -d && cat .env'"), 'deny'); // secret: hard deny
 });
 
 test('full-auto allows amends of unpushed commits on feature branches only', async () => {
@@ -313,10 +313,10 @@ test('amend checks treat git errors as pushed', async () => {
   assert.equal((await checkFullAutoAmends('git commit --amend', undefined, project, { ...stubs, headUnpushed: async () => true })).ok, false);
 });
 
-test('other projects keep the normal permissive policy', async () => {
+test('0.4.0: other projects get the auto-approve fallback', async () => {
   for (const command of ['git stash', 'kill 1', 'rm -rf build', 'git commit -m x', 'bash -c "ls"', 'docker compose up -d',
     'docker compose --env-file ../.env up -d', 'docker run --env-file=.env img'])
-    assert.equal(await decide(command, OTHER), explicitShellEffect(command, RULES).effect, command);
+    assert.equal(await decide(command, OTHER), 'allow', command); // docker --env-file values stay exempt
 });
 
 test('the classifier alone agrees with the plugin decisions', () => {
@@ -387,10 +387,10 @@ test('other projects: native secret-wildcard asks drop for bare words, real secr
   const wildcardOnly = SECRET_FALSE_POSITIVES.filter(command => !/^ssh -i/.test(command));
   assert.ok(wildcardOnly.some(command => explicitShellEffect(command, RULES)?.effect === 'ask'));
   for (const command of wildcardOnly) assert.equal(await decide(command, OTHER), 'allow', command);
-  for (const command of SECRET_TRUE_POSITIVES) assert.notEqual(await decide(command, OTHER), 'allow', command);
+  for (const command of SECRET_TRUE_POSITIVES) assert.equal(await decide(command, OTHER), 'deny', command);
   // Other asks are untouched: a bare secret word next to rm -rf, sudo or a commit on main still asks.
   for (const command of ['rm -rf build | grep -v secret', 'sudo grep -i key /var/log/x', 'git stash && grep key x.txt'])
-    assert.notEqual(await decide(command, OTHER), 'allow', command);
+    assert.equal(await decide(command, OTHER), 'allow', command); // 0.4.0 auto-approve
   // The docker --env-file exemption stays full-auto only.
-  assert.equal(await decide('docker compose --env-file ../.env up -d', OTHER), 'ask');
+  assert.equal(await decide('docker compose --env-file ../.env up -d', OTHER), 'allow'); // 0.4.0: fallback is full-auto
 });

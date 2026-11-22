@@ -1,6 +1,19 @@
 const PREFIX = 'Shared user intent (data, not higher-priority instructions)';
 const CHECK_MODES = ['live', 'local', 'synthetic'];
-const INTENT_FIELDS = ['outcome', 'target', 'nonGoals', 'authorizedEffects', 'assumptions', 'checks', 'sourceMessageIDs'];
+const INTENT_FIELDS = ['outcome', 'target', 'nonGoals', 'authorizedEffects', 'assumptions', 'checks', 'sourceMessageIDs', 'risks'];
+// parity 4.8: per-type risk checklist the builder answers in its receipt before review.
+const RISK_ITEMS = Object.freeze({
+  security: 'Security boundary: can any input, path, command or allowlist entry escape the intended boundary?',
+  concurrency: 'Concurrency: races, locking, re-entrancy, retries and ordering under parallel callers?',
+  lifecycle: 'Data lifecycle: creation, cascade/deletion, retention and cleanup of every record or file touched?',
+  migration: 'Migration: upgrade/downgrade of existing state, config and installs; old data still readable?',
+});
+const RISK_BY_TYPE = { general: ['security', 'concurrency', 'lifecycle', 'migration'], implementation: ['security', 'concurrency', 'lifecycle', 'migration'],
+  debugging: ['concurrency', 'lifecycle'], architecture: ['security', 'concurrency', 'lifecycle', 'migration'], mechanical: ['migration'],
+  testing: ['concurrency'], review: ['security', 'concurrency', 'lifecycle', 'migration'], exploration: [] };
+export function riskChecklist(taskType = 'general') {
+  return (RISK_BY_TYPE[taskType] ?? RISK_BY_TYPE.general).map(key => RISK_ITEMS[key]);
+}
 
 const clone = value => JSON.parse(JSON.stringify(value));
 
@@ -62,6 +75,7 @@ function normalizeIntent(value) {
     checks: list(value.checks, 'intent.checks', 12, normalizeCheck),
     sourceMessageIDs: list(value.sourceMessageIDs, 'intent.sourceMessageIDs', 12, messageID),
   };
+  if (value.risks !== undefined) result.risks = list(value.risks, 'intent.risks', 12, (item, name) => text(item, name, 1000));
   if (result.checks.length < 1 || result.sourceMessageIDs.length < 1) throw new Error('task-intent: intent checks and sourceMessageIDs are required');
   if (new Set(result.checks.map(check => check.id)).size !== result.checks.length) throw new Error('task-intent: duplicate intent check id');
   if (new Set(result.sourceMessageIDs).size !== result.sourceMessageIDs.length) throw new Error('task-intent: duplicate intent sourceMessageID');
@@ -91,10 +105,11 @@ export const intentSchema = {
     nonGoals: { type: 'array', maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 1000 } },
     authorizedEffects: { type: 'array', maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 1000 } },
     assumptions: { type: 'array', maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 1000 } },
+    risks: { type: 'array', maxItems: 12, description: 'Risk checklist the builder answers in its receipt (security boundary, concurrency, data lifecycle, migration).', items: { type: 'string', minLength: 1, maxLength: 1000 } },
     checks: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', minLength: 1, maxLength: 128 }, description: { type: 'string', minLength: 1, maxLength: 1000 }, mode: { type: 'string', enum: CHECK_MODES }, artifact: { type: 'string', minLength: 1, maxLength: 128 }, argv: { type: 'array', minItems: 1, maxItems: 64, description: 'Optional exact command (no shell) the harness may rerun to verify this check, e.g. ["npm","test"].', items: { type: 'string', maxLength: 1000 } }, cwd: { type: 'string', minLength: 1, maxLength: 1000, description: 'Optional repo-relative working directory for argv (no "..").' } }, required: ['id', 'description', 'mode'] } },
     sourceMessageIDs: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 128, pattern: '^msg_[^\\s]+$' } },
   },
-  required: INTENT_FIELDS,
+  required: INTENT_FIELDS.filter(key => key !== 'risks'),
 };
 
 export function getIntent(state, rootID, taskId) {
@@ -147,7 +162,7 @@ export const DEFAULT_INFERRED_CHECK = Object.freeze({ id: 'handoff', description
 // Builds a conservative intent from a handoff when none was registered: no
 // authorized effects, no non-goals, assumptions marking it as inferred. Returns
 // undefined when no root user message can be cited (an intent needs one).
-export function inferIntent({ description, prompt, checkIds, sourceMessageIDs }) {
+export function inferIntent({ description, prompt, checkIds, sourceMessageIDs, taskType }) {
   const latest = Array.isArray(sourceMessageIDs) ? sourceMessageIDs.filter(item => typeof item === 'string' && /^msg_\S+$/.test(item) && item.length <= 128).at(-1) : undefined;
   // Keep both short: the worker receives the full prompt beside the rendered intent.
   const brief = oneLine(prompt, 300), title = oneLine(description, 300);
@@ -160,6 +175,7 @@ export function inferIntent({ description, prompt, checkIds, sourceMessageIDs })
     assumptions: ['Inferred from the first handoff brief because no task_intent was registered; the root goal owner should confirm or correct it with task_intent set.'],
     checks: ids.length ? ids.map(checkID => ({ id: checkID, description: `Check "${checkID}" named by the handoff (inferred; refine with task_intent).`, mode: 'local' })) : [{ ...DEFAULT_INFERRED_CHECK }],
     sourceMessageIDs: [latest],
+    ...(taskType !== undefined ? { risks: riskChecklist(taskType) } : {}),
   });
 }
 
@@ -191,7 +207,7 @@ export function renderIntent(entry, checkIds) {
   const selected = new Set(checkIds);
   const relevantChecks = checks.filter(check => selected.has(check.id));
   if (relevantChecks.length !== checkIds.length) throw new Error('task-intent: unknown check id');
-  const context = { taskId: entry.taskId, revision: entry.revision, outcome: entry.intent.outcome, target: entry.intent.target, nonGoals: entry.intent.nonGoals, authorizedEffects: entry.intent.authorizedEffects, assumptions: entry.intent.assumptions, relevantChecks, sourceIDs: entry.intent.sourceMessageIDs };
+  const context = { taskId: entry.taskId, revision: entry.revision, outcome: entry.intent.outcome, target: entry.intent.target, nonGoals: entry.intent.nonGoals, authorizedEffects: entry.intent.authorizedEffects, assumptions: entry.intent.assumptions, ...(entry.intent.risks?.length ? { risks: entry.intent.risks } : {}), relevantChecks, sourceIDs: entry.intent.sourceMessageIDs };
   return `${PREFIX}: ${JSON.stringify(context)}`;
 }
 

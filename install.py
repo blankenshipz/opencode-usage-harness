@@ -16,8 +16,11 @@ import os
 import platform
 import re
 import shutil
+import shlex
 import stat
+import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path, PurePosixPath
 
@@ -393,6 +396,281 @@ def rollback(prefix: Path) -> str:
         lock.close()
 
 
+# --- restart-safe deploy (parity 4.13) --------------------------------------
+# `harness-manage deploy <release>` replaces the hand-run r7-restart/r37 deploy
+# scripts.  Every external effect goes through a runner so tests can inject it;
+# command output is never echoed because env.sh-sourced commands may see secrets.
+DEPLOY_BUSY_EXIT = 3
+DEFAULT_RESUME_COMMAND = "python3 -m workrelay.cli resume-after-restart"
+COMMIT_HOOK_MARKER = "# harness: prepare-commit-msg attribution"
+
+
+class DeployContext:
+    def __init__(self, prefix: Path, args) -> None:
+        self.prefix = prefix
+        self.root = Path(args.root).expanduser() if args.root else prefix.parent
+        self.env_file = Path(args.env_file).expanduser() if args.env_file else self.root / "env.sh"
+        self.bridge = Path(args.bridge).expanduser() if args.bridge else self.root / "workrelay-bridge.json"
+        self.gateway = Path(args.gateway_dir).expanduser() if args.gateway_dir else self.root / "gateway"
+        self.db = Path(args.opencode_db).expanduser() if args.opencode_db else self.root / "xdg/data/opencode/opencode.db"
+        env_projects = [p for p in os.environ.get("HARNESS_DEPLOY_PROJECTS", "").split(":") if p]
+        self.projects = [str(Path(p).expanduser()) for p in (args.project or env_projects)]
+        self.backups = Path(args.backup_dir).expanduser() if args.backup_dir else self.root / "backups"
+        self.config_files = [self.root / "state/config/opencode.json", self.root / "state/config/configure-choices.json", self.bridge, self.gateway / "mcp.json"]
+        resume = args.resume_command if args.resume_command is not None else os.environ.get("HARNESS_DEPLOY_RESUME_COMMAND", DEFAULT_RESUME_COMMAND)
+        self.resume_command = shlex.split(resume) if resume else []
+
+    def wrapped(self, argv: list[str]) -> list[str]:
+        """Run argv with env.sh sourced (when present), output kept private."""
+        if self.env_file.is_file():
+            return ["bash", "-c", 'set -a; . "$1" >/dev/null 2>&1; set +a; shift; exec "$@"', "harness-deploy", str(self.env_file), *argv]
+        return list(argv)
+
+
+def default_runner(argv: list[str], cwd: str | None = None, timeout: float = 60) -> tuple[int, str]:
+    try:
+        done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return done.returncode, done.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 124, ""
+
+
+def count_busy_sessions(db: Path, window_hours: float = 6) -> int:
+    """Sessions updated in the window that are not idle since their last update (r7-busy.py)."""
+    import sqlite3
+    if not db.is_file():
+        raise InstallError("opencode database not found: %s" % db)
+    connection = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        now = time.time() * 1000
+        row = connection.execute(
+            "select count(*) from session_v2 where time_archived is null and (time_idle is null or time_idle < time_updated) and time_updated > ?",
+            (now - window_hours * 3600 * 1000,)).fetchone()
+        return int(row[0])
+    finally:
+        connection.close()
+
+
+def default_probe(context: DeployContext, runner=default_runner) -> dict[str, object]:
+    """Pending permission asks per project (r7-pending.sh) plus busy sessions."""
+    pending: dict[str, int] = {}
+    for project in context.projects:
+        code, out = runner(context.wrapped(["opencode", "api", "GET", "/api/permission/request", "-H", "x-opencode-directory:%s" % project]), cwd=project, timeout=10)
+        if code != 0:
+            raise InstallError("could not query pending asks for %s" % project)
+        pending[project] = out.count('"id":"per_')
+    return {"pending": pending, "busy": count_busy_sessions(context.db)}
+
+
+def busy_reasons(probe: dict[str, object]) -> list[str]:
+    reasons = []
+    for project, count in sorted(dict(probe.get("pending") or {}).items()):
+        if count:
+            reasons.append("%d pending permission ask(s) in %s" % (count, project))
+    busy = int(probe.get("busy") or 0)
+    if busy:
+        reasons.append("%d busy session(s)" % busy)
+    return reasons
+
+
+def wait_until_idle(probe_fn, wait: float, interval: float = 15, sleep=time.sleep, clock=time.monotonic) -> list[str]:
+    deadline = clock() + max(0.0, wait)
+    while True:
+        reasons = busy_reasons(probe_fn())
+        if not reasons or clock() >= deadline:
+            return reasons
+        print("deploy: waiting, busy: %s" % "; ".join(reasons), flush=True)
+        sleep(min(interval, max(0.1, deadline - clock())))
+
+
+def write_bridge_guard_entry(bridge: Path, release: Path) -> None:
+    data = json.loads(bridge.read_text(encoding="utf-8"))
+    data["guard_entry"] = str(release / "plugins/v2/subscription-guard/index.mjs")
+    mode = stat.S_IMODE(bridge.stat().st_mode)
+    temporary = bridge.with_name(".%s.%s" % (bridge.name, uuid.uuid4().hex))
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+        os.replace(temporary, bridge)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def backup_config(context: DeployContext, current: Path | None, previous: Path | None, stamp: str) -> Path:
+    destination = context.backups / ("deploy-%s" % stamp)
+    destination.mkdir(parents=True, exist_ok=True)
+    os.chmod(destination, 0o700)
+    for source in context.config_files:
+        if source.is_file():
+            shutil.copy2(source, destination / source.name)
+    (destination / "harness-current.txt").write_text((current.name if current else "") + "\n")
+    (destination / "harness-previous.txt").write_text((previous.name if previous else "") + "\n")
+    return destination
+
+
+def deploy_plan(context: DeployContext, release: str, args) -> list[str]:
+    plan = [
+        "check idle: no pending asks in %d project(s) and no busy sessions%s" % (len(context.projects), " (wait up to %ss)" % args.wait if args.wait else ""),
+        "back up config files to %s/deploy-<stamp>" % context.backups,
+        "switch current -> releases/%s, previous -> old current" % release,
+        "update guard_entry in %s" % context.bridge,
+    ]
+    if args.restart:
+        plan += ["stop gateway (%s/gateway.pid)" % context.gateway, "opencode service stop; opencode service start", "start gateway (%s/start-gateway.sh)" % context.gateway]
+    plan.append("warm plugins and verify releases/%s is loaded in: %s" % (release, ", ".join(context.projects) or "(no projects)"))
+    plan.append("resume hook: %s" % (" ".join(context.resume_command) if context.resume_command else "(disabled)"))
+    return plan
+
+
+def restart_services(context: DeployContext, runner, sleep=time.sleep) -> None:
+    pid_file = context.gateway / "gateway.pid"
+    if pid_file.is_file():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 15)
+            for _ in range(20):
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                sleep(0.5)
+        except (ValueError, OSError):
+            pass
+    for step in (["opencode", "service", "stop"], ["opencode", "service", "start"]):
+        code, _ = runner(context.wrapped(step), cwd=str(context.root), timeout=120)
+        if code != 0:
+            raise InstallError("%s failed (exit %d)" % (" ".join(step), code))
+        sleep(2 if step[-1] == "stop" else 10)
+    start = context.gateway / "start-gateway.sh"
+    if start.is_file():
+        code, _ = runner(context.wrapped(["bash", str(start)]), cwd=str(context.gateway), timeout=120)
+        if code != 0:
+            raise InstallError("gateway start failed (exit %d)" % code)
+
+
+def warm_and_verify(context: DeployContext, release: Path, runner) -> dict[str, int]:
+    loaded: dict[str, int] = {}
+    marker = "releases/%s" % release.name
+    for project in context.projects:
+        out = ""
+        for _ in range(2):  # the first call loads plugins, the second reports them
+            _, out = runner(context.wrapped(["opencode", "api", "GET", "/api/plugin", "-H", "x-opencode-directory:%s" % project]), cwd=project, timeout=30)
+        loaded[project] = out.count(marker)
+    return loaded
+
+
+def run_resume_hook(context: DeployContext, runner) -> str:
+    if not context.resume_command:
+        return "resume hook disabled"
+    code, _ = runner(context.wrapped([*context.resume_command, "--help"]), cwd=str(context.root), timeout=30)
+    if code != 0:
+        return "resume hook unavailable, skipped"
+    code, _ = runner(context.wrapped(context.resume_command), cwd=str(context.root), timeout=120)
+    return "resume hook exit %d" % code
+
+
+def deploy(prefix: Path, args, probe=None, runner=default_runner, sleep=time.sleep, clock=time.monotonic) -> int:
+    if not VERSION_RE.fullmatch(args.release):
+        fail("invalid release name")
+    context = DeployContext(prefix, args)
+    release = prefix / "releases" / args.release
+    if not release.is_dir() or release.is_symlink():
+        fail("no staged release %s" % args.release)
+    if args.dry_run:
+        for number, step in enumerate(deploy_plan(context, args.release, args), 1):
+            print("%d. %s" % (number, step))
+        return 0
+    probe_fn = probe or (lambda: default_probe(context, runner))
+    reasons = wait_until_idle(probe_fn, float(args.wait or 0), sleep=sleep, clock=clock)
+    if reasons and not args.force:
+        print("deploy refused, busy: %s" % "; ".join(reasons), file=sys.stderr)
+        return DEPLOY_BUSY_EXIT
+    if not args.skip_validate:
+        validate_release(release)
+    lock = lock_prefix(prefix)
+    try:
+        current = link_target(prefix, "current") if not args.skip_validate else ((prefix / "current").resolve() if (prefix / "current").is_symlink() else None)
+        previous = (prefix / "previous").resolve() if (prefix / "previous").is_symlink() else None
+        backup = backup_config(context, current, previous, time.strftime("%Y%m%d-%H%M%S"))
+        print("backup %s" % backup)
+        if current and current != release.resolve():
+            atomic_link(prefix / "previous", current)
+        atomic_link(prefix / "current", release.absolute())
+        print("current -> %s (previous %s)" % (release.name, current.name if current else "none"))
+        if context.bridge.is_file():
+            write_bridge_guard_entry(context.bridge, release.absolute())
+            print("guard_entry updated")
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+    if args.restart:
+        restart_services(context, runner, sleep=sleep)
+        print("restarted opencode service and gateway")
+    loaded = warm_and_verify(context, release, runner)
+    missing = [p for p, n in loaded.items() if n == 0]
+    for project, count in sorted(loaded.items()):
+        print("%s: %d plugin(s) from %s" % (project, count, release.name))
+    print(run_resume_hook(context, runner))
+    if missing:
+        print("deploy: release not loaded in: %s" % ", ".join(missing), file=sys.stderr)
+        return 4
+    print("deployed %s" % release.name)
+    return 0
+
+
+# --- commit attribution hook (parity 4.12) ----------------------------------
+PREPARE_COMMIT_MSG = r"""#!/bin/sh
+# harness: prepare-commit-msg attribution
+# Appends Agent:, Harness-Role: and Workrelay-Session: trailers from
+# HARNESS_AGENT, HARNESS_ROLE and WORKRELAY_SESSION_ID.  Unset variables are
+# skipped, existing trailers are never duplicated, and author/committer are
+# never touched.  A previous hook is chained as prepare-commit-msg.harness-chained.
+set -eu
+msg="$1"
+chained="$(dirname "$0")/prepare-commit-msg.harness-chained"
+if [ -x "$chained" ]; then "$chained" "$@"; fi
+case "${2:-}" in merge|squash) exit 0 ;; esac
+add() {
+  [ -n "$2" ] || return 0
+  value=$(printf '%s' "$2" | tr -d '\r\n')
+  if git interpret-trailers --parse "$msg" | grep -qi "^$1: "; then return 0; fi
+  git interpret-trailers --in-place --if-exists addIfDifferent --trailer "$1: $value" "$msg"
+}
+add Agent "${HARNESS_AGENT:-}"
+add Harness-Role "${HARNESS_ROLE:-}"
+add Workrelay-Session "${WORKRELAY_SESSION_ID:-}"
+"""
+
+
+def install_commit_hook(repo: Path) -> str:
+    """Install the attribution hook; an existing different hook is chained, never clobbered."""
+    try:
+        hooks = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-path", "hooks"], capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        fail("%s is not a git repository" % repo)
+    hooks_dir = Path(hooks) if os.path.isabs(hooks) else repo / hooks
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    destination = hooks_dir / "prepare-commit-msg"
+    chained = hooks_dir / "prepare-commit-msg.harness-chained"
+    if destination.is_symlink():
+        fail("refusing to replace symlinked hook %s" % destination)
+    if destination.exists():
+        existing = destination.read_text(encoding="utf-8", errors="replace")
+        if existing == PREPARE_COMMIT_MSG:
+            return "already installed at %s" % destination
+        if COMMIT_HOOK_MARKER not in existing:
+            if chained.exists() or chained.is_symlink():
+                fail("refusing to overwrite existing chained hook %s" % chained)
+            os.replace(destination, chained)
+    temporary = hooks_dir / (".prepare-commit-msg.%s" % uuid.uuid4().hex)
+    temporary.write_text(PREPARE_COMMIT_MSG, encoding="utf-8")
+    os.chmod(temporary, 0o755)
+    os.replace(temporary, destination)
+    return "installed %s%s" % (destination, " (chained previous hook)" if chained.exists() else "")
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Install a reviewed local harness release")
     result.add_argument("--prefix", default=str(DEFAULT_PREFIX))
@@ -406,6 +684,23 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--provenance", type=Path, required=True)
     sub.add_parser("status")
     sub.add_parser("rollback")
+    command = sub.add_parser("deploy", help="restart-safe switch to a staged release")
+    command.add_argument("release", help="staged release name under <prefix>/releases")
+    command.add_argument("--wait", type=float, default=0, metavar="SECONDS", help="poll until idle for up to SECONDS")
+    command.add_argument("--restart", action="store_true", help="stop gateway, restart opencode service, start gateway")
+    command.add_argument("--dry-run", action="store_true", help="print the plan only")
+    command.add_argument("--force", action="store_true", help="deploy even when busy")
+    command.add_argument("--project", action="append", help="project directory to check/warm (repeatable; default $HARNESS_DEPLOY_PROJECTS)")
+    command.add_argument("--root", help="deployment root (default: parent of --prefix)")
+    command.add_argument("--env-file", help="env file sourced for opencode commands (default <root>/env.sh)")
+    command.add_argument("--bridge", help="workrelay-bridge.json (default <root>/workrelay-bridge.json)")
+    command.add_argument("--gateway-dir", help="gateway directory (default <root>/gateway)")
+    command.add_argument("--opencode-db", help="opencode.db for busy sessions (default <root>/xdg/data/opencode/opencode.db)")
+    command.add_argument("--backup-dir", help="backup directory (default <root>/backups)")
+    command.add_argument("--resume-command", default=None, help="resume-after-restart command; empty string disables (default $HARNESS_DEPLOY_RESUME_COMMAND or %s)" % DEFAULT_RESUME_COMMAND)
+    command.add_argument("--skip-validate", action="store_true", help="skip manifest validation of the release")
+    command = sub.add_parser("install-commit-hook", help="install the prepare-commit-msg attribution hook into a repo")
+    command.add_argument("repo", type=Path)
     return result
 
 
@@ -421,6 +716,10 @@ def main(argv: list[str] | None = None) -> int:
             print("activated %s" % activate(prefix, args.version, args.provenance))
         elif args.command == "status":
             print(json.dumps(status(prefix, state), sort_keys=True))
+        elif args.command == "deploy":
+            return deploy(prefix, args)
+        elif args.command == "install-commit-hook":
+            print(install_commit_hook(args.repo.expanduser()))
         else:
             print("rolled back to %s" % rollback(prefix))
         return 0

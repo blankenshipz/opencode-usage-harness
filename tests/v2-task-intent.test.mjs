@@ -117,3 +117,12 @@ test('an inferred intent can be replaced by the first explicit set with expected
   assert.equal(replaced.revision, 2);
   assert.equal(replaced.inferred, undefined);
 });
+
+test('parity 4.8: intent risks from the per-type checklist', async () => {
+  const m = await import('../plugins/v2/task-intent.mjs');
+  assert.equal(m.riskChecklist('implementation').length, 4);
+  assert.deepEqual(m.riskChecklist('exploration'), []);
+  const intent = m.inferIntent({description:'x',prompt:'y',sourceMessageIDs:['msg_1'],taskType:'implementation'});
+  assert.match(intent.risks.join(' '), /Security boundary/);
+  assert.equal(m.inferIntent({description:'x',prompt:'y',sourceMessageIDs:['msg_1']}).risks, undefined);
+});

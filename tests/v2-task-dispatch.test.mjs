@@ -74,7 +74,7 @@ async function harness(t, custom, nativeInput, dispatchOptions={}) {
  const ctx={location:{directory:'/project'},agent:{list:async()=>({data:Object.entries(agents).map(([id,a])=>({id,...a}))})},tool:{transform:async fn=>{assert.notEqual(fn.constructor.name,'AsyncFunction','native editor transformations must be synchronous');return fn({get:n=>tools.get(n),update:(n,fn)=>fn(tools.get(n)),add:tool=>tools.set(tool.name,tool)});}}};
  const registry=createRegistry(dir);await registry('/project',async(state,save)=>{setIntent(state,{rootID:'root',taskId:'release',intent,expectedRevision:0,actorSessionID:'root'});await save();});
  const hooks=new Map();ctx.session={hook:async(name,fn)=>{const previous=hooks.get(name);hooks.set(name,async event=>{if(previous)await previous(event);return fn(event);});}};
- const runtime=await installTaskDispatch(ctx,{registry,globalRegistry:createRegistry(path.join(dir,'global-writers')),loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction'],loadRoutingPolicy:()=>undefined,resolvePublicationScope:async()=>({checkout:'.worktrees/pub',commonGit:'.git'}),...dispatchOptions});
+ const runtime=await installTaskDispatch(ctx,{registry,globalRegistry:createRegistry(path.join(dir,'global-writers')),loadSessions:async()=>sessions,loadSources:async()=>['msg_user','msg_correction'],loadRoutingPolicy:()=>undefined,resolvePublicationScope:async()=>({checkout:'.worktrees/pub',commonGit:'.git'}),selfCheck:false,loadVerdicts:()=>[],...dispatchOptions});
  const call=(input,tool='task_dispatch',sessionID='root')=>tools.get(tool).execute(input,{sessionID,agent:'router',progress:async()=>{}});
  return {call,sessions,calls,tools,ctx,dir,registry,rawNative,hooks,runtime};
 }
@@ -1301,4 +1301,39 @@ test('quota pace ahead throttles a third concurrently active new child but not c
  await h.call({ ...base, background:true, routing });
  await h.call({ ...base, background:true, routing, workKey:'two', writePaths:['two'] });
  await assert.rejects(h.call({ ...base, background:true, routing, workKey:'three', writePaths:['three'] }), /QUOTA_PACE_THROTTLED/);
+});
+
+test('parity 4.8: review dispatch refuses a missing or stale builder self-check', async () => {
+  const { selfCheckRefusal } = await import('../plugins/v2/task-dispatch.mjs');
+  assert.match(selfCheckRefusal('done, tests pass', 'abcdef1234'), /REVIEW_SELF_CHECK_MISSING.*Send the builder back/);
+  assert.match(selfCheckRefusal('Self-check: HEAD 1111111, checks re-run: npm test', 'abcdef1234'), /REVIEW_SELF_CHECK_STALE/);
+  assert.equal(selfCheckRefusal('Self-check: HEAD abcdef1, checks re-run: npm test', 'abcdef1234'), undefined);
+});
+
+test('parity 4.9/4.10: re-review round 2 goes BALANCED with a scoped brief; builder gets an escalation hint', async () => {
+  const { reviewRoundPlan } = await import('../plugins/v2/task-dispatch.mjs');
+  const agents = [{ id: 'harness-builder', model: 'anthropic/sonnet#medium' }, { id: 'harness-reviewer', model: 'anthropic/opus#high' }];
+  const state = { records: [
+    { rootID: 'r', taskId: 't', key: 'k1', agent: 'harness-reviewer', childID: 'rev1', routing: { selected: 'anthropic/opus#high' } },
+    { rootID: 'r', taskId: 't', key: 'k0', agent: 'harness-builder', childID: 'b1', routing: { selected: 'anthropic/sonnet#medium' } }] };
+  const verdicts = [{ sessionId: 'rev1', verdict: 'needs_fixes', tree: 'tree1', summary: 'race in lock' }, { sessionId: 'other', verdict: 'needs_fixes' }];
+  const routing = { selected: 'anthropic/opus#high' };
+  const r2 = reviewRoundPlan({ input: { agent: 'harness-reviewer', taskId: 't', routing: { risk: 'normal' } }, state, rootID: 'r', key: 'k2', agents, routing, verdicts });
+  assert.equal(r2.round, 2); assert.equal(r2.selected, 'anthropic/sonnet#medium'); assert.match(r2.briefScope, /tree1/); assert.match(r2.briefScope, /race in lock/);
+  const high = reviewRoundPlan({ input: { agent: 'harness-reviewer', taskId: 't', routing: { risk: 'high' } }, state, rootID: 'r', key: 'k2', agents, routing, verdicts });
+  assert.equal(high.selected, undefined);
+  const first = reviewRoundPlan({ input: { agent: 'harness-verifier', taskId: 'other', routing: { risk: 'normal' } }, state, rootID: 'r', key: 'k9', agents, routing, verdicts });
+  assert.equal(first.round, 1); assert.equal(first.selected, undefined);
+  const two = [...verdicts, { sessionId: 'rev1', verdict: 'needs_fixes' }];
+  assert.match(reviewRoundPlan({ input: { agent: 'harness-builder', taskId: 't', routing: { risk: 'normal' } }, state, rootID: 'r', key: 'k0', agents, routing, verdicts: two }).hint, /escalate to senior-builder/);
+  assert.match(reviewRoundPlan({ input: { agent: 'harness-builder', taskId: 't', routing: { risk: 'high' } }, state, rootID: 'r', key: 'k0', agents, routing, verdicts, brakeOn: true }).hint, /withheld/);
+  assert.equal(reviewRoundPlan({ input: { agent: 'harness-builder', taskId: 't', routing: { risk: 'normal' } }, state, rootID: 'r', key: 'k0', agents, routing, verdicts }).hint, undefined);
+});
+
+test('parity 4.10: a reviewer continuation keeps its admitted route', async () => {
+  const { reviewRoundPlan } = await import('../plugins/v2/task-dispatch.mjs');
+  const state = { records: [{ rootID: 'r', taskId: 't', key: 'k1', agent: 'harness-reviewer', childID: 'rev1', routing: { selected: 'anthropic/opus#high' } }] };
+  const plan = reviewRoundPlan({ input: { agent: 'harness-reviewer', taskId: 't', routing: { risk: 'normal' } }, state, rootID: 'r', key: 'k1', requested: 'rev1',
+    agents: [{ id: 'harness-builder', model: 'anthropic/sonnet#medium' }], routing: { selected: 'anthropic/opus#high' }, verdicts: [{ sessionId: 'rev1', verdict: 'needs_fixes' }] });
+  assert.deepEqual(plan, {});
 });

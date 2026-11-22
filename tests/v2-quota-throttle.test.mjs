@@ -15,7 +15,7 @@ test('throttle only new children while pace is ahead and the active cap is reach
 });
 test('sampler reads on a timer, feeds pace, and swallows failures', async () => {
   let fn, ms, n = 0; const seen = [];
-  const s = installQuotaSampler({}, { read: async () => { n++; if (n === 2) throw new Error('x'); return { pools: { openai: { checked_at: new Date().toISOString(), windows: [] } } }; },
+  const s = installQuotaSampler({}, { log: () => {}, read: async () => { n++; if (n === 2) throw new Error('x'); return { pools: { openai: { checked_at: new Date().toISOString(), windows: [] } } }; },
     setTimer: (f, m) => (fn = f, ms = m, { unref() {} }), clearTimer: () => {}, onSample: p => seen.push(p) });
   assert.equal(ms, QUOTA_SAMPLE_MS);
   assert.deepEqual(await s.sample(), { openai: 'unknown' }); assert.equal(await s.sample(), undefined);
@@ -73,4 +73,21 @@ test('r26 fable: a short burst is not extrapolated over the week; non-builders a
   const p = weeklyProjection(quota, 'openai', NOW, () => ({ ratePerHour: 3 }));
   assert.equal(Math.round(p.projected), 105);
   for (const agent of ['router', 'explorer', undefined]) assert.equal(budgetBrake({ quota: q(60, 3), now: NOW, newChild: true, rootID: 'root', records: [], sessions, env, agent }), undefined);
+});
+
+test('parity 4.11: gate level, sample telemetry, and --gate fails open without a snapshot', async () => {
+  const fs = await import('node:fs'), os = await import('node:os'), path = await import('node:path'), cp = await import('node:child_process');
+  const { gateLevel, logQuotaSample } = await import('../plugins/v2/quota-throttle.mjs');
+  const now = Date.now(), q = used => ({ pools: { anthropic: { windows: [{ scope: 'account', used_percent: used, duration_minutes: 10080, burn_rate_per_hour: 1, resets_at: new Date(now + 24 * 3600_000).toISOString() }] } } });
+  assert.equal(gateLevel(q(10), 'anthropic', now), 'ok');
+  assert.equal(gateLevel(q(85), 'anthropic', now), 'slow');
+  assert.equal(gateLevel(q(95), 'anthropic', now), 'hold');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qt-'));
+  const file = path.join(dir, 'telemetry', 'quota-throttle.jsonl');
+  logQuotaSample({ anthropic: 'ahead' }, q(85), { now, file });
+  const row = JSON.parse(fs.readFileSync(file, 'utf8').trim());
+  assert.equal(row.level, 1); assert.equal(row.decision, 'cap_one_builder'); assert.ok(row.projected > 100);
+  const r = cp.spawnSync(process.execPath, [new URL('../bin/subscription-quota.mjs', import.meta.url).pathname, '--gate'], { env: { ...process.env, HARNESS_STATE_DIR: dir }, encoding: 'utf8' });
+  assert.equal(r.status, 0); assert.equal(r.stdout, 'ok\n'); assert.match(r.stderr, /failing open/);
+  fs.rmSync(dir, { recursive: true });
 });

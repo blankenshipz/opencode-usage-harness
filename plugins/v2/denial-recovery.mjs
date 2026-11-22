@@ -7,6 +7,8 @@ const text = value => typeof value === 'string' ? value : value?.message;
 // code. Do not inspect child output: a worker saying that it is blocked is not a
 // native decision about dispatch.
 export function admissionDenial(value) {
+  // A policy block (ask timeout / HARD DENY) is resumable, never a suppressed admission denial.
+  if (blockedResumable(value)) return;
   const messages = [
     value instanceof Error ? value.message : undefined,
     text(value?.error), text(value?.metadata?.error), text(value?.output?.error),
@@ -15,6 +17,20 @@ export function admissionDenial(value) {
   const codes = [value?.error?.code, value?.metadata?.error?.code, value?.output?.error?.code, value?.code];
   if (category === 'native_permission' || messages.some(message => /^Subagent denied:/i.test(message))) return 'native_permission';
   if (category === 'provider_refusal' || codes.includes('misalignment_policy_violation') || messages.some(message => /^Subagent failed \(sessionID: [^)]+\):[\s\S]*\bmisalignment_policy_violation\b/i.test(message))) return 'provider_refusal';
+}
+
+// 0.4.0: the ask-timeout denial (park-yield) and the guard's HARD DENY are policy blocks, not
+// failures: the work is blocked and resumable once a human approves the exact command.
+export const BLOCKED_RESUMABLE_RE = /(?:^|[\s:])(?:ASK TIMEOUT DENY \(harness auto-approve policy\)|HARD DENY \(harness auto-approve policy; rule: )/;
+export function blockedResumable(value) {
+  const messages = [
+    typeof value === 'string' ? value : undefined,
+    value instanceof Error ? value.message : undefined,
+    text(value?.error), text(value?.metadata?.error), text(value?.output?.error), typeof value?.output === 'string' ? value.output : undefined,
+  ].filter(Boolean);
+  const hit = messages.find(message => BLOCKED_RESUMABLE_RE.test(message));
+  if (!hit) return;
+  return { status: 'blocked', resumable: true, kind: /ASK TIMEOUT DENY/.test(hit) ? 'ask_timeout' : 'hard_deny' };
 }
 
 export function admissionInputs(input) {
@@ -47,6 +63,8 @@ export function receipt(category, input) {
   return { category, inputsHash: admissionInputs(input), ...(evidence ? { recoveryHash: evidence.hash } : {}), recordedAt: Date.now() };
 }
 
-export const denialAdvice = category => category === 'native_permission'
+export const denialAdvice = category => category === 'blocked_resumable'
+  ? 'Blocked, resumable (not a failure): the harness auto-approve policy denied or timed out a permission ask. Record a resumable blocker with the exact command, continue other work, and do not retry variants; resume after a human approves.'
+  : category === 'native_permission'
   ? 'Native permission denied this admission. Do not retry unchanged work. Declare concrete changed scope, inputs, or authorization evidence; native admission will decide again.'
   : 'The provider refused this run. Do not retry unchanged work. Declare concrete changed scope, inputs, or authorization evidence; native admission will decide again.';

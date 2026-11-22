@@ -79,6 +79,9 @@ INTENT_FIRST_GUIDANCE = ("\nRecommended before the first task_dispatch/subagent 
 ROLE_CHOICE_GUIDANCE = ("\nPick the smallest capable role: harness-quick-builder for routine normal-risk mechanical edits "
     "with a known change (renames, version bumps, config/doc/copy tweaks, small single-file fixes; "
     "routing taskType 'mechanical', complexity 'routine'), harness-builder for standard implementation, "
+    "harness-senior-builder (strong model) for risk 'high' builds: security policy or allowlists, concurrency and locking, "
+    "auth, data retention/deletion, or a new runtime, and for the fix after a second needs_fixes review on a task "
+    "(not while the weekly budget brake is on), "
     "harness-deep-debugger/harness-verifier for complex debugging and verification.")
 REVIEW_VERDICT_GUIDANCE = ('\nEvery independent review ends with the review_verdict tool: after your final assessment call it once with '
     'verdict (pass | needs_fixes | fail) and reviewedHead (the current HEAD sha you reviewed; the tool rejects a stale one). '
@@ -90,13 +93,14 @@ ROUTER_REVIEW_GUIDANCE = ('\nWhen dispatching a review or verification, tell the
 CANCEL_GUIDANCE = ("\nTo stop a child you dispatched (e.g. after a rule change), call task_dispatch_cancel "
     "{taskId, workKey, reason}; it interrupts it and releases its locks.")
 
-NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','deep-debugger','deep-debugger-high','architect','reviewer','verifier','maximum','maximum-max')
+NAMESPACED_ROLES = ('router','coordinator','scout','quick-builder','builder','builder-high','senior-builder','deep-debugger','deep-debugger-high','architect','reviewer','verifier','maximum','maximum-max')
 ROLES = {
     'router': ('STRONG', True, True),
     'coordinator': ('BALANCED', True, True),
     'scout': ('FAST', False, True),
     'quick-builder': ('FAST', False, False),
     'builder': ('BALANCED', False, False),
+    'senior-builder': ('STRONG', False, False),
     'deep-debugger': ('STRONG', False, False),
     'architect': ('STRONG', False, True),
     'reviewer': ('STRONG', False, True),
@@ -274,7 +278,8 @@ BUILDER_FILE_WRITE_GUIDANCE = ('\nWrite files with the edit/write tool, not shel
 READONLY_IDENTITY_GUIDANCE = ('\nYou have no shell. For the working directory, git toplevel, branch, HEAD and dirty state, '
                               'call repo_identity instead of asking for pwd or git commands.')
 
-def shell_rules(shell_policy):
+def shell_rules(shell_policy, legacy_asks=False):
+    # legacy_asks: the pre-0.4.0 dangerous-command asks (tests of the non-full-auto guard path only).
     if shell_policy == 'allowlist':
         return [{'action':'shell','resource':command,'effect':'allow'} for command in ALLOWLIST_SHELL_ALLOW]
     if shell_policy == 'permissive':
@@ -283,7 +288,10 @@ def shell_rules(shell_policy):
                 [{'action':'shell','resource':p,'effect':'allow'} for p in SECRET_CODE_SHELL_ALLOW] +
                 [{'action':'shell','resource':p,'effect':'ask'} for p in SECRET_REASSERT_SHELL_ASK] +
                 [{'action':'shell','resource':p,'effect':'allow'} for p in ENV_TEMPLATE_SHELL_ALLOW] +
-                [{'action':'shell','resource':command,'effect':'ask'} for command in DANGEROUS_COMMAND_ASK + WRAPPED_COMMAND_ASK])
+                # 0.4.0 auto-approve: dangerous-command asks become allow; the shell guard hard-denies
+                # (force push/history rewrite, deletes outside the project, secrets) in execute.before,
+                # before the native rule is evaluated, and downgrades the remaining secret-name asks.
+                [{'action':'shell','resource':command,'effect':'ask' if legacy_asks else 'allow'} for command in DANGEROUS_COMMAND_ASK + WRAPPED_COMMAND_ASK])
     raise ValueError(f'shell_policy must be one of {", ".join(SHELL_POLICIES)}')
 
 # Opt-in scratch space outside the workspace (--allow-tmp-scratch; persisted). Only the native
@@ -473,7 +481,7 @@ def main():
     p.add_argument('--compaction-tokens',type=compaction_tokens_arg,default=None,metavar='N',help=f'Absolute context tokens that mark a session high-pressure and eligible for compaction, even when a larger model window is known (effective trigger: min(N, 80%% of the window)); persisted. HARNESS_COMPACTION_TOKENS overrides it at runtime. Default: previously persisted choice, else {DEFAULT_COMPACTION_TOKENS}')
     p.add_argument('--full-auto-project',action='append',default=[],metavar='DIR',help='Enable the full-auto permission profile for this project directory (repeatable; persisted in full_auto_projects): shell, external_directory, read and edit asks inside it are allowed except force pushes, history rewrites, branch deletes, deletes outside the project, disk writes and secret paths')
     p.add_argument('--no-full-auto-project',action='append',default=[],metavar='DIR',help='Remove a directory from the persisted full-auto projects (repeatable)')
-    p.add_argument('--full-auto-no-deploy',action='append',default=[],metavar='DIR',help='In this full-auto project, every push, publish and deploy command (git push, gh pr create, railway/fly/vercel/eas deploys, docker push, npm publish, scp/rsync to a host) asks (persisted as no_push_deploy)')
+    p.add_argument('--full-auto-no-deploy',action='append',default=[],metavar='DIR',help='No-op since 0.4.0 (auto-approve: pushes and deploys are allowed in every project). Still accepted and persisted as no_push_deploy for back-compat')
     p.add_argument('--full-auto-allow-deploy',action='append',default=[],metavar='DIR',help='Remove no_push_deploy from a full-auto project')
     a=p.parse_args(); routing=json.loads(a.routing_policy.read_text()) if a.routing_policy else None
     state_dir=a.state_dir.expanduser().resolve();directory=state_dir/'config';target=directory/'opencode.json'

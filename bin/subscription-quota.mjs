@@ -1,5 +1,20 @@
 #!/usr/bin/env node
 import { readProviderQuotas, readCachedClaudeQuota } from '../plugins/v2/provider-quota.mjs';
+import { gateLevel } from '../plugins/v2/quota-throttle.mjs';
+
+// parity 4.11: shared quota gate. Prints exactly ok|slow|hold from the cached
+// snapshot, never calls the network, fails open (ok) when stale/missing; exit 0.
+if (process.argv.includes('--gate')) {
+  let out = 'ok';
+  try {
+    const cached = await readCachedClaudeQuota();
+    if (!cached) process.stderr.write('quota gate: no cached snapshot; failing open (ok)\n');
+    else if (cached.cache?.stale) process.stderr.write(`quota gate: snapshot is stale (${cached.cache.age_seconds}s old); failing open (ok)\n`);
+    else out = gateLevel({ pools: { anthropic: cached } }, 'anthropic');
+  } catch { process.stderr.write('quota gate: snapshot unreadable; failing open (ok)\n'); out = 'ok'; }
+  process.stdout.write(`${out}\n`);
+  process.exit(0);
+}
 
 const result = await readProviderQuotas();
 // Outside a session the Claude OAuth adapter is unavailable; report the plugin's

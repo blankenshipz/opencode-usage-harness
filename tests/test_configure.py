@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from configure import profile, namespace_harness_agents, DANGEROUS_SHELL_ASK, ENV_TEMPLATE_SHELL_ALLOW, SECRET_CODE_SHELL_ALLOW, SECRET_REASSERT_SHELL_ASK, ALLOWLIST_SHELL_ALLOW, BUILDER_FILE_WRITE_GUIDANCE, atomic_write_text
+from configure import profile, namespace_harness_agents, DANGEROUS_SHELL_ASK, SECRET_SHELL_ASK, DANGEROUS_COMMAND_ASK, WRAPPED_COMMAND_ASK, ENV_TEMPLATE_SHELL_ALLOW, SECRET_CODE_SHELL_ALLOW, SECRET_REASSERT_SHELL_ASK, ALLOWLIST_SHELL_ALLOW, BUILDER_FILE_WRITE_GUIDANCE, atomic_write_text
 
 class ConfigureTests(unittest.TestCase):
     def test_roles_and_safe_public_defaults(self):
@@ -42,6 +42,16 @@ class ConfigureTests(unittest.TestCase):
         router_children = {(r['action'], r['resource']) for r in p['agents']['harness-router']['permissions']}
         self.assertIn(('subagent', 'builder'), router_children)
         self.assertIn(('subagent', 'harness-builder'), router_children)
+
+    def test_senior_builder_role_on_strong_and_named_in_guidance(self):
+        import configure
+        self.assertEqual(configure.ROLES['senior-builder'], ('STRONG', False, False))
+        self.assertIn('senior-builder', configure.NAMESPACED_ROLES)
+        for word in ('security policy', 'concurrency', 'auth', 'retention', 'new runtime'):
+            self.assertIn(word, configure.ROLE_CHOICE_GUIDANCE)
+        tiers=('FAST','BALANCED','STRONG','MAXIMUM')
+        a=profile({k:f'anthropic/{k.lower()}#medium' for k in tiers})['agents']
+        self.assertEqual(a['harness-senior-builder']['model'], 'anthropic/strong#medium')
 
     def test_router_and_deep_roles_on_strong_quick_builder_on_fast(self):
         tiers=('FAST','BALANCED','STRONG','MAXIMUM')
@@ -148,14 +158,18 @@ class ConfigureTests(unittest.TestCase):
             if policy == 'permissive':
                 for command in ('cat .env.example','cat apps/api/.env.sample','head -5 .env.template'):
                     self.assertEqual(native(builder, 'shell', command), 'allow', command)
-                for command in ('cat .env','cat .env.local','cat .env.example.bak','rm -rf .env.example','git commit -m x .env.example'):
+                for command in ('cat .env','cat .env.local','cat .env.example.bak'):
                     self.assertEqual(native(builder, 'shell', command), 'ask', command)
+                # 0.4.0: dangerous-command asks are allow natively; the shell guard decides (hard deny or allow).
+                for command in ('rm -rf .env.example','git commit -m x .env.example'):
+                    self.assertEqual(native(builder, 'shell', command), 'allow', command)
                 # 0.3.4: source/test files named like secrets are code; real secret files still ask.
                 for command in ('cat backend/app/agent_search/credentials.py','head -5 app/secret_utils.ts | cat','grep -n x mobile/src/creds/credentials.tsx'):
                     self.assertEqual(native(builder, 'shell', command), 'allow', command)
-                for command in ('cat credentials.json','cat secrets.yaml','cat client_secret.json','cat .env x.py','cat server.pem app.py','cat a.key b.ts','cat ~/.aws/credentials',
-                                'git add backend/app/agent_search/credentials.py'):
+                for command in ('cat credentials.json','cat secrets.yaml','cat client_secret.json','cat .env x.py','cat server.pem app.py','cat a.key b.ts','cat ~/.aws/credentials'):
                     self.assertEqual(native(builder, 'shell', command), 'ask', command)
+                # 0.4.0: git add matches a dangerous-command rule, now allow natively (the guard decides).
+                self.assertEqual(native(builder, 'shell', 'git add backend/app/agent_search/credentials.py'), 'allow')
             else:
                 self.assertFalse(any(r['resource'] in ENV_TEMPLATE_SHELL_ALLOW for r in builder if r['action']=='shell'))
 
@@ -295,8 +309,8 @@ class ConfigureTests(unittest.TestCase):
         shell=[r for r in permissive['permissions'] if r['action']=='shell']
         self.assertEqual(shell[0],{'action':'shell','resource':'*','effect':'allow'})
         asks=[r['resource'] for r in shell[1:] if r['effect']=='ask']
-        self.assertEqual(sorted(asks),sorted(DANGEROUS_SHELL_ASK+SECRET_REASSERT_SHELL_ASK))
-        self.assertTrue(all(r['effect']=='ask' or r['resource'] in ENV_TEMPLATE_SHELL_ALLOW+SECRET_CODE_SHELL_ALLOW for r in shell[1:]))
+        self.assertEqual(sorted(asks),sorted(SECRET_SHELL_ASK+SECRET_REASSERT_SHELL_ASK))  # 0.4.0: dangerous asks -> allow
+        self.assertTrue(all(r['effect']=='ask' or r['resource'] in ENV_TEMPLATE_SHELL_ALLOW+SECRET_CODE_SHELL_ALLOW+DANGEROUS_COMMAND_ASK+WRAPPED_COMMAND_ASK for r in shell[1:]))
         for required in ('git push *--force*','git push * +*','sudo *','rm -rf *','*.env*','bash -*','eval *','git commit*'):
             self.assertIn(required,DANGEROUS_SHELL_ASK)
         # Read-only roles keep their agent-level shell deny, which follows the global allow.
@@ -554,7 +568,7 @@ class ConfigureTests(unittest.TestCase):
             return out
         for command in ('python3 check_receipt.py -- git push -f origin main','env X=1 git commit -m x','xargs git push --force','git push -f','git push origin +main','git push --delete origin x','git reset --hard','git rebase main','timeout 5 kill 1',
                         'nohup git reset --hard','env X=1 sh -c y','xargs rm -rf','find . -name x -exec rm -rf {} +','git commit -m x','sudo ls','timeout 5 git add x','git add -A','git branch -d x','git commit --amend'):
-            self.assertEqual(effect(command),'ask',command)
+            self.assertEqual(effect(command),'allow',command)  # 0.4.0: the shell guard hard-denies the dangerous forms
         for command in ('git log --oneline -5','git status','git diff --stat','python3 check_receipt.py run -- pytest -q','pytest -q tests',
                         'npm run lint','ruff check .','timeout 60 pytest -q','timeout 5 git status','env X=1 ssh host','xargs grep foo',
                         'git push','git push -u origin feature-fix','git push origin main','python3 check_receipt.py -- git push origin main'):

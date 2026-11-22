@@ -46,3 +46,45 @@ than blindly reapplied; changed evidence must fail closed.
 
 This is an operator procedure, not a model-callable grant writer or a new review
 waiver. The independent review remains outstanding until it actually runs.
+
+## Restart-safe deploy (`harness-manage deploy`)
+
+`harness-manage deploy <release>` switches to an already staged release under
+`<prefix>/releases/` only when nothing is running:
+
+```
+harness-manage deploy 0.4.0 --project /path/a --project /path/b --wait 1800 --restart
+harness-manage deploy 0.4.0 --dry-run --restart     # print the plan, change nothing
+```
+
+1. Idle check: no pending permission asks (`opencode api GET /api/permission/request`
+   per project) and no busy sessions (read-only `session_v2` query on
+   `<root>/xdg/data/opencode/opencode.db`). When busy it exits 3 and names what
+   is busy; `--wait SECONDS` polls every 15 s first. `--force` skips the refusal.
+2. Backs up `state/config/opencode.json`, `configure-choices.json`,
+   `workrelay-bridge.json` and `gateway/mcp.json` to `<root>/backups/deploy-<stamp>/`
+   (mode 700) with the old `current`/`previous` names.
+3. Points `current` at the release and `previous` at the old `current`, then
+   rewrites `guard_entry` in `workrelay-bridge.json` atomically (mode kept).
+4. With `--restart`: stops the gateway (`gateway/gateway.pid`), runs
+   `opencode service stop` and `start`, and runs `gateway/start-gateway.sh`.
+5. Warms each project's plugins (`GET /api/plugin` twice) and verifies the
+   release path is loaded; exit 4 when a project does not load it.
+6. Runs the resume-after-restart hook (`--resume-command`, default
+   `$HARNESS_DEPLOY_RESUME_COMMAND` or `python3 -m workrelay.cli resume-after-restart`)
+   only if `<command> --help` succeeds; otherwise it reports it skipped.
+
+`<root>` defaults to the parent of the prefix; commands run with `<root>/env.sh`
+sourced and their output is never printed. Projects come from `--project` or
+`$HARNESS_DEPLOY_PROJECTS` (colon separated). Roll back with `harness-manage rollback`.
+
+## Commit attribution
+
+`harness-manage install-commit-hook <repo>` installs a `prepare-commit-msg` hook
+(source: `scripts/git-hooks/prepare-commit-msg`) that appends `Agent:`,
+`Harness-Role:` and `Workrelay-Session:` trailers from `HARNESS_AGENT`,
+`HARNESS_ROLE` and `WORKRELAY_SESSION_ID`. Unset variables are skipped, existing
+trailers are not duplicated, and author and committer are never changed. An
+existing different hook is kept as `prepare-commit-msg.harness-chained` and run
+first. `plugins/v2/agent-attribution.mjs` sets those variables for harness shells
+(OpenCode `shell` `create.before` hook); values already in the environment win.

@@ -16,6 +16,9 @@
 // Missing data fails open. HARNESS_BUDGET_BRAKE=off disables it.
 import { quotaPace } from './dispatch-routing.mjs';
 import { windowBurn } from './burn-pacing.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { statePath } from './paths.mjs';
 
 export const QUOTA_SAMPLE_MS = 10 * 60_000;
 export const THROTTLE_MAX_ACTIVE = 2;
@@ -90,18 +93,45 @@ export function dispatchThrottle({ pace, newChild, compact = false, review = fal
     message: `task-dispatch: QUOTA_PACE_THROTTLED: provider quota pace is ahead of the sustainable rate; ${active.length} children of this root are active (limit ${maxActive} while ahead). No child was launched. Wait for an active child to finish (or continue an existing child) before starting new work; this is pacing, not a permission denial.` };
 }
 
+// parity 4.11: brake level for a provider: 0 none, 1 projected > 100%, 2 projected > 115% or used >= 90%.
+export function brakeLevel(quota, provider = 'openai', now = Date.now(), burn = windowBurn) {
+  let p;
+  try { p = weeklyProjection(quota, provider, now, burn); } catch { return { level: 0 }; }
+  if (!p) return { level: 0 };
+  return { level: p.projected > 100 ? (p.projected > 115 || p.used >= 90 ? 2 : 1) : 0, projected: p.projected, used: p.used, resetsAt: p.resetsAt };
+}
+// Shared gate (bin/subscription-quota.mjs --gate): ok | slow | hold.
+export function gateLevel(quota, provider = 'anthropic', now = Date.now(), burn = windowBurn) {
+  const { level } = brakeLevel(quota, provider, now, burn);
+  return level >= 2 ? 'hold' : level === 1 ? 'slow' : 'ok';
+}
+export function logQuotaSample(paces, quota, { now = Date.now(), file = statePath('telemetry', 'quota-throttle.jsonl'), fsImpl = fs } = {}) {
+  try {
+    const providers = Object.keys(paces ?? {});
+    const rows = providers.map(provider => {
+      const b = brakeLevel(quota, provider, now);
+      const decision = b.level >= 2 ? 'hold_new_builders' : b.level === 1 ? 'cap_one_builder' : paces[provider] === 'ahead' ? 'throttle_new_children' : 'admit';
+      return JSON.stringify({ at: new Date(now).toISOString(), provider, pace: paces[provider], projected: Number.isFinite(b.projected) ? Math.round(b.projected * 10) / 10 : null,
+        used: b.used ?? null, resetsAt: b.resetsAt ?? null, level: b.level, decision });
+    });
+    if (!rows.length) return;
+    fsImpl.mkdirSync(path.dirname(file), { recursive: true });
+    fsImpl.appendFileSync(file, rows.join('\n') + '\n');
+  } catch { /* telemetry is best effort */ }
+}
+
 export function sampleQuota(quota, now = Date.now()) {
   const providers = Object.keys(quota?.pools ?? {});
   return Object.fromEntries((providers.length ? providers : ['openai']).map(provider => [provider, quotaPace(quota, now, provider)]));
 }
 
-export function installQuotaSampler(ctx, { read, intervalMs = QUOTA_SAMPLE_MS, setTimer = setInterval, clearTimer = clearInterval, now = Date.now, onSample = () => {} } = {}) {
+export function installQuotaSampler(ctx, { read, intervalMs = QUOTA_SAMPLE_MS, setTimer = setInterval, clearTimer = clearInterval, now = Date.now, onSample = () => {}, log = logQuotaSample } = {}) {
   if (typeof read !== 'function') return { stop() {}, sample: async () => undefined };
   let busy = false;
   const sample = async () => {
     if (busy) return undefined;
     busy = true;
-    try { const paces = sampleQuota(await read(ctx), now()); onSample(paces); return paces; }
+    try { const quota = await read(ctx), at = now(); const paces = sampleQuota(quota, at); log(paces, quota, { now: at }); onSample(paces); return paces; }
     catch { return undefined; }
     finally { busy = false; }
   };

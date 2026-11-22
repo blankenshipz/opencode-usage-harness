@@ -15,9 +15,10 @@
 // It is lexical and quoting-aware for common cases, not a shell interpreter.
 
 import { execFile } from 'node:child_process';
+import { recordGuardDecision } from './permission-reevaluate.mjs'; // runtime-only use; safe ESM cycle
 import os from 'node:os';
 import path from 'node:path';
-import { fullAutoProjectFor, fullAutoShellCheck, rememberFullAuto, downgradeFullAutoShell, pathResourcesInside, PATH_ACTIONS, realish, shellSecretReasons } from './full-auto.mjs';
+import { fullAutoProjectFor, defaultFullAutoProject, fullAutoShellCheck, rememberFullAuto, downgradeFullAutoShell, pathResourcesInside, PATH_ACTIONS, realish, shellSecretReasons, hardDenyReasons, hardDenyMessage } from './full-auto.mjs';
 
 // Native shell secret asks; must match configure.py SECRET_SHELL_ASK (tests/v2-full-auto.test.mjs
 // checks). They match the whole command string (`*.key*` also hits `d.keys()`); the guard drops an
@@ -737,9 +738,10 @@ export const downgradeVerifiedCommit = downgradeVerifiedShell;
 
 const listData = value => Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
 
-export async function installShellGuard(ctx, { tools = ['shell', 'bash'], fullAutoProjects, ...options } = {}) {
+export async function installShellGuard(ctx, { tools = ['shell', 'bash'], fullAutoProjects, defaultFullAuto = true, ...options } = {}) {
   if (typeof ctx?.tool?.hook !== 'function') return;
-  const fullAutoProject = directory => fullAutoProjectFor(directory, ...(fullAutoProjects ? [fullAutoProjects()] : []));
+  // 0.4.0: unlisted projects get the auto-approve fallback (defaultFullAuto:false keeps the legacy path for tests).
+  const fullAutoProject = directory => fullAutoProjectFor(directory, ...(fullAutoProjects ? [fullAutoProjects()] : [])) ?? (defaultFullAuto ? defaultFullAutoProject(directory) : undefined);
   const permission = ctx.permission;
   const canAsk = typeof permission?.assert === 'function' && typeof permission?.hook === 'function';
   if (canAsk) {
@@ -792,13 +794,12 @@ export async function installShellGuard(ctx, { tools = ['shell', 'bash'], fullAu
           if (amend.ok) { reasons = withoutAmend; amendOk = true; } else reasons.push(...amend.reasons);
         }
       }
-      if (!reasons.length) { if (canAsk) rememberFullAuto(event, { amendOk }); return; }
-      const reason = `full-auto project ${project.directory}: ${reasons.join('; ')}`;
-      if (!canAsk) throw new Error(`Harness shell guard blocked this command because approval cannot be requested here: ${reason}.`);
-      await permission.assert({
-        sessionID: event.sessionID, agent: event.agent, action: 'shell', resources: [command], save: [],
-        metadata: { [GUARD_MARKER]: reason }, source: { type: 'tool', messageID: event.messageID, id: event.id },
-      });
+      // 0.4.0 auto-approve: only the hard-deny classes stop a command, immediately and without an ask.
+      const hard = hardDenyReasons(reasons);
+      if (hard.length) { recordGuardDecision(event.sessionID, event.id, { verified: false }); throw new Error(`Harness shell guard: ${hardDenyMessage(hard, command)}`); }
+      // 4.3: one decision per call; a native ask for this same call is answered once by permission-reevaluate.
+      recordGuardDecision(event.sessionID, event.id, { verified: true });
+      if (canAsk) rememberFullAuto(event, { amendOk });
       return;
     }
     const result = analyzeShellCommand(command, rules);

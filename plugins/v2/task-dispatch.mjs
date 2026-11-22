@@ -1,5 +1,5 @@
 import { workerObservation } from './worker-observation.mjs';
-import { readRoutingQuota, readRoutingPolicy, selectDispatchModel, modelReference, TASK_TYPES } from './dispatch-routing.mjs';
+import { readRoutingQuota, readRoutingPolicy, selectDispatchModel, modelReference, TASK_TYPES, builderEscalation, reviewRoundTier } from './dispatch-routing.mjs';
 import { waitForCompactionIdle } from './compaction-wait.mjs';
 
 import { observeAdmission, convergenceAdvice, userActions, recordProgress, normalizeProgressEvidence } from './convergence.mjs';
@@ -7,6 +7,7 @@ import { checkpointSchema, normalizeCheckpoint, observedContext, contextMaintena
 import { recordAttempt, attemptStatus } from './verification-attempt.mjs';
 import path from 'node:path';
 import { realpath } from 'node:fs/promises';
+import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import crypto from 'node:crypto';
@@ -29,7 +30,7 @@ import { createDispatchCanceller, cancelInputSchema } from './task-dispatch-canc
 import { createResultDelivery } from './result-delivery.mjs';
 import { parkMonitor as defaultParkMonitor, parkedResult } from './park-yield.mjs';
 import { createRouterCompactor } from './router-maintenance.mjs';
-import { dispatchThrottle } from './quota-throttle.mjs';
+import { dispatchThrottle, budgetBrake } from './quota-throttle.mjs';
 import { createStaleReconciler } from './dispatch-reconcile.mjs';
 import { midRunCompactionEnabled, midRunCompactionDecision, settleMidRunCompaction, admitMidRunCompaction, recordAdmitted, recordAdmissionFailure, recordBaseline, buildContinuation, activeContinuation, midRunCompactionStatus, pendingCompactionPreservation, BRIEF_LIMIT } from './mid-run-compaction.mjs';
 
@@ -305,7 +306,62 @@ function hasRetainedCompactionEvidence(record, childID) {
   const expected=compactionSourceEvidence(record,childID);
   return expected && Number.isInteger(saved.sourceGeneration) && saved.sourceGeneration===record.completionBinding.generation && JSON.stringify(identity)===JSON.stringify(expected);
 }
-async function resolveReviewProvenance({ input, state, sessions, rootID, record, requested, loadCompletionReceipt }) {
+// parity 4.9/4.10 helpers. Verdicts come from <state>/review-verdicts.jsonl and are
+// joined to this task's reviewer/verifier dispatch records by childID (= sessionId).
+export function readReviewVerdicts(file=statePath('review-verdicts.jsonl')) {
+  try { return fs.readFileSync(file,'utf8').split('\n').filter(Boolean).slice(-2000).map(line=>{ try { return JSON.parse(line); } catch { return undefined; } }).filter(Boolean); }
+  catch { return []; }
+}
+function quotaBrakeOn(quota, routing) {
+  try { return Boolean(budgetBrake({quota,provider:routing.selected?.split('/')[0],agent:'builder',newChild:true,env:process.env})); } catch { return false; }
+}
+export function reviewRoundPlan({ input, state, rootID, key, requested, agents, routing, verdicts=[], brakeOn=false }) {
+  const role=canonicalHarnessRole(input.agent) ?? input.agent;
+  const taskRecords=(state.records ?? []).filter(r=>r.rootID===rootID && r.taskId===input.taskId);
+  const reviewRecords=taskRecords.filter(r=>['reviewer','verifier'].includes(canonicalHarnessRole(r.agent) ?? r.agent));
+  const reviewSessions=new Set(reviewRecords.map(r=>r.childID).filter(Boolean));
+  const taskVerdicts=verdicts.filter(v=>reviewSessions.has(v.sessionId)).map(v=>v.verdict);
+  const risk=input.routing?.risk;
+  if (['reviewer','verifier'].includes(role)) {
+    // A continuation keeps its admitted reviewer route (cache and review affinity).
+    if (requested) return {};
+    const prior=reviewRecords.filter(r=>r.key!==key && r.childID!==requested && r.routing?.selected).length;
+    const round=Math.max(prior,taskVerdicts.length)+1;
+    const tier=reviewRoundTier({agent:role,risk,round,lastReviewedTree:verdicts.filter(v=>reviewSessions.has(v.sessionId)).at(-1)?.tree,
+      openFindings:verdicts.filter(v=>reviewSessions.has(v.sessionId) && v.verdict==='needs_fixes' && v.summary).slice(-5).map(v=>v.summary)});
+    if (tier?.tier!=='BALANCED') return {round};
+    let selected;
+    const balanced=modelReference((agents ?? []).find(a=>(canonicalHarnessRole(a.id ?? a.name) ?? (a.id ?? a.name))==='builder')?.model);
+    if (balanced && !routing.modelOverride && input.model===undefined && input.routing?.reviewIndependence!=='required'
+      && balanced.split('/')[0]===routing.selected?.split('/')[0]) selected=balanced;
+    return {round,selected,briefScope:tier.briefScope};
+  }
+  const esc=builderEscalation({agent:role,risk,reviewRounds:taskVerdicts,brakeOn});
+  if (esc?.escalated) return {hint:`escalate to senior-builder: ${esc.reason==='risk_high'?'risk high':'second needs_fixes on this task'}; dispatch the fix as a fresh harness-senior-builder child instead of continuing this builder`};
+  if (esc && !esc.escalated) return {hint:`senior-builder escalation withheld (${esc.reason}): the weekly budget brake is on`};
+  return {};
+}
+// parity 4.8: a builder must report `Self-check: HEAD <sha>` at the current HEAD before review.
+export function selfCheckRefusal(finalText, currentHead) {
+  const match=String(finalText ?? '').match(/Self-check:\s*HEAD\s+([0-9a-f]{7,40})/i);
+  const advice='Send the builder back to self-check: re-read its full diff, re-run the bound checks at the final HEAD, and report "Self-check: HEAD <sha>, checks re-run: ..." with the risk checklist answers.';
+  if (!match) return `task-dispatch: REVIEW_SELF_CHECK_MISSING: the builder's terminal report has no "Self-check: HEAD <sha>" line. ${advice}`;
+  if (typeof currentHead==='string' && currentHead && !currentHead.startsWith(match[1].toLowerCase()))
+    return `task-dispatch: REVIEW_SELF_CHECK_STALE: the builder self-checked HEAD ${match[1]} but the current HEAD is ${currentHead.slice(0,12)}. ${advice}`;
+  return undefined;
+}
+function gitHead(cwd) {
+  return new Promise(resolve => execFile('git',['rev-parse','HEAD'],{cwd,timeout:10000},(error,stdout)=>resolve(error?undefined:String(stdout).trim())));
+}
+export async function defaultSelfCheck({ owner, child, loadFinalText }) {
+  const assistantID=owner.completionReceipt?.assistantID ?? child?.lastAssistantID;
+  if (!assistantID) return selfCheckRefusal('', undefined);
+  let text;
+  try { const final=await loadFinalText({sessionID:owner.childID,assistantID}); text=typeof final==='string'?final:final?.text; } catch {}
+  const head=child?.directory ? await gitHead(child.directory) : undefined;
+  return selfCheckRefusal(text, head);
+}
+async function resolveReviewProvenance({ input, state, sessions, rootID, record, requested, loadCompletionReceipt, selfCheck }) {
   const routing=input.routing;
   const persisted=record?.routing?.reviewProvenance;
   if (requested===record?.childID && persisted?.childID && modelReference(persisted.model) && record.routing?.reviewIndependence==='required') {
@@ -358,6 +414,7 @@ async function resolveReviewProvenance({ input, state, sessions, rootID, record,
   if (sourceOwner.state!=='completed')
     throw new Error(`task-dispatch: review author has no completed admitted implementation generation (recorded state: ${owner.state ?? 'unknown'}); explicit generation-bound completion evidence is required before dispatching review`);
   await validateBackgroundReceipt(sourceOwner,child,loadCompletionReceipt);
+  if (selfCheck) { const refusal=await selfCheck({owner:sourceOwner,child}); if (refusal) throw new Error(refusal); }
   const selected=modelReference(owner.routing?.selected), observed=modelReference(child.model);
   if (!selected || (observed && observed!==selected))
     throw new Error('task-dispatch: review author model evidence is missing or disagrees with its admitted route');
@@ -411,7 +468,7 @@ export function taskWorkStatus(state,rootID,taskId) {
   return {...totals,due:totals.steps-(review?.steps??0)>=240 || totals.continuations-(review?.continuations??0)>=12,limits:{steps:240,continuations:12}};
 }
 const gitBranch = directory => new Promise((resolve,reject)=>execFile('git',['-C',directory,'rev-parse','--abbrev-ref','HEAD'],{timeout:3000},(error,stdout)=>error?reject(error):resolve(String(stdout))));
-export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, loadDeliveryEvidence = runtimeDeliveryEvidence, deliverySchedule, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot, parkMonitor = defaultParkMonitor, appendOutcome } = {}) {
+export async function installTaskDispatch(ctx, { registry = createRegistry(), globalRegistry = createRegistry(statePath('dispatch-global-writers')), loadSessions = runtimeSessions, loadSources = runtimeIntentSources, loadCompletionReceipt = runtimeCompletionReceipt, loadTerminalReceipt = runtimeTerminalReceipt, loadFinalText = runtimeFinalText, loadDeliveryEvidence = runtimeDeliveryEvidence, deliverySchedule, now = Date.now, loadQuota = readRoutingQuota, loadRoutingPolicy = readRoutingPolicy, resolvePublicationScope: discoverPublicationScope = resolvePublicationScope, grantPath, configRoot, parkMonitor = defaultParkMonitor, appendOutcome, selfCheck, loadVerdicts = readReviewVerdicts } = {}) {
   if (!ctx.agent?.list) return;
   if (typeof ctx.tool?.hook==='function') await ctx.tool.hook('execute.before', async event => {
     if (event?.tool!=='bash' && event?.tool!=='shell') return;
@@ -876,13 +933,20 @@ export async function installTaskDispatch(ctx, { registry = createRegistry(), gl
           state.workReviews.push({rootID,taskId:input.taskId,steps:total.steps,continuations:total.continuations,...review,at:now()});
         }
         let routedInput;
-        try { routedInput=await resolveReviewProvenance({input,state,sessions,rootID,record,requested,loadCompletionReceipt}); }
+        try { routedInput=await resolveReviewProvenance({input,state,sessions,rootID,record,requested,loadCompletionReceipt,selfCheck:selfCheck===false?undefined:(args=>(selfCheck??defaultSelfCheck)({...args,loadFinalText}))}); }
         catch (error) {
           if (input.routing?.reviewIndependence==='required' || record?.routing?.reviewIndependence==='required') { recordReviewGate(state,{rootID,taskId:input.taskId,reason:error?.message,at:now()}); await save(); }
           throw error;
         }
         const routing=selectDispatchModel({input:routedInput,agent,agents,record,child,quota,
           hasActiveDescendant:Boolean(requested && sessions.some(session=>session.active&&descendant(sessions,session.id,requested)))});
+        // parity 4.9/4.10: re-review rounds on BALANCED with a scoped brief; builder escalation hint.
+        try {
+          const plan=reviewRoundPlan({input,state,rootID,key,requested,agents,routing,verdicts:loadVerdicts(),brakeOn:quotaBrakeOn(quota,routing)});
+          if (plan.selected) { routing.reviewRound={round:plan.round,from:routing.selected,to:plan.selected}; routing.selected=plan.selected; }
+          if (plan.briefScope && typeof input.prompt==='string' && !input.prompt.startsWith('Re-review round')) input.prompt=`${plan.briefScope}\n\n${input.prompt}`;
+          if (plan.hint) intentNotes.push(plan.hint);
+        } catch { /* routing hints are advisory */ }
         if (routedInput.routing?.reviewProvenance) routing.reviewProvenance=routedInput.routing.reviewProvenance;
         if (routedInput.routing?.reviewIndependence) routing.reviewIndependence=routedInput.routing.reviewIndependence;
         // r20 item 4: while quota pace is ahead, cap concurrently active new children per root.

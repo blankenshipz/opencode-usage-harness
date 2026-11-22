@@ -192,3 +192,7 @@ admission path. Do not remove required capabilities or relax permissions. This i
 not a recovery route around a previous denial: native permission, provider and
 financial denials remain blocking, recorded owners retain their exact identity,
 and continuing an existing child still requires its stored agent and parent.
+
+## Shared quota gate
+
+`node <harness>/bin/subscription-quota.mjs --gate` prints exactly `ok`, `slow` or `hold` from the cached Claude quota snapshot (no network call) and always exits 0. `slow` = weekly usage projected over 100% at reset; `hold` = projected over 115% or used at least 90%. A missing or stale snapshot fails open (`ok`) with a note on stderr. External launchers such as `cc` should call it before starting work. Each quota sample's projection, level and decision is logged to `state/telemetry/quota-throttle.jsonl`.

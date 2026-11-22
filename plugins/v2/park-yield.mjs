@@ -5,7 +5,8 @@
 // already sends the user a stalled event). At PARK_AFTER (30 min) the ask is
 // parked: it is never answered or rejected by the harness and stays answerable
 // by a human, but a foreground parent waiting on that child (or a descendant)
-// is released with an explicit blocked/incomplete result. Never auto-deny.
+// is released with an explicit blocked/incomplete result. Never auto-approve; since 0.4.0 an ask
+// pending past HARNESS_ASK_TIMEOUT_MS is auto-denied (see ASK_TIMEOUT_MS).
 import fs from 'node:fs';
 import path from 'node:path';
 import { statePath } from './paths.mjs';
@@ -19,6 +20,14 @@ import { statePath } from './paths.mjs';
 const envMs = (name, fallback) => { const raw = process.env[name]; return typeof raw === 'string' && /^\d{1,8}$/.test(raw) ? Number(raw) : fallback; };
 export const NOTIFY_AFTER_MS = envMs('HARNESS_PARK_NOTIFY_MS', 0);
 export const PARK_AFTER_MS = envMs('HARNESS_PARK_AFTER_MS', 30_000);
+// 0.4.0 (parity 4.4): safety net. An ask still pending after HARNESS_ASK_TIMEOUT_MS (default
+// 15 min) is DENIED (never approved) so a child does not hold its context until a human appears.
+export const ASK_TIMEOUT_MS = envMs('HARNESS_ASK_TIMEOUT_MS', 900_000);
+export const ASK_TIMEOUT_PREFIX = 'ASK TIMEOUT DENY (harness auto-approve policy)';
+export function askTimeoutMessage({ summary, pendingMs } = {}) {
+  return `${ASK_TIMEOUT_PREFIX}: this permission ask (${summary ?? 'unknown action'}) was not answered within ${Math.round((pendingMs ?? 0) / 60_000)} min and was denied. ` +
+    'Status: blocked, resumable. Record a resumable blocker carrying the exact command, continue other non-overlapping work, and do NOT retry variants or workarounds of this command.';
+}
 export const PENDING_ASKS_FILE = statePath('asks', 'pending.json');
 const REDACTIONS = [
   [/\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|KEY|AUTH|CREDENTIAL|HMAC|COOKIE)[A-Za-z0-9_]*)=\S+/gi, '$1=[redacted]'],
@@ -61,7 +70,7 @@ export function parkLogger({ file = statePath('telemetry', 'permission-park.json
   };
 }
 
-export function createParkMonitor({ now = Date.now, notifyAfter = NOTIFY_AFTER_MS, parkAfter = PARK_AFTER_MS, log = () => {}, publish = () => {} } = {}) {
+export function createParkMonitor({ now = Date.now, notifyAfter = NOTIFY_AFTER_MS, parkAfter = PARK_AFTER_MS, askTimeout = ASK_TIMEOUT_MS, log = () => {}, publish = () => {}, reject } = {}) {
   const asks = new Map(); // requestID -> {sessionID, since, action, stalled, parked}
   const waiters = new Set();
   let ticking = false;
@@ -83,6 +92,7 @@ export function createParkMonitor({ now = Date.now, notifyAfter = NOTIFY_AFTER_M
       sync();
     },
     replied(id) { if (asks.delete(id)) sync(); },
+    setReject(fn) { reject = fn; },
     pending() { return [...asks].map(([id, ask]) => ({ requestID: id, ...ask })); },
     forgetSession(sessionID) { let changed = false; for (const [id, ask] of asks) if (ask.sessionID === sessionID) changed = asks.delete(id) || changed; if (changed) sync(); },
     async tick() {
@@ -105,6 +115,20 @@ export function createParkMonitor({ now = Date.now, notifyAfter = NOTIFY_AFTER_M
           log(record); events.push(record);
         }
       }
+      // Safety net: deny (never approve) asks pending past askTimeout. Needs a reject function.
+      if (typeof reject === 'function' && askTimeout > 0) {
+        for (const [id, ask] of [...asks]) {
+          if (ask.timedOut || at - ask.since < askTimeout) continue;
+          ask.timedOut = true;
+          const base = parkedRecord(id, ask);
+          const message = askTimeoutMessage(base);
+          let denied = false;
+          try { await reject({ sessionID: ask.sessionID, requestID: id, message }); denied = true; } catch { /* already answered elsewhere */ }
+          const record = { at: new Date(at).toISOString(), event: 'ask_timeout_denied', outcome: denied ? 'ask_timeout_denied' : 'ask_timeout_reply_failed', ...base };
+          log(record); events.push(record);
+          if (denied) asks.delete(id);
+        }
+      }
       if (events.length) sync();
       for (const [id, ask] of asks) if (ask.parked) await offer(parkedRecord(id, ask));
       return events;
@@ -123,6 +147,9 @@ export const parkMonitor = createParkMonitor({ log: parkLogger(), publish: pendi
 
 export function installParkYield(ctx, { monitor = parkMonitor, tickMs = PARK_TICK_MS, setTimer = setInterval, clearTimer = clearInterval } = {}) {
   if (typeof ctx?.event?.subscribe !== 'function') return { stop() {} };
+  // The shared monitor is created without a permission client; attach the deny path here.
+  if (typeof ctx?.permission?.reply === 'function' && typeof monitor.setReject === 'function')
+    monitor.setReject(({ sessionID, requestID, message }) => ctx.permission.reply({ sessionID, requestID, decision: 'reject', message }));
   const controller = new AbortController();
   const timer = setTimer(() => { void monitor.tick().catch(() => {}); }, tickMs);
   timer?.unref?.();

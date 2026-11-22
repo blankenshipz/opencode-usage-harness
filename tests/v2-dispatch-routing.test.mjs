@@ -423,3 +423,23 @@ test('policy validation rejects unknown schema, invalid roles, profile refs, res
 ]) assert.throws(()=>{const policy=structuredClone(valid);mutate(policy);validateTaskFitPolicy(policy);},error=>error.code==='ROUTING_POLICY_INVALID');
  assert.doesNotThrow(()=>validateTaskFitPolicy({version:1,enabled:true,roles:{'harness-verifier':[]}}));
 });
+
+test('parity 4.9-4.11: projection-based ahead, senior-builder escalation, re-review tier, no effort raise while ahead', async () => {
+  const m = await import('../plugins/v2/dispatch-routing.mjs');
+  assert.equal(m.ROLE_TIERS['senior-builder'], 'STRONG');
+  // used 50 with pace_delta 12 => elapsed 38 => projected ~132% => ahead; used 10, delta 5 => projected 200%; used 60, delta 11 at 49% elapsed => 122%.
+  assert.ok(m.projectedAtReset({used_percent:50,pace_delta:12}) > 100);
+  assert.ok(m.projectedAtReset({used_percent:90,pace_delta:11,resets_at:new Date(Date.now()+3600_000).toISOString(),burn_rate_per_hour:1}) < 100);
+  const now=Date.now(), mk=w=>({pools:{openai:{checked_at:new Date(now).toISOString(),windows:[{scope:'account',...w}]}}});
+  // pace_delta > 10 but projected under 100 (explicit burn rate) is no longer ahead.
+  assert.notEqual(m.quotaPace(mk({used_percent:80,remaining_percent:20,pace_delta:15,duration_minutes:10080,burn_rate_per_hour:0.1,resets_at:new Date(now+24*3600_000).toISOString()}),now),'ahead');
+  assert.equal(m.quotaPace(mk({used_percent:80,remaining_percent:20,pace_delta:5,duration_minutes:10080,burn_rate_per_hour:2,resets_at:new Date(now+24*3600_000).toISOString()}),now),'ahead');
+  assert.deepEqual(m.builderEscalation({agent:'builder',risk:'normal',reviewRounds:['needs_fixes']}), undefined);
+  assert.equal(m.builderEscalation({agent:'builder',risk:'normal',reviewRounds:['needs_fixes','needs_fixes']}).agent,'senior-builder');
+  assert.equal(m.builderEscalation({agent:'builder',risk:'high'}).reason,'risk_high');
+  assert.equal(m.builderEscalation({agent:'builder',risk:'high',brakeOn:true}).escalated,false);
+  assert.equal(m.reviewRoundTier({agent:'reviewer',round:1}).tier,'STRONG');
+  assert.equal(m.reviewRoundTier({agent:'reviewer',round:2,risk:'high'}).tier,'STRONG');
+  const r2=m.reviewRoundTier({agent:'verifier',round:2,lastReviewedTree:'abc123',openFindings:['race in lock']});
+  assert.equal(r2.tier,'BALANCED'); assert.match(r2.briefScope,/abc123/); assert.match(r2.briefScope,/race in lock/);
+});

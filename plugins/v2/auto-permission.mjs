@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { isSecretPath, markers, scanShell } from './shell-guard.mjs';
-import { realish, fullAutoProjectFor, fullAutoShellCheck, protectedLocation, containsProtected } from './full-auto.mjs';
+import { realish, fullAutoProjectFor, fullAutoShellCheck, protectedLocation, containsProtected, toolOutputFileRead, defaultFullAutoProject } from './full-auto.mjs';
 import { statePath } from './paths.mjs';
 
 export const LISTABLE_DIRS = ['/opt', '/snap/bin', '/bin', '/sbin', '/usr/bin', '/usr/local/bin'];
@@ -74,6 +74,8 @@ export function decideFullAutoExternal({ action, resources, tool, input, project
   if (!shell && !READ_ONLY_TOOLS.has(tool)) return { decision: 'ask', reason: 'full_auto_tool_not_read_only' };
   for (const r of res) {
     const lexical = path.resolve(directory ?? '/', stripGlob(r).replace(/\/\*\*$/, ''));
+    // 0.4.0 (4.2): the read tool may open a single OpenCode tool-output tool_* file.
+    if (tool === 'read' && action === 'read' && toolOutputFileRead('read', lexical)) continue;
     for (const candidate of [lexical, realish(lexical, { realpath })]) {
       if (credentialPath(candidate, home)) return { decision: 'ask', reason: 'credential_path' };
       if (SEARCH_TOOLS.has(tool) && (containsProtected(candidate) || ['.ssh', '.aws', '.config', '.gnupg'].some(d => contains(candidate, path.join(home, d)))))
@@ -160,7 +162,7 @@ export function autoPermissionLogger({ file = statePath('telemetry', 'auto-permi
   };
 }
 
-export async function installAutoPermission(ctx, { log = autoPermissionLogger(), now = () => Date.now(), home = os.homedir(), realpath = fs.realpathSync, fullAutoProjects } = {}) {
+export async function installAutoPermission(ctx, { log = autoPermissionLogger(), now = () => Date.now(), home = os.homedir(), realpath = fs.realpathSync, fullAutoProjects, defaultFullAuto = true } = {}) {
   const permission = ctx?.permission;
   if (typeof permission?.hook !== 'function') return { stop() {} };
   const calls = new Map(); // `${sessionID}\0${callID}` -> {tool, input}
@@ -178,7 +180,7 @@ export async function installAutoPermission(ctx, { log = autoPermissionLogger(),
     if (!call) return; // unknown tool/input: leave it with the human
     let verdict;
     try {
-      const project = event.metadata?.[markers.PROBE_MARKER] ? undefined : fullAutoProjectFor(ctx.location?.directory, ...(fullAutoProjects ? [fullAutoProjects()] : []));
+      const project = event.metadata?.[markers.PROBE_MARKER] ? undefined : (fullAutoProjectFor(ctx.location?.directory, ...(fullAutoProjects ? [fullAutoProjects()] : [])) ?? (defaultFullAuto ? defaultFullAutoProject(ctx.location?.directory) : undefined));
       verdict = decideAutoPermission({ action: event.action, resources: event.resources, tool: call.tool, input: call.input, directory: ctx.location?.directory, home, realpath, fullAutoProject: project });
     } catch { verdict = { decision: 'ask', reason: 'error' }; }
     const subject = typeof call.input?.command === 'string' ? call.input.command : (event.resources ?? []).join(' ');

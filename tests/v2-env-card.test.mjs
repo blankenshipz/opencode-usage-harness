@@ -55,3 +55,15 @@ test('card is cached, refreshed on root session.created, injected only for route
   assert.equal(probes, 2);
   installed.stop();
 });
+
+test('parity 4.8: review lessons are read bounded from .review/lessons.md', async () => {
+  const fs = await import('node:fs'), os = await import('node:os'), path = await import('node:path');
+  const { readReviewLessons } = await import('../plugins/v2/env-card.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lessons-'));
+  assert.equal(readReviewLessons(dir), undefined);
+  fs.mkdirSync(path.join(dir, '.review'));
+  fs.writeFileSync(path.join(dir, '.review', 'lessons.md'), 'old\n' + 'x'.repeat(5000) + '\nnewest lesson');
+  const text = readReviewLessons(dir, { maxBytes: 100 });
+  assert.match(text, /newest lesson/); assert.doesNotMatch(text, /old/); assert.ok(text.length < 250);
+  fs.rmSync(dir, { recursive: true });
+});

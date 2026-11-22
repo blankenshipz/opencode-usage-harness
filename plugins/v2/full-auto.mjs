@@ -57,7 +57,8 @@ function normalizeProject(entry) {
   const dataDirs = (Array.isArray(raw.data_dirs) ? raw.data_dirs : [])
     .filter(dir => typeof dir === 'string' && path.isAbsolute(dir)).map(dir => realish(path.resolve(dir))).filter(dir => dir !== '/');
   // no_push_deploy (0.3.3): pushes and deploys always ask in this project (yrdsale Phase 1 rule).
-  return { directory, roots: [directory, ...dataDirs], ...(raw.no_push_deploy === true ? { noPushDeploy: true } : {}) };
+  // 0.4.0: no_push_deploy is parsed for back-compat but is a no-op (auto-approve; pushes and deploys allowed).
+  return { directory, roots: [directory, ...dataDirs] };
 }
 
 // 0.3.4 (r36): protected locations. Read tools and read-only shell must ask for them even under
@@ -69,6 +70,13 @@ function normalizeProject(entry) {
 // and OpenCode's shell-output files <xdg data>/opencode/shell/** (a session's own command output).
 export const PROTECTED_DIRS = ['/home/box/work/agent-profiles', '/home/box/work/ocharness'];
 export const READABLE_DIRS = ['/home/box/work/ocharness/state/check-receipts', '/home/box/work/ocharness/harness', '/home/box/work/ocharness/xdg/data/opencode/shell'];
+// 0.4.0 (4.2): the `read` tool may open one OpenCode tool-output file (tool_*); no list/glob/grep there.
+export const TOOL_OUTPUT_DIR = '/home/box/work/ocharness/xdg/data/opencode/tool-output';
+export function toolOutputFileRead(action, target) {
+  if (action !== 'read' || typeof target !== 'string' || !path.isAbsolute(target)) return false;
+  const resolved = path.resolve(target);
+  return path.dirname(resolved) === TOOL_OUTPUT_DIR && /^tool_[A-Za-z0-9._-]+$/.test(path.basename(resolved));
+}
 // Directories under which any component named like *profile* is a browser profile copy.
 export const PROFILE_PARENTS = ['/workspace/browser-probe'];
 const BROWSER_DATA_FILE = /^(Cookies|Extension Cookies|Safe Browsing Cookies|Login Data|Login Data For Account|Web Data|Local State)(-journal|-wal|-shm)?$/;
@@ -164,6 +172,13 @@ export function loadFullAutoProjects({ choicesPath = path.join(managedConfigRoot
   return projects;
 }
 
+// 0.4.0: any project directory not listed gets the same auto-approve + hard-deny policy.
+export function defaultFullAutoProject(directory) {
+  if (typeof directory !== 'string' || !path.isAbsolute(directory) || directory === '/' ) return undefined;
+  const resolved = path.resolve(directory);
+  if (resolved === path.resolve(os.homedir())) return undefined;
+  return { directory: resolved, roots: [resolved], implicit: true };
+}
 export function fullAutoProjectFor(directory, projects = loadFullAutoProjects()) {
   if (typeof directory !== 'string' || !path.isAbsolute(directory)) return undefined;
   const resolved = realish(path.resolve(directory));
@@ -661,14 +676,16 @@ function nestedCommands(segment, nested, ctx, { garageOk = false } = {}) {
 // 0.3.3: per-segment working directories. After a top-level `cd T`, the segments joined to it by
 // `&&` (and the subshells opened by `&& (`) run only if the cd succeeded, so they run in T alone; a
 // `;`, newline, `||` or `&` at the top level ends that, and later segments get the union (as before).
-function segmentCwdList(segments, base, home) {
+function segmentCwdList(segments, base, home, roots = []) {
   const union = segmentCwds(segments, base, home);
   const list = [];
-  let exact, moved = false;
+  let exact, moved = false, exactKeep = false;
   for (const segment of segments) {
     const sep = segment.prevSep === '(' && segment.outer !== undefined ? segment.outer : segment.prevSep;
     const top = !segment.sub || segment.prevSep === '(';
-    if (exact && top && ['', ';', '\n', '||', '&', '|', '|&', ')'].includes(sep) && !(sep === '' && segment.sub)) exact = undefined;
+    // 0.4.0 (4.1): a literal existing cd target inside the project roots stays exact across `;` and newlines.
+    const keep = exactKeep && [';', '\n'].includes(sep);
+    if (exact && top && !keep && ['', ';', '\n', '||', '&', '|', '|&', ')'].includes(sep) && !(sep === '' && segment.sub)) exact = undefined;
     list.push(exact ?? union);
     const { words } = segment;
     if (!segment.sub && words[0] === 'cd' && words.length <= 2 && union) {
@@ -676,7 +693,8 @@ function segmentCwdList(segments, base, home) {
       moved = true;
       const target = from && from.size === 1 ? cdTarget([...from][0], words, home) : undefined;
       exact = target ? new Set([target]) : undefined;
-    } else if (words.some(word => ['cd', 'pushd', 'popd', 'chdir'].includes(word))) { exact = undefined; moved = true; }
+      exactKeep = Boolean(target && roots.some(root => contains(root, target)) && /^[A-Za-z0-9_./@%+=:,~-]+$/.test(words[1] ?? '') && (() => { try { return fs.statSync(target).isDirectory(); } catch { return false; } })());
+    } else if (words.some(word => ['cd', 'pushd', 'popd', 'chdir'].includes(word))) { exact = undefined; exactKeep = false; moved = true; }
   }
   return list;
 }
@@ -713,7 +731,7 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
   const nested = [];
   const envReads = garage && remote && depth > 0 ? garageEnvReads(command, segments) : new Map();
   const vars = literalVariables(segments);
-  const cwdList = remote ? undefined : segmentCwdList(segments, cwd, home);
+  const cwdList = remote ? undefined : segmentCwdList(segments, cwd, home, project?.roots ?? []);
   const baseCtx = ctx;
   segments.forEach((segment, n) => {
     const ctx = cwdList ? { ...baseCtx, cwds: cwdList[n] } : baseCtx;
@@ -749,8 +767,6 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     }
     const service = serviceDanger(words);
     if (service) reasons.push(`${text}: ${service}`);
-    const deploy = project?.noPushDeploy ? pushDeployDanger(words) : undefined;
-    if (deploy) reasons.push(`${text}: ${deploy}`);
     // Delete targets with literal variables (B=/x; rm -rf $B) are judged by their expansion.
     const expandedWords = words.map(word => { const values = /\$/.test(word) ? expandVariables(word, vars) : undefined; return values?.length === 1 ? values[0] : word; });
     if (paths) reasons.push(...[...rmDanger(expandedWords, ctx), ...findDanger(expandedWords, ctx), ...rsyncDanger(words, ctx, nested)].map(why => `${text}: ${why}`));
@@ -764,6 +780,37 @@ export function fullAutoShellCheck(command, cwd, project, { home = process.env.H
     reasons.push(...innerReasons.map(why => `${inner.remote ? 'remote ' : 'nested '}${why}`));
   }
   return [...new Set(reasons)];
+}
+
+// 0.4.0 auto-approve: of the full-auto reasons, only these classes deny; everything else is allowed.
+// Returns [{ rule, reason }].
+export const HARD_DENY_RULES = {
+  history: 'force push / history rewrite',
+  delete: 'delete outside the project roots or /tmp',
+  secret: 'secret read or exfiltration (incl. protected harness/browser-profile paths)',
+};
+export function hardDenyReasons(reasons) {
+  const out = [];
+  for (const reason of reasons ?? []) {
+    if (typeof reason !== 'string') continue;
+    if (/truncating redirect/.test(reason)) continue;
+    if (/git push --force|git push \+|rewrites or deletes remote refs|git rebase rewrites|filter-branch|filter-repo|force-with-lease|--mirror/.test(reason)) { out.push({ rule: 'history', reason }); continue; }
+    if (/commit --amend/.test(reason)) { out.push({ rule: 'history', reason }); continue; }
+    if (/writes disks or devices|redirect writes device/.test(reason)) { out.push({ rule: 'delete', reason }); continue; }
+    if (/git reset --hard/.test(reason)) {
+      const seg = reason.match(/^(?:nested |remote )*"((?:[^"\\]|\\.)*)"/)?.[1] ?? '';
+      if (/reset\s+(?:-q\s+)?--hard(?:\s+(?:-q|HEAD|@))*\s*$/.test(seg)) continue;
+      out.push({ rule: 'history', reason }); continue;
+    }
+    if (/resolves outside the project|reaches \/, a top-level|--no-preserve-root|globs over directories/.test(reason)) { out.push({ rule: 'delete', reason }); continue; }
+    if (/secret|credential|protected path|harness\/agent-profile location|browser profile|browser user-data|private key|token/i.test(reason)) { out.push({ rule: 'secret', reason }); continue; }
+  }
+  return out;
+}
+export function hardDenyMessage(hard, command) {
+  const rules = [...new Set(hard.map(entry => HARD_DENY_RULES[entry.rule]))].join(', ');
+  return `HARD DENY (harness auto-approve policy; rule: ${rules}): ${hard.map(entry => entry.reason).join('; ')}. `
+    + `This is not an approval request and will not be asked. Do not retry variants of this command. Record a resumable blocker with the exact command ${JSON.stringify(String(command ?? '').slice(0, 400))} and continue with other work.`;
 }
 
 // Calls inspected by the guard and found safe under full-auto, keyed by session + tool call.
@@ -786,7 +833,7 @@ export function downgradeFullAutoShell(event, project) {
   if (!entry || entry.expires <= Date.now() || !Array.isArray(event.resources) || !event.resources.length) return false;
   for (const resource of event.resources) {
     if (typeof resource !== 'string') return false;
-    if (fullAutoShellCheck(resource, undefined, project, { paths: false, amendOk: entry.amendOk }).length) return false;
+    if (hardDenyReasons(fullAutoShellCheck(resource, undefined, project, { paths: false, amendOk: entry.amendOk })).length) return false;
   }
   event.effect = 'allow';
   return true;

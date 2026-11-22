@@ -48,9 +48,9 @@ test('sudo and system service changes ask under full-auto, reads do not', () => 
   assert.equal(serviceDanger(['git', 'log']), undefined);
 });
 
-test('no_push_deploy projects ask for pushes and deploys; others do not', () => {
+test('0.4.0: no_push_deploy is a no-op; pushes and deploys are allowed', () => {
   for (const command of ['git push', 'git push origin feature', 'git -C . push -u origin x', 'gh pr create --fill', 'railway up', 'vercel --prod', 'eas submit -p ios', 'docker push img', 'npm publish', 'rsync -a dist/ host:/srv/app', 'fly deploy'])
-    assert.notDeepEqual(check(command, P, noDeploy), [], command);
+    assert.deepEqual(check(command, P, noDeploy), [], command);
   for (const command of ['git commit -m x', 'git fetch', 'gh pr view 1', 'railway logs', 'docker build .', 'npm test'])
     assert.deepEqual(check(command, P, noDeploy), [], command);
   assert.deepEqual(check('git push origin feature'), []);
@@ -76,4 +76,24 @@ test('full-auto external_directory: read-only tools anywhere but credentials and
   assert.equal(decide('shell', [`${root}/web/*`], { command: 'cd backend && npx tsc --noEmit; cd ../web && npx tsc --noEmit 2>&1 | tail -3' }), 'allow');
   assert.equal(decide('shell', ['/opt/x/*'], { command: 'sudo ls /opt/x' }), 'ask');
   assert.equal(decide('shell', [`${OTHER}/*`], { command: `cat ${OTHER}/notes.md` }), 'ask');
+});
+
+// 0.4.0: cd T; cmd keeps T exact; only hard-deny classes stop commands.
+import { fullAutoShellCheck as fasc040, hardDenyReasons as hdr040, toolOutputFileRead as tofr040 } from '../plugins/v2/full-auto.mjs';
+import { test as test040 } from 'node:test';
+import assert040 from 'node:assert/strict';
+import fs040 from 'node:fs'; import os040 from 'node:os'; import path040 from 'node:path';
+test040('0.4.0: cd sub; cmd > ../x resolves inside the project; hard denies classified', () => {
+  const root = fs040.mkdtempSync(path040.join(os040.tmpdir(), 'r40-')).replace(/^\/tmp/, '/tmp');
+  const proj = path040.join(root, 'proj'); fs040.mkdirSync(path040.join(proj, 'mobile'), { recursive: true });
+  const project = { directory: proj, roots: [proj] };
+  for (const c of ['cd mobile; npx tsc > ../.review/receipts/s6/tsc.txt', 'cd mobile\nnpx tsc > ../.review/receipts/s6/tsc.txt'])
+    assert040.deepEqual(hdr040(fasc040(c, proj, project)), []);
+  for (const [c, rule] of [['git push --force origin main', 'history'], ['git rebase -i HEAD~3', 'history'], ['git reset --hard origin/main', 'history'], ['rm -rf /etc/x', 'delete'], ['cat .env', 'secret'], ['cat /home/box/work/ocharness/state/x', 'secret']])
+    assert040.equal(hdr040(fasc040(c, proj, project))[0]?.rule, rule, c);
+  for (const c of ['git push origin main', 'railway up', 'git reset --hard HEAD', 'git commit -qm x'])
+    assert040.deepEqual(hdr040(fasc040(c, proj, project)), [], c);
+  assert040.equal(tofr040('read', '/home/box/work/ocharness/xdg/data/opencode/tool-output/tool_abc123'), true);
+  assert040.equal(tofr040('glob', '/home/box/work/ocharness/xdg/data/opencode/tool-output/tool_abc123'), false);
+  assert040.equal(tofr040('read', '/home/box/work/ocharness/xdg/data/opencode/tool-output'), false);
 });
