@@ -104,9 +104,21 @@ commit, apply `compat/claude-auth-3.0.0-subscription-only.patch` and then
 `compat/claude-auth-3.0.0-auth-recovery.patch`, verify the source hashes in both
 `*-baseline.json` files, and
 vendor the built directory (`package.json`, `index.mjs`, `dist/`, production
-`node_modules`). Recommended location: `<prefix>/vendor/claude-auth`, outside the
-hash-pinned release inventory (a file added under `releases/<version>/` fails
-`install.py` and staged-release verification).
+`node_modules`). Either keep it at `<prefix>/vendor/claude-auth`, outside the
+hash-pinned release inventory, or (since 0.4.1) carry it in the release:
+
+```
+python3 install.py --prefix <prefix> stage --source <checkout> --vendor-claude-auth <built-adapter-dir>
+```
+
+This copies the tree to `<release>/plugins/v2/claude-auth`, keeping symlinks as
+symlinks. It records the tree in `manifest.json` under `vendored` as one digest
+over every directory, file (sha256 and mode) and symlink target. Symlinks must be
+relative and stay inside the tree. Verification fails on any change. Do not copy
+an adapter into `releases/<version>/` by hand after staging: that tree is not in
+the manifest, so verification (and since 0.4.1 also `deploy --dry-run`) rejects
+it. Releases installed before 0.4.1 with a hand-copied adapter are still accepted
+as the existing `current`/`previous` rollback targets.
 
 When Anthropic is enabled, `configure.py` appends the adapter to the generated
 `plugins` list after the harness plugins. It uses, in order: `--claude-auth-plugin

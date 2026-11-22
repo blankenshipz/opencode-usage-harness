@@ -50,6 +50,11 @@ DENIED_SUFFIXES = (
     ".sqlite3", ".swp", ".tmp",
 )
 VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]*$")
+# Built third-party trees that may be carried inside a release.  They are not
+# source payload (npm's node_modules has relative symlinks such as .bin/*), so
+# the manifest records each as one tree digest under "vendored" instead of per
+# file.  Symlinks must be relative and stay inside the vendored tree.
+VENDOR_PATHS = {"plugins/v2/claude-auth"}
 
 
 class InstallError(RuntimeError):
@@ -177,10 +182,77 @@ def read_manifest(release: Path) -> list[dict[str, object]]:
     return files
 
 
-def validate_release(release: Path) -> list[dict[str, object]]:
+def vendored_tree_digest(root: Path) -> tuple[str, int]:
+    """Digest of a vendored tree: every dir, file (sha256 + mode) and symlink.
+
+    Symlinks are never followed; each must be relative and point inside root
+    (checked lexically; every link in the tree is confined, so chains are too).
+    """
+    if root.is_symlink() or not root.is_dir():
+        fail("vendored tree is not a real directory: %s" % root)
+    digest = hashlib.sha256()
+    count = 0
+    base = os.path.realpath(root)
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        names = sorted(dirnames + filenames)
+        for name in names:
+            path = Path(directory) / name
+            rel = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                target = os.readlink(path)
+                resolved = os.path.normpath(os.path.join(base, os.path.dirname(rel), target))
+                if os.path.isabs(target) or (resolved != base and not resolved.startswith(base + os.sep)):
+                    fail("vendored symlink escapes its tree: %s" % rel)
+                record = "L\0%s\0%s" % (rel, target)
+            elif path.is_dir():
+                record = "D\0%s" % rel
+            elif path.is_file():
+                record = "F\0%s\0%s\0%o" % (rel, sha256(path), stat.S_IMODE(path.stat().st_mode))
+            else:
+                fail("vendored tree contains a non-regular entry: %s" % rel)
+            digest.update(record.encode("utf-8", "surrogateescape") + b"\n")
+            count += 1
+        # os.walk lists symlinked directories in dirnames but never descends into them.
+    return digest.hexdigest(), count
+
+
+def read_vendored(release: Path) -> list[dict[str, object]]:
+    try:
+        vendored = json.loads((release / "manifest.json").read_text(encoding="utf-8")).get("vendored", [])
+    except (OSError, ValueError, AttributeError) as error:
+        fail("release manifest is corrupt: %s" % error)
+    if not isinstance(vendored, list):
+        fail("release manifest vendored list is invalid")
+    seen: set[str] = set()
+    for record in vendored:
+        if (not isinstance(record, dict) or set(record) != {"path", "tree_sha256", "entries"} or
+                record["path"] not in VENDOR_PATHS or record["path"] in seen or
+                not isinstance(record["tree_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", record["tree_sha256"]) or
+                not isinstance(record["entries"], int)):
+            fail("release manifest has an invalid vendored record")
+        seen.add(str(record["path"]))
+    return vendored
+
+
+def validate_release(release: Path, legacy_vendor_ok: bool = False) -> list[dict[str, object]]:
+    """Verify a release against its manifest, including vendored trees.
+
+    legacy_vendor_ok is only for releases already installed before 0.4.1 (the
+    outgoing current/previous pointers): a hand-vendored adapter at a
+    VENDOR_PATHS location that the manifest does not record is accepted when
+    its symlinks are confined to it.  Releases being staged or deployed are
+    always checked strictly.
+    """
     if release.is_symlink() or not release.is_dir():
         fail("release is not a real directory")
     files = read_manifest(release)
+    vendored = {str(record["path"]): record for record in read_vendored(release)}
+    if legacy_vendor_ok:
+        for name in VENDOR_PATHS - set(vendored):
+            if (release / name).is_dir() and not (release / name).is_symlink():
+                vendored_tree_digest(release / name)
+                vendored[name] = {"path": name, "legacy": True}
     expected: set[str] = set()
     for record in files:
         if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
@@ -192,20 +264,46 @@ def validate_release(release: Path) -> list[dict[str, object]]:
         if name in expected or not re.fullmatch(r"[0-9a-f]{64}", digest):
             fail("release manifest is invalid")
         expected.add(name)
+        if any(name == root or name.startswith(root + "/") for root in vendored):
+            fail("release manifest lists a file inside a vendored tree: %s" % name)
         file_path = release / name
         if (file_path.is_symlink() or not file_path.is_file() or
                 sha256(file_path) != digest or stat.S_IMODE(file_path.stat().st_mode) != mode):
             fail("release file does not match manifest: %s" % name)
+    for name, record in vendored.items():
+        if record.get("legacy"):
+            continue
+        digest, count = vendored_tree_digest(release / name)
+        if digest != record["tree_sha256"] or count != record["entries"]:
+            fail("vendored tree does not match manifest: %s" % name)
     actual: set[str] = set()
-    for item in release.rglob("*"):
-        rel = item.relative_to(release).as_posix()
-        if item.is_symlink() or (not item.is_dir() and not item.is_file()):
-            fail("release contains unsupported entry: %s" % rel)
-        if item.is_file():
-            actual.add(rel)
+    for directory, dirnames, filenames in os.walk(release, followlinks=False):
+        for name in sorted(dirnames + filenames):
+            item = Path(directory) / name
+            rel = item.relative_to(release).as_posix()
+            if rel in vendored:
+                continue
+            # Bytecode Python writes next to a release's own modules at runtime;
+            # never packaged (scan_source skips it), so ignored here too.
+            if (not item.is_symlink() and ((name == "__pycache__" and item.is_dir()) or
+                                           (item.is_file() and name.endswith(".pyc") and Path(directory).name == "__pycache__"))):
+                continue
+            if item.is_symlink() or (not item.is_dir() and not item.is_file()):
+                fail("release contains unsupported entry: %s%s" % (rel, vendor_hint(rel)))
+            if item.is_file():
+                actual.add(rel)
+        dirnames[:] = [d for d in dirnames if (Path(directory) / d).relative_to(release).as_posix() not in vendored]
     if actual != expected | {"manifest.json"}:
-        fail("release inventory contains unknown or missing files")
+        unknown = sorted(actual - expected - {"manifest.json"})[:3]
+        fail("release inventory contains unknown or missing files%s" % (": %s%s" % (", ".join(unknown), vendor_hint(unknown[0])) if unknown else ""))
     return files
+
+
+def vendor_hint(rel: str) -> str:
+    for root in VENDOR_PATHS:
+        if rel == root or rel.startswith(root + "/"):
+            return " (an adapter copied in after staging is not in the manifest; stage with --vendor-claude-auth DIR)"
+    return ""
 
 
 def atomic_link(link: Path, target: Path) -> None:
@@ -234,7 +332,7 @@ def link_target(prefix: Path, name: str, required: bool = False) -> Path | None:
         target.relative_to(releases)
     except ValueError:
         fail("%s does not point inside releases" % name)
-    validate_release(target)
+    validate_release(target, legacy_vendor_ok=True)
     return target
 
 
@@ -275,10 +373,19 @@ def wrappers(prefix: Path, directory: str = "bin") -> None:
         os.replace(temp, destination)
 
 
-def install(prefix: Path, source: Path, stage_only: bool = False) -> str:
+def install(prefix: Path, source: Path, stage_only: bool = False, vendor: dict[str, Path] | None = None) -> str:
     if platform.system() not in {"Darwin", "Linux"}:
         fail("this installer supports macOS and Linux only")
     version, inventory = scan_source(source)
+    vendor = dict(vendor or {})
+    vendored: list[dict[str, object]] = []
+    for name, tree in sorted(vendor.items()):
+        if name not in VENDOR_PATHS:
+            fail("not a vendorable path: %s" % name)
+        if any(str(record["path"]).startswith(name + "/") or record["path"] == name for record in inventory):
+            fail("source already contains %s; refusing to vendor over it" % name)
+        digest, count = vendored_tree_digest(tree)
+        vendored.append({"path": name, "tree_sha256": digest, "entries": count})
     lock = lock_prefix(prefix)
     try:
         releases = prefix / "releases"
@@ -288,7 +395,7 @@ def install(prefix: Path, source: Path, stage_only: bool = False) -> str:
         destination = releases / version
         if destination.exists() or destination.is_symlink():
             installed = validate_release(destination)
-            if installed != inventory:
+            if installed != inventory or read_vendored(destination) != vendored:
                 fail("source differs from the installed release with the same VERSION")
         else:
             temporary = releases / (".%s.%s" % (version, uuid.uuid4().hex))
@@ -299,7 +406,15 @@ def install(prefix: Path, source: Path, stage_only: bool = False) -> str:
                     target = temporary / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source / relative, target)
-                (temporary / "manifest.json").write_text(json.dumps({"version": version, "files": inventory}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+                for record in vendored:
+                    target = temporary / str(record["path"])
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(vendor[str(record["path"])], target, symlinks=True)
+                manifest = {"version": version, "files": inventory}
+                if vendored:
+                    manifest["vendored"] = vendored
+                (temporary / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+                # Re-verifies the copied vendored trees against the digests taken from the originals.
                 validate_release(temporary)
                 os.replace(temporary, destination)
             except Exception:
@@ -670,14 +785,22 @@ def deploy(prefix: Path, args, probe=None, runner=default_runner, sleep=time.sle
     release = prefix / "releases" / args.release
     if not release.is_dir() or release.is_symlink():
         fail("no staged release %s" % args.release)
-    if args.dry_run:
-        for number, step in enumerate(deploy_plan(context, args.release, args), 1):
-            print("%d. %s" % (number, step))
-        return 0
+    # The dry run runs the same preflight as a real deploy (projects, release
+    # verification, current/previous pointers), so a plan that passes here does
+    # not fail verification later.  Only the idle probe and the switch are skipped.
     if not context.projects and not args.force:
         print("deploy refused: no projects (--project, HARNESS_DEPLOY_PROJECTS or full_auto_projects in %s); "
               "pending asks cannot be checked, use --force to override" % context.state_dir, file=sys.stderr)
         return DEPLOY_BUSY_EXIT
+    if not args.skip_validate:
+        validate_release(release)
+        link_target(prefix, "current")
+        link_target(prefix, "previous")
+    if args.dry_run:
+        print("0. preflight: %s" % ("release, current and previous verified against their manifests" if not args.skip_validate else "release verification skipped (--skip-validate)"))
+        for number, step in enumerate(deploy_plan(context, args.release, args), 1):
+            print("%d. %s" % (number, step))
+        return 0
     probe_fn = probe or (lambda: default_probe(context, runner))
 
     def still_idle(stage: str) -> bool:
@@ -691,8 +814,6 @@ def deploy(prefix: Path, args, probe=None, runner=default_runner, sleep=time.sle
     if reasons and not args.force:
         print("deploy refused, busy: %s" % "; ".join(reasons), file=sys.stderr)
         return DEPLOY_BUSY_EXIT
-    if not args.skip_validate:
-        validate_release(release)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     restart_id = re.sub(r"[^A-Za-z0-9._:-]", "-", "deploy-%s-%s" % (stamp, args.release))[:80]
     lock = lock_prefix(prefix)
@@ -804,6 +925,8 @@ def parser() -> argparse.ArgumentParser:
     for name in ("install", "update", "stage"):
         command = sub.add_parser(name)
         command.add_argument("--source", required=True, help="reviewed local source checkout")
+        command.add_argument("--vendor-claude-auth", type=Path, metavar="DIR",
+                             help="built opencode-claude-auth tree to carry as plugins/v2/claude-auth (recorded in the manifest as a tree digest)")
     command = sub.add_parser("activate")
     command.add_argument("--version", required=True)
     command.add_argument("--provenance", type=Path, required=True)
@@ -840,7 +963,8 @@ def main(argv: list[str] | None = None) -> int:
         prefix = checked_prefix(args.prefix)
         state = checked_state(args.state_dir)
         if args.command in {"install", "update", "stage"}:
-            version = install(prefix, Path(args.source).expanduser(), stage_only=args.command == "stage")
+            vendor = {"plugins/v2/claude-auth": args.vendor_claude_auth.expanduser()} if args.vendor_claude_auth else None
+            version = install(prefix, Path(args.source).expanduser(), stage_only=args.command == "stage", vendor=vendor)
             print(("staged %s" if args.command == "stage" else "installed %s") % version)
         elif args.command == "activate":
             print("activated %s" % activate(prefix, args.version, args.provenance))

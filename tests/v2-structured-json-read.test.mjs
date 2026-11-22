@@ -70,7 +70,10 @@ test('rejects mutation after opening and symlink retargets', async t => {
   let mutate = true;
   const fsMutation = { ...fs, open: async (...args) => {
     const handle = await fs.open(...args); const read = handle.read.bind(handle);
-    handle.read = async (...readArgs) => { if (mutate) { mutate = false; await fs.writeFile(h.file, '{"a":2}'); } return read(...readArgs); };
+    // Same-size rewrite. Kernel file timestamps are clock-tick coarse, so a rewrite
+    // within one tick can leave mtime/ctime unchanged; move mtime explicitly so
+    // the stamp check is exercised deterministically (it was flaky without this).
+    handle.read = async (...readArgs) => { if (mutate) { mutate = false; await fs.writeFile(h.file, '{"a":2}'); const later = new Date(Date.now() + 10_000); await fs.utimes(h.file, later, later); } return read(...readArgs); };
     return handle;
   } };
   const tool = createStructuredJSONRead({ directory: h.directory, fs: fsMutation, nativeRead: h.nativeRead });

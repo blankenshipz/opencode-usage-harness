@@ -727,6 +727,8 @@ harness-manage status
 harness-manage rollback
 ```
 
+To carry a built Claude OAuth adapter inside the release, add `--vendor-claude-auth DIR` to `stage`, `install` or `update` (0.4.1; see [CLAUDE-SUBSCRIPTION.md](docs/CLAUDE-SUBSCRIPTION.md#installing-the-artifact-and-generating-the-plugin-entry)). `harness-manage deploy --dry-run` runs the same release verification as a real deploy ([MAINTENANCE-RECOVERY.md](docs/MAINTENANCE-RECOVERY.md#restart-safe-deploy-harness-manage-deploy)).
+
 Updates use the new source's `VERSION`; changed content cannot replace an already-installed version. Files are staged, hashed, and activated through an atomic `current` symlink. `previous` retains a rollback target. State, OAuth credentials, project files, and active services are not updated or restarted. Source manifests detect local corruption; **they are not cryptographic publisher signatures**. Obtain releases from a trusted repository and verify release checksums.
 
 Agent profiles refer to the release from which they were generated. Updating toolkit code alone does not switch active plugin paths. At a planned idle point, back up state, regenerate/review the profile with the new release's `configure.py --replace`, and explicitly restart the compatible service. Rollback of code does not roll back profile or state: restore the corresponding profile backup too. Do not downgrade a database schema blindly.

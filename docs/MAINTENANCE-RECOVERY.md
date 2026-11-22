@@ -54,8 +54,15 @@ waiver. The independent review remains outstanding until it actually runs.
 
 ```
 harness-manage deploy 0.4.0 --project /path/a --project /path/b --wait 1800 --restart
-harness-manage deploy 0.4.0 --dry-run --restart     # print the plan, change nothing
+harness-manage deploy 0.4.0 --dry-run --restart     # verify, print the plan, change nothing
 ```
+
+0. Preflight, shared by `--dry-run` and a real deploy (since 0.4.1): the project
+   check, strict manifest verification of the release (including a vendored
+   adapter, see [CLAUDE-SUBSCRIPTION.md](CLAUDE-SUBSCRIPTION.md#installing-the-artifact-and-generating-the-plugin-entry)),
+   and verification of the `current` and `previous` releases. If the dry run
+   passes, the real deploy cannot fail verification later. `--skip-validate`
+   skips this step, and the dry run says so.
 
 1. Idle check: no pending permission asks (`opencode api GET /api/permission/request`
    per project, JSON parsed) and no busy sessions (read-only `session_v2` query on

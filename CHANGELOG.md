@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.1 — vendored adapter in the release manifest, dry run verifies like a real deploy (r40d)
+
+The 0.4.0 deploy failed at release verification after its dry run had passed: staging copied the live claude-auth adapter into the release afterwards, its `node_modules/.bin` symlinks were not in `manifest.json`, and `deploy --dry-run` did not run verification.
+
+- **`stage`/`install`/`update --vendor-claude-auth DIR`** carries a built opencode-claude-auth tree as `plugins/v2/claude-auth`. Symlinks are copied as symlinks. The manifest records the tree under `vendored` as a single digest over every directory, file (sha256 and mode) and symlink target. Every symlink must be relative and stay inside the tree, otherwise staging is refused. A changed file, or an added or removed entry, fails verification. Restaging the same version with a different adapter is refused.
+- **`deploy --dry-run` runs the same preflight as a real deploy:** the project check, strict verification of the release, and verification of the `current` and `previous` pointers. Only the idle probe and the switch are skipped. Plan line `0.` reports the result; `--skip-validate` says that verification was skipped.
+- **Releases installed before 0.4.1:** a hand-vendored adapter at `plugins/v2/claude-auth` that the manifest does not record is accepted only for the existing `current`/`previous` pointers (deploy, rollback, status), and only if its symlinks are confined to it. A release that is being staged or deployed must record it.
+- **Verification ignores `__pycache__/*.pyc`** that Python writes at runtime inside a release (live 0.3.4 had `src/__pycache__`). Any other file there is still unknown payload. Unknown-file errors now name up to three paths and point at `--vendor-claude-auth` when the path is inside the adapter.
+- **Test flake:** `v2-structured-json-read` "rejects mutation after opening and symlink retargets" failed when its same-size rewrite landed within one coarse kernel timestamp tick. This was not a regression; the plugin was unchanged. The test now moves mtime explicitly. A same-size rewrite within one tick is a documented limit of the stat-stamp check.
+- New `tests/test_vendored_release.py`, which reproduces the r40c failure: the dry run and the real deploy now fail with the same error.
+
 ## 0.4.0 — auto-approve by default, guard fixes, review quality, quota gate (r40)
 
 Zach's decision (2026-11-22): "let's not need approvals, let's bias to auto-approve mode". This overrides the ask-timeout and Harny-as-approver items of the parity plan (`parity-plan.md` 4.4, 5.1).
