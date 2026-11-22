@@ -36,6 +36,18 @@ The first 0.4.0 build (`b2897a9`) was not tagged or deployed: Fable found 8 High
 - **Unlisted-project fallback (M5).** The fallback is realpath-resolved and refuses `/`, `/home`, `/workspace`, `/opt`, `/etc`, `/usr`, `/var`, `/tmp` and anything containing `$HOME`, `$HOME/work` or `/workspace`.
 - **Not fixed: M6.** After `cd X;`, later segments are judged in `X` only, so a `cd` that fails at runtime is not modelled.
 
+### Second Fable review fixes (r40c, before release)
+
+The second 0.4.0 build (`2d599f9`) was not tagged or deployed: the second Fable review found five High classifier gaps. All are fixed in `hardExtras2` (`plugins/v2/full-auto.mjs`), with about 110 new cases in `tests/v2-hard-deny.test.mjs`.
+- **Secret prints:** bare `env` (also `env | sort`, `env | grep -v secret`), `export -p`, `declare -p`, `printenv SECRET_NAME`, `echo`/`printf`/here-strings of secret-named variables (`$GH_PAT`, `$DATABASE_URL`, `${!X}`), secret variables in a curl URL or body, `< /proc/self/environ`, `gh auth status --show-token`, `git credential fill`, shell history files and `/etc/shadow`. Secret names are judged by name parts (`TOKEN_COUNT`, `KEYBOARD`, `total_tokens` stay allowed); `curl -H "Authorization: Bearer $TOKEN"` stays allowed.
+- **Secret reads/uploads:** brace expansion (`cat .en{v,}`); curl `-F f=@file`, `-F "f=<file"`, `--data-urlencode x@file`, `-T file`, `--data @file`, stdin uploads (`-T -`, `@-`) fed by `< .env`, and non-literal upload names. Reader globs are matched against secret file names (`cat *.md` is no longer a false deny).
+- **Symlinks:** a write or delete after `ln -s` to a target outside the project is denied; `cd` targets and `..` are resolved physically (realpath), so pre-existing symlinks are judged by where they point.
+- **Interpreters and git environment:** inline code of `python -c`/heredoc, `node -e`, `ruby -e`, `perl -e/-E`, `php -r`, `deno eval`, `bun -e` is inspected for shell-outs (string literals re-checked as commands, a non-literal shell-out is denied), deletes/overwrites (path literals judged; no literal: deny) and environment prints; aliases are re-checked; `GIT_DIR`/`GIT_WORK_TREE` outside the project, `GIT_CONFIG_*`, `--work-tree`/`--git-dir`, `-c` and `git config` of `alias.*`, `remote.*.push`/`mirror`, `push.default`, `pull.rebase` are denied; an unknown git subcommand is looked up as an alias and re-checked.
+- **Overwrites outside the project or `/tmp`:** `cp`/`mv`/`install`/`ln -f` destinations (incl. `-t DIR`), `tee` (not `-a`), `sed -i`, `perl -i`, `dd of=`, `truncate`. `dd of=/tmp/x` is no longer a false deny.
+- **M6 (partial):** a `cd` keeps later `;` segments in the target only if the directory exists and is enterable now; a cd to a missing directory judges both directories.
+- **Workrelay:** the committed test temp directory `tests/.bound-attestation-*/` is removed and ignored (no credentials in it).
+- Known limits are listed in the README ("Hard-deny known limits").
+
 ## 0.3.4 — protected reads, source files named like secrets (r37)
 
 Two fixes from the r36 log review.

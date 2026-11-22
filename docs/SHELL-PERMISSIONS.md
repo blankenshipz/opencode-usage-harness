@@ -327,3 +327,7 @@ Other paths changed in the same round:
   - it never approves.
 - **Unlisted-project fallback** (`defaultFullAutoProject`): the directory is resolved with realpath first. These are refused: `/`, `/home`, `/workspace`, `/opt`, `/etc`, `/usr`, `/var`, `/tmp` itself, and anything that equals or contains `$HOME`, `$HOME/work` or `/workspace`.
 - **Known limit:** after `cd X;` (`;`, not `&&`), later segments are judged in `X` only (Fable r40 M6). A `cd` that fails at runtime leaves the command running in the base directory.
+
+### 0.4.0 classifier additions (second review fix round, r40c)
+
+`hardExtras2` adds: environment and secret-variable prints (`env`, `export -p`, `printenv NAME`, `echo $GH_PAT`, here-strings, curl URLs/bodies), brace-expanded and curl-uploaded secret files (`-F @`/`<`, `--data-urlencode x@`, `-T`, `--data @`, stdin from `< .env`), writes and deletes after an `ln -s` that points outside the project, physical resolution of `cd` and `..`, inline interpreter code (shell-outs re-checked, path literals judged, non-literal targets denied), aliases and git aliases re-checked, git environment (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_*`, `--work-tree`, `--git-dir`) and push-changing config (`alias.*`, `remote.*.push|mirror`, `push.default`, `pull.rebase`), and overwrites outside the project or `/tmp` by `cp`, `mv`, `install`, `ln -f`, `tee`, `sed -i`, `perl -i`, `dd of=`, `truncate`. See README "Hard-deny known limits".

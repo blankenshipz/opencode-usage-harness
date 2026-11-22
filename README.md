@@ -598,6 +598,16 @@ See the [native and multi-pool workflow](docs/NATIVE-AND-MULTI-POOL.md) and the
 [architecture and runnable fixture example](docs/SUBSCRIPTION-POOLS.md).
 This planning foundation is scheduled for 0.2.0 and is not in the v0.1.0 release.
 
+## Hard-deny known limits
+
+The 0.4.0 hard-deny classifier (`hardDenyCheck`) parses the command; it is a guard against plausible accidents, not a sandbox. Known gaps, accepted for 0.4.0:
+- Programs that do their work from a script file (`python3 tool.py`, `npm run x`, a Makefile) are not inspected; only inline code (`-c`, `-e`, heredoc) is.
+- Inline code that builds a command or path at runtime from pieces (string concatenation, `base64` decoding, `chr()`), or that reads secrets without printing them obviously, can evade the literal checks.
+- Git aliases are resolved from the current repository's config only when the shell's directory is known; `include.path` files and system config written outside the command are not followed.
+- Symlinks are resolved at check time; a link swapped between the check and the run is not seen. Commands that change directory in loops or functions are judged by the union of directories, or denied when unknown.
+- Secret-variable names are recognised by name parts (`TOKEN`, `KEY`, `SECRET`, `PAT`, `PASSWORD`, `*_URL` of databases); a secret in an innocently named variable is not.
+- `>>`, `tee -a` and other appends outside the project are allowed (they do not delete); `rsync` without `--delete` into an outside directory is allowed.
+
 ## Remaining work and next steps
 
 The next milestones are:
