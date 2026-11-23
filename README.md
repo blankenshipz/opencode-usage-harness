@@ -114,6 +114,7 @@ The generated profile in [configure.py](configure.py) maps roles as follows:
 | `harness-scout` | FAST | Focused repository exploration and summaries; no shell, edits or delegation. |
 | `harness-quick-builder` | FAST | Mechanical fixes, small localized changes and straightforward tests. |
 | `harness-builder` | BALANCED | Ordinary implementation and feature work. |
+| `harness-senior-builder` | STRONG | High-risk implementation (security policy, concurrency, locking) and rework after a second `needs_fixes`; never dispatched while the weekly quota brake is on. |
 | `harness-deep-debugger` | STRONG | Ambiguous failures and difficult debugging. |
 | `harness-architect` | STRONG | Design and consequential analysis; no shell or edits. |
 | `harness-reviewer` | STRONG | Correctness, regression and risk review; no shell or edits. |
@@ -598,6 +599,14 @@ See the [native and multi-pool workflow](docs/NATIVE-AND-MULTI-POOL.md) and the
 [architecture and runnable fixture example](docs/SUBSCRIPTION-POOLS.md).
 This planning foundation is scheduled for 0.2.0 and is not in the v0.1.0 release.
 
+## Quota gate for launchers
+
+`node <harness>/bin/subscription-quota.mjs --gate` prints exactly `ok`, `slow` or `hold` from the cached Claude quota snapshot (no network call, always exit 0, fails open when the snapshot is missing or stale). Launchers can use it to hold off new work; the router uses the same weekly view for its brake (no raised builder effort while ahead, no `harness-senior-builder` while the brake is on). Every sample is logged to `<state>/telemetry/quota-throttle.jsonl`. See [usage controls](docs/USAGE-CONTROLS.md#shared-quota-gate).
+
+## Using the harness from Grok Bot
+
+Grok Bot agents reach the harness through [workrelay](https://github.com/blankenshipz/workrelay): start a session on `harness-router`, pass `agent` on every call, and get progress events (permission asks, auto-denies, finished, failed, stalled) on a webhook routine instead of polling. Because auto-approve is the default (see above), a session rarely waits for a human; a hard deny or the 15-minute timeout shows up as a resumable blocker and a `permission_auto_denied` event. The step-by-step workflow is in workrelay's README, section "Using from Grok Bot".
+
 ## Hard-deny known limits
 
 The 0.4.0 hard-deny classifier (`hardDenyCheck`) parses the command; it is a guard against plausible accidents, not a sandbox. Known gaps, accepted for 0.4.0:
@@ -706,11 +715,11 @@ The database is opened read-only. The public repository includes no database. Hi
 
 Read [COMPATIBILITY.md](docs/COMPATIBILITY.md) and [SETUP.md](docs/SETUP.md). The installer does **not** silently modify an existing OpenCode profile, choose account-specific model IDs, authenticate, buy credits, or install remote services.
 
-The generated public profile asks approval for unknown shell commands, pushes, deployments, and destructive actions. Reasoned one-use large-file grants do not require a separate confirmation. Existing file permissions still apply. For broader permissions, use `configure.py --shell-policy permissive`: it allows all shell commands except a dangerous-command ask list. The default is `allowlist`. A raw-command guard asks for redirects to secret-looking paths and for redirects the 2.0.30 shell parser drops; see [shell permissions](docs/SHELL-PERMISSIONS.md).
+Since 0.4.0 the generated profile is **auto-approve for every project** (see below). Reasoned one-use large-file grants do not require a separate confirmation. Existing file permissions still apply. `configure.py --shell-policy allowlist|permissive` still selects the native shell rule set, and a raw-command guard still forces a check for redirects to secret-looking paths and for redirects the 2.0.30 shell parser drops; see [shell permissions](docs/SHELL-PERMISSIONS.md).
 
-Full-auto projects (`configure.py --full-auto-project DIR`) allow shell, path and edit asks inside the project, but still ask for force pushes, history rewrites, deletes outside the project, disk writes and secret-looking paths. There are two narrow exceptions to the secret-path ask, both full-auto only: the value of docker's `--env-file` option (docker loads it into the containers), and, since 0.3.2, read-only access to exactly `/opt/wncscanner-docker/.env` over `ssh garage-server` with `cat`, `less`, `grep`, `stat` or `readlink` (the operator's standing rule, which also covers `systemctl cat/status wncscanner-stack`). Writes, copies or redirects of that file, other secret files in the same command, other hosts and local reads still ask, and any change to the `wncscanner-stack` service (`systemctl restart|stop|enable|edit|...`, writes to its unit file) now asks on every host. No OpenCode "always" pattern is saved for this. See [shell permissions](docs/SHELL-PERMISSIONS.md) for the exact conditions. Since 0.3.3 full-auto also asks for `sudo` and any system service change, and `--full-auto-no-deploy DIR` makes every push, publish and deploy ask in that project (set for yrdsale). Read-only tools may look outside the project except at credential paths and other projects' uncommitted files, and a foreground parent is released 30 s after a child's ask so it keeps working while a human answers. Since 0.3.4 full-auto reads and read-only shell ask for browser profile data (`Cookies`, `Login Data`, Chrome profile directories), `/home/box/work/agent-profiles` and the harness install itself, except `state/check-receipts`, the harness code and OpenCode shell output; source files named like secrets (`credentials.py`, `*Credentials.test.tsx`) are no longer treated as secrets.
+`configure.py --full-auto-project DIR` is still accepted, but every project is full-auto now, so listing one changes nothing. Inside the project, shell, path and edit asks are allowed. There are two narrow exceptions to the secret-path deny, both unchanged: the value of docker's `--env-file` option (docker loads it into the containers), and read-only access to exactly `/opt/wncscanner-docker/.env` over `ssh garage-server` with `cat`, `less`, `grep`, `stat` or `readlink` (the operator's standing rule, which also covers `systemctl cat/status wncscanner-stack`). Writes, copies or redirects of that file, other secret files in the same command, other hosts and local reads are denied. No OpenCode "always" pattern is saved for this. See [shell permissions](docs/SHELL-PERMISSIONS.md) for the exact conditions. Read-only tools may look outside the project except at credential paths and other projects' uncommitted files, and a foreground parent is released 30 s after a child's ask so it keeps working. Browser profile data (`Cookies`, `Login Data`, Chrome profile directories), `/home/box/work/agent-profiles` and the harness install itself (except `state/check-receipts`, the harness code and OpenCode shell output) count as protected locations; source files named like secrets (`credentials.py`, `*Credentials.test.tsx`) are not treated as secrets.
 
-**Since 0.4.0 auto-approve is the default for every project, listed or not**, including pushes and deploys; `--full-auto-no-deploy` is a no-op. The guard never asks. It hard-denies at once, with a resumable-blocker message, only force pushes and history rewrites, deletes outside the project or `/tmp` (and raw disk writes), and reads or exfiltration of secrets (the garage-server `.env` read-only exemption stays). Any ask that still stays pending is auto-denied after 15 minutes (`HARNESS_ASK_TIMEOUT_MS`). See [shell permissions](docs/SHELL-PERMISSIONS.md), "0.4.0".
+**Since 0.4.0 auto-approve is the default for every project, listed or not**, including pushes, deploys, `sudo` and service changes; `--full-auto-no-deploy` is a no-op. The guard never asks. It hard-denies at once, with a resumable-blocker message, only: force pushes and history rewrites; deletes outside the project or `/tmp` and raw disk writes; and reads or exfiltration of secrets (the garage-server `.env` read-only exemption stays). The denial names the rule and tells the agent to record a resumable blocker with the exact command, carry on with other work and not retry variants. Any ask that still stays pending is auto-denied, never approved, after 15 minutes (`HARNESS_ASK_TIMEOUT_MS`). Hard denies and timeouts are logged to `<state>/telemetry/permission-park.jsonl` as `ask_hard_denied` and `ask_timeout_denied`; workrelay turns those into a `permission_auto_denied` progress event when its `session_notify.permission_park_log` points at that file. The classifier has [known limits](#hard-deny-known-limits). See [shell permissions](docs/SHELL-PERMISSIONS.md), "0.4.0".
 
 For an explicitly authorized repository relocation, an operator can issue an expiring external-write grant to an existing worker. It is bound to the workspace, task, owner, intent revision, checks and destination. The dispatcher revalidates it on continuations and coordinates harness-managed destination ownership across workspaces; ordinary requests cannot grant themselves access by naming an absolute path. Native permissions still apply. This permits scoped destination work—it does not relocate sessions, copy files or approve publication automatically.
 
@@ -726,6 +735,16 @@ harness-manage status
 # If needed:
 harness-manage rollback
 ```
+
+For a live installation that serves running sessions, stage first and switch only when idle (`harness-manage` is `install.py` on your `PATH`):
+
+```sh
+harness-manage stage --source /absolute/path/to/new-release [--vendor-claude-auth DIR]
+harness-manage deploy <version-or-release-name> --dry-run --restart   # verify and print the plan; changes nothing
+harness-manage deploy <version-or-release-name> --wait 1800 --restart # switch only when no ask is pending and no session is busy
+```
+
+`deploy` backs up the profile, bridge config and gateway config, switches `current`, restarts the OpenCode service and gateway (`--restart`), warms plugins, then runs the workrelay resume hook (`resume-interrupted --all-interrupted`, owner from the bridge config or `--resume-owner`; `--resume-command ''` disables it). A failed config regeneration or restart rolls `current` back (exit 5); a project that does not load the new plugins exits 4 and is reported without rolling back. Details, exit codes and recovery: [MAINTENANCE-RECOVERY.md](docs/MAINTENANCE-RECOVERY.md#restart-safe-deploy-harness-manage-deploy).
 
 To carry a built Claude OAuth adapter inside the release, add `--vendor-claude-auth DIR` to `stage`, `install` or `update` (0.4.1; see [CLAUDE-SUBSCRIPTION.md](docs/CLAUDE-SUBSCRIPTION.md#installing-the-artifact-and-generating-the-plugin-entry)). `harness-manage deploy --dry-run` runs the same release verification as a real deploy ([MAINTENANCE-RECOVERY.md](docs/MAINTENANCE-RECOVERY.md#restart-safe-deploy-harness-manage-deploy)).
 

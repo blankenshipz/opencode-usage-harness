@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.2 — documentation only (2026-11-23)
+
+No code changes.
+
+- README: the permission section now matches 0.4.0 (auto-approve for every project, hard denies instead of asks, 15-minute auto-deny, `permission-park.jsonl` records and the workrelay `permission_auto_denied` event). Removed stale 0.3.x claims that full-auto still asks for pushes, `sudo`, service changes and protected reads, and that `--full-auto-no-deploy` makes pushes ask.
+- README: added `harness-senior-builder` to the role table, the `stage`/`deploy --dry-run`/`deploy --wait --restart` flow with the resume hook, a quota gate section, and a pointer to workrelay's "Using from Grok Bot" workflow.
+
 ## 0.4.1 — vendored adapter in the release manifest, dry run verifies like a real deploy (r40d)
 
 The 0.4.0 deploy failed at release verification after its dry run had passed: staging copied the live claude-auth adapter into the release afterwards, its `node_modules/.bin` symlinks were not in `manifest.json`, and `deploy --dry-run` did not run verification.
