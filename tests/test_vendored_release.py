@@ -31,6 +31,18 @@ def deploy_args(release, **overrides):
     return argparse.Namespace(**base)
 
 
+class FakeClock:
+    """Monotonic clock that only advances when the code under test sleeps."""
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
 class Runner:
     def __init__(self, release):
         self.release = release
@@ -84,10 +96,11 @@ class VendoredReleaseTests(unittest.TestCase):
 
     def deploy(self, release, **kw):
         out, err = io.StringIO(), io.StringIO()
+        clock = FakeClock()  # no-op sleep with the real clock would busy-spin the warm check for 60 s on a mismatch
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = INSTALL.deploy(self.prefix, deploy_args(release, project=[str(self.project)], root=str(self.root), **kw),
-                                      probe=lambda: {"pending": 0, "busy": 0}, runner=Runner(release), sleep=lambda s: None)
+                                      probe=lambda: {"pending": 0, "busy": 0}, runner=Runner(release), sleep=clock.sleep, clock=clock)
             except INSTALL.InstallError as error:
                 return 1, out.getvalue(), str(error)
         return code, out.getvalue(), err.getvalue()

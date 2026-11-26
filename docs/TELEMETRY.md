@@ -282,6 +282,27 @@ request at meaningful boundaries; they are not a background watchdog. Report the
 finding once, preserve ownership and receipts, and use native stop/recovery with
 appropriate authorization. There is no automatic restart, replacement, or retry.
 
+## Permission park log
+
+`<state>/telemetry/permission-park.jsonl` records native permission asks that reached a human
+(`outcome: "stalled"` on the first tick, `pendingMs` about 0), asks that released a waiting
+parent after 30 s (`outcome: "parked"`, `answerable: true`), and since 0.4.0 the auto-approve
+denials `ask_hard_denied` (immediate, never pending; `rule` names the hard-deny class) and
+`ask_timeout_denied` (15-minute safety net). Session and request IDs are internal; do not copy
+them, or raw commands, into reports.
+
+When counting it:
+
+- Cut stalled/parked counts at the 0.4.1 go-live (2026-11-22 17:50 America/New_York on the
+  live service), not at midnight. After go-live the log should be quiet except
+  `ask_hard_denied` / `ask_timeout_denied`. A stalled or parked line after that time is a
+  real ask that auto-approve did not decide and is worth investigating.
+- Lines written before 0.4.3 repeat each ask once per loaded project's plugin instance (2 to 5
+  copies on the live service). Count distinct `requestID` + `outcome`. Since 0.4.3 the logger
+  writes each outcome once per process.
+- `ask_hard_denied` lines from the auto-permission hook carry `permissionID: null` (the hook
+  runs before a permission ID exists) and are told apart by `callID`.
+
 ## Phase completion and measurement quality
 
 Before expensive release gates, prove the smallest requested user journey and run

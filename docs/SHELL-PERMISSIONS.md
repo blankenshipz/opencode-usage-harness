@@ -328,6 +328,15 @@ Other paths changed in the same round:
 - **Unlisted-project fallback** (`defaultFullAutoProject`): the directory is resolved with realpath first. These are refused: `/`, `/home`, `/workspace`, `/opt`, `/etc`, `/usr`, `/var`, `/tmp` itself, and anything that equals or contains `$HOME`, `$HOME/work` or `/workspace`.
 - **Known limit:** after `cd X;` (`;`, not `&&`), later segments are judged in `X` only (Fable r40 M6). A `cd` that fails at runtime leaves the command running in the base directory.
 
+### Reading `permission-park.jsonl` after 0.4.1
+
+An auto-approve audit (2026-11-25) found that the "stalls continued after auto-approve" reading came from the log window, not from missed approvals:
+
+- Cut stalled/parked counts at the 0.4.1 go-live (2026-11-22 17:50 America/New_York on the live service), not at midnight. Every stalled/parked line on Nov 22 predates go-live.
+- After go-live the log should contain only `ask_hard_denied` (immediate hard denies; never pending) and `ask_timeout_denied` lines. In the audited telemetry it held 3 `ask_hard_denied` lines (`credential_path` reads), with 0 stalled, 0 parked and 0 `decline_to_auto` in `auto-permission.jsonl`.
+- `outcome: "stalled"` means an ask reached a human. It is written on the first tick (`HARNESS_PARK_NOTIFY_MS` defaults to 0), so its `pendingMs` is about 0. It is not workrelay's `stalled` event, which means a busy session made no progress.
+- Before 0.4.3 every project's plugin instance logged every ask, so one ask produced 2 to 5 identical lines. Count distinct `requestID` + `outcome`. Since 0.4.3 the park logger keeps a process-wide record of the lines it has written.
+
 ### 0.4.0 classifier additions (second review fix round, r40c)
 
 `hardExtras2` adds: environment and secret-variable prints (`env`, `export -p`, `printenv NAME`, `echo $GH_PAT`, here-strings, curl URLs/bodies), brace-expanded and curl-uploaded secret files (`-F @`/`<`, `--data-urlencode x@`, `-T`, `--data @`, stdin from `< .env`), writes and deletes after an `ln -s` that points outside the project, physical resolution of `cd` and `..`, inline interpreter code (shell-outs re-checked, path literals judged, non-literal targets denied), aliases and git aliases re-checked, git environment (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_*`, `--work-tree`, `--git-dir`) and push-changing config (`alias.*`, `remote.*.push|mirror`, `push.default`, `pull.rebase`), and overwrites outside the project or `/tmp` by `cp`, `mv`, `install`, `ln -f`, `tee`, `sed -i`, `perl -i`, `dd of=`, `truncate`. See README "Hard-deny known limits".

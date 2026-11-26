@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createParkMonitor, installParkYield, parkedResult, NOTIFY_AFTER_MS, PARK_AFTER_MS } from '../plugins/v2/park-yield.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createParkMonitor, installParkYield, parkedResult, parkLogger, NOTIFY_AFTER_MS, PARK_AFTER_MS } from '../plugins/v2/park-yield.mjs';
 
 test('stalled at 10 min, parked at 30 min, logged once each, never replies', async () => {
   let at = 0; const logs = [];
@@ -81,4 +84,36 @@ test('0.3.3: stall is logged at once and the parent is released after 30 s', asy
   m.asked({ id: 'per_z', sessionID: 's', action: 'shell', since: 0 });
   await m.tick(); assert.deepEqual(logged.map(r => r.outcome), ['stalled']);
   at = 30_000; await m.tick(); assert.deepEqual(logged.map(r => r.outcome), ['stalled', 'parked']);
+});
+
+// 0.4.3: on the live service each project's plugin instance (a separate module instance in one process)
+// saw every ask, so one ask produced 2 to 5 identical stalled and parked lines.
+test('park log writes each ask outcome once across plugin module instances', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'park-log-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'permission-park.jsonl');
+  const other = await import('../plugins/v2/park-yield.mjs?second-plugin-instance');
+  assert.notEqual(other.createParkMonitor, createParkMonitor, 'a separate module instance, as in the live service');
+  let at = 0;
+  const monitors = [createParkMonitor({ now: () => at, log: parkLogger({ file }), askTimeout: 0 }),
+    other.createParkMonitor({ now: () => at, log: other.parkLogger({ file }), askTimeout: 0 }),
+    createParkMonitor({ now: () => at, log: parkLogger({ file }), askTimeout: 0 })];
+  for (const m of monitors) { m.asked({ id: 'per_dup', sessionID: 'child', action: 'shell', since: 0 }); m.asked({ id: 'per_two', sessionID: 'child', action: 'read', since: 0 }); }
+  at = NOTIFY_AFTER_MS; for (const m of monitors) assert.equal((await m.tick()).length, 2, 'each monitor still tracks the ask');
+  at = PARK_AFTER_MS; for (const m of monitors) await m.tick();
+  const lines = fs.readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(lines.map(l => `${l.requestID}:${l.outcome}`).sort(), ['per_dup:parked', 'per_dup:stalled', 'per_two:parked', 'per_two:stalled']);
+});
+
+test('park log dedupe keeps distinct hard denies and records without an ID', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'park-log-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'permission-park.jsonl'), log = parkLogger({ file });
+  // Hook hard denies carry permissionID null; the call ID tells them apart.
+  const deny = (callID, rule = 'credential_path') => ({ at: 'x', event: 'ask_hard_denied', sessionID: 's', permissionID: null, callID, rule, action: 'external_directory', source: 'auto_permission' });
+  log(deny('call_1')); log(deny('call_2')); log(deny('call_1')); parkLogger({ file })(deny('call_2'));
+  // Same call, different rule: two distinct denies, both kept (Fable L3); a repeat is still dropped.
+  log(deny('call_1', 'destructive_git')); log(deny('call_1', 'destructive_git'));
+  log({ at: 'x', event: 'ask_hard_denied', sessionID: 's' }); log({ at: 'x', event: 'ask_hard_denied', sessionID: 's' });
+  const other = path.join(dir, 'other.jsonl'); parkLogger({ file: other })(deny('call_1'));
+  assert.equal(fs.readFileSync(file, 'utf8').trim().split('\n').length, 5);
+  assert.equal(fs.readFileSync(other, 'utf8').trim().split('\n').length, 1, 'scoped per log file');
 });

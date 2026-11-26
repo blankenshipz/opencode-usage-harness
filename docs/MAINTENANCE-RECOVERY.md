@@ -86,13 +86,30 @@ harness-manage deploy 0.4.0 --dry-run --restart     # verify, print the plan, ch
 6. With `--restart`: stops the gateway (`gateway/gateway.pid`), runs
    `opencode service stop` and `start`, and runs `gateway/start-gateway.sh`.
    If that fails, `current` is rolled back to the old release (exit 5).
-7. Warms each project's plugins (`GET /api/plugin` twice) and verifies the
-   release path is loaded; exit 4 when a project does not load it.
+7. Warms each project's plugins and verifies the release path is loaded. Since
+   0.4.3 it first waits for the restarted service: `GET /api/plugin` is retried
+   every 2 s, for up to 60 s in total across all projects, until it returns
+   parseable JSON. One more call then reports the loaded plugins, and it keeps
+   polling until the release path appears: within the shared 60 s, and for at
+   least 10 s per project once that project's `/api/plugin` has answered (so a
+   service that comes up late in the window still gives later projects time to
+   report). Exit 4 only when a project still does not load it after the wait.
+   Each call has its own 30 s timeout, so the worst case is somewhat longer than
+   60 s, but always bounded. (The 0.4.1 deploy exited 4
+   because both calls ran before the service was up; a minute later all projects
+   had loaded the release.)
 8. Resume hook: by default `python3 -m workrelay.cli --config <bridge>
    resume-interrupted --owner <owner> --restart-id deploy-<stamp>-<release>
    --all-interrupted` (owner: `--resume-owner` or `authorized_owner` in the bridge
    config; `PYTHONPATH=<workrelay>/src`). It runs only if its `--help` succeeds.
    `--resume-command` or `$HARNESS_DEPLOY_RESUME_COMMAND` override it; `""` disables.
+   It runs after step 7, so since 0.4.3, on a successful warm check, the service
+   has answered `/api/plugin` before the hook starts. The hook also runs when
+   step 7 ends in exit 4 (including when the service never answered), as in 0.4.2;
+   in that case re-run it by hand once the service is up. The 0.4.1 hook exit 2 (a workrelay `BridgeError`) was
+   most likely the same "service not up yet" cause. The hook itself is unchanged
+   and is not retried; re-run it by hand with the same `--restart-id` if needed
+   (it is idempotent per root).
 
 `<root>` defaults to the parent of the prefix; commands run with `<root>/env.sh`
 sourced and their output is never printed. Projects come from `--project` or

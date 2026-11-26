@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.3 — deploy warm check waits for the service, park log written once per ask, deterministic dispatch test (2026-11-25)
+
+No permission policy changes. Auto-approve and the three hard-deny rules (history rewrites, deletes outside the project or `/tmp`, secrets) are unchanged, and so is the 15-minute auto-deny.
+
+**Why the park log looked like auto-approve was still stalling.** A cross-stream review counted "73 stalled and 50 parked since Nov 22" in `permission-park.jsonl` and read it as stalls continuing under auto-approve. A recount of the live telemetry found no missed auto-approve:
+- The window started at midnight Nov 22. 0.4.1 went live at 17:50 America/New_York that day.
+- All 123 stalled/parked lines fall between 07:19 and 17:38 ET, on 0.3.4.
+- Those 123 lines are only 17 distinct asks. Every project's plugin instance logged every ask, 2 to 5 times each that day.
+- `stalled` is written on the first tick, with `pendingMs` 0. It means "a human was asked", not "hung".
+- After go-live the log holds only 3 `ask_hard_denied` lines. All are `credential_path` reads, denied at once and never pending.
+- After go-live there are 0 stalled, 0 parked and 0 `decline_to_auto` decisions in `auto-permission.jsonl`.
+- Replaying the 21 pre-go-live `decline_to_auto` asks through the 0.4.1 policy gives 16 allows and 5 hard denies. None would ask.
+
+So nothing in the policy needed fixing, and this release does not claim a stall fix.
+
+- **Park log written once per ask outcome (`park-yield.mjs`).** One `opencode serve` process loads a separate plugin module instance per project. Each instance has its own park monitor and sees every `permission.asked` event. `parkLogger` now keeps a process-wide registry, the same pattern as execution-timing, keyed by log file, session, request or permission or call ID, outcome or event, and rule and action. Each ask's `stalled`, `parked` and `ask_timeout_*` line is therefore written once. Hard denies (`permissionID` null) are told apart by `callID`, and records without any ID are always written. The monitors' behaviour is unchanged: each still tracks the ask, releases its waiting parents and runs the timeout deny.
+- **Deploy warm check waits for the restarted service (`install.py`).** `warm_and_verify` made its two `GET /api/plugin` calls immediately after `opencode service start`. On the 0.4.1 deploy that gave a false exit 4: the service was not up yet, and a minute later every project had loaded the release. The check now retries every 2 s, for up to 60 s in total, until `/api/plugin` returns parseable JSON. It then calls once more so the response reports the loaded plugins, and keeps polling until the release path appears: within the shared 60 s, and for at least 10 s per project once that project's `/api/plugin` has answered, so a service that comes up late in the window does not leave later projects with only two calls (Fable review M1). Each call keeps its 30 s timeout, so the worst case is somewhat over 60 s but bounded. Exit 4 means a project still does not load the release after the wait. Sleep and clock come from `deploy()`, so tests run instantly. The workrelay resume hook runs after this step, so on a successful warm check it starts only once the service answers. On exit 4 the hook still runs, as in 0.4.2. The 0.4.1 hook exit 2 was most likely the same cause. The hook itself is unchanged and not retried.
+- **`v2-external-dispatch` "global writer admission serializes destination and granted source" is deterministic.** In the destination-first order, the test raced both calls. In about half the runs the destination's child session existed before the source was checked. The source was then refused by the destination-quiescence check, a correct refusal but not the lease this test covers. The first call is now held inside the native subagent after its admission has reserved the global lease, and the second call must be refused with `global overlapping writer lease` without reaching native. The lease assertion is unchanged, plus a check that the denied call never reaches native. 15 of 15 runs pass. The old test failed intermittently; the failure rate seen during this work came from mixed and full-suite runs, and a later run of the file alone did not reproduce it (0 of 12).
+- **Docs:**
+  - TELEMETRY: new "Permission park log" section.
+  - SHELL-PERMISSIONS: new "Reading `permission-park.jsonl` after 0.4.1" section.
+  - README: the permission paragraph says to count from the 0.4.1 go-live (2026-11-22 17:50 America/New_York) rather than midnight, to count distinct asks, and that after go-live only `ask_hard_denied` / `ask_timeout_denied` are expected.
+  - MAINTENANCE-RECOVERY and README describe the warm-check wait and the resume hook ordering.
+- Tests:
+  - `tests/test_deploy.py`: the service is down for the first N calls, never comes up, reports stale plugins, or has a shared deadline across projects, a service that comes up late in the window with a later project still reporting stale plugins (per-project report budget), and a bounded report budget when the release never appears, all with a fake clock. `tests/test_vendored_release.py` uses a fake clock too.
+  - `tests/v2-park-yield.test.mjs`: two module instances of `park-yield.mjs` write one line per outcome; distinct hard denies (different call, or same call with a different rule) and ID-less records are kept.
+
 ## 0.4.2 — documentation only (2026-11-23)
 
 No code changes.

@@ -61,8 +61,27 @@ export function pendingAsksWriter({ file = PENDING_ASKS_FILE } = {}) {
 }
 export const PARK_TICK_MS = 10_000;
 
+// 0.4.3: every project's plugin instance in one `opencode serve` process has its own park monitor and
+// sees every permission.asked event, so each ask was logged once per loaded project (2 to 5 copies on the
+// live service). Like execution-timing, keep one process-wide registry of written lines so an ask's
+// stalled/parked/timeout outcome is logged once per file. Records without an ID are always written.
+const MAX_PARK_KEYS = 8192;
+// Old and new module instances can share this registry across a deploy without a restart: a shape change needs a new key (e.g. a '.v2' suffix).
+const parkLogged = globalThis[Symbol.for('opencode-usage-harness.permission-park')] ??= { keys: new Set(), order: [] };
+const parkLogKey = (file, record) => {
+  const id = record?.requestID ?? record?.permissionID ?? record?.callID;
+  const kind = record?.outcome ?? record?.event;
+  return typeof id === 'string' && id && typeof kind === 'string' ? [path.resolve(file), record.sessionID ?? '', id, kind, record.rule ?? '', record.action ?? ''].join('\0') : undefined;
+};
+
 export function parkLogger({ file = statePath('telemetry', 'permission-park.jsonl') } = {}) {
   return record => {
+    const key = parkLogKey(file, record);
+    if (key) {
+      if (parkLogged.keys.has(key)) return;
+      parkLogged.keys.add(key); parkLogged.order.push(key);
+      if (parkLogged.order.length > MAX_PARK_KEYS) parkLogged.keys.delete(parkLogged.order.shift());
+    }
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
       fs.appendFileSync(file, JSON.stringify(record) + '\n', { mode: 0o600 });

@@ -720,14 +720,65 @@ def restart_services(context: DeployContext, runner, sleep=time.sleep) -> None:
             raise InstallError("gateway start failed (exit %d)" % code)
 
 
-def warm_and_verify(context: DeployContext, release: Path, runner) -> dict[str, int]:
+# 0.4.3: after a restart the service needs a few seconds before /api/plugin answers (the 0.4.1
+# deploy exited 4 because both calls ran before it was up).  Poll each project until /api/plugin
+# returns parseable JSON, then call it again so the response reports the loaded plugins; keep
+# polling until the release path shows up.  The 60 s budget for "service not up yet" is shared by all
+# projects; once a project's /api/plugin has answered, that project also gets at least
+# WARM_REPORT_SECONDS to report the release, so a service that comes up late in the shared window
+# does not leave later projects with only two calls (false exit 4).
+WARM_WAIT_SECONDS = 60.0
+WARM_POLL_SECONDS = 2.0
+WARM_REPORT_SECONDS = 10.0
+
+
+def plugin_response_ok(code: int, out: str) -> bool:
+    if code != 0 or not (out or "").strip():
+        return False
+    try:
+        json.loads(out)
+    except ValueError:
+        return False
+    return True
+
+
+def warm_and_verify(context: DeployContext, release: Path, runner, sleep=time.sleep, clock=time.monotonic,
+                    wait: float = WARM_WAIT_SECONDS, interval: float = WARM_POLL_SECONDS,
+                    report_wait: float = WARM_REPORT_SECONDS) -> dict[str, int]:
     loaded: dict[str, int] = {}
     marker = "releases/%s" % release.name
+    deadline = clock() + max(0.0, wait)
+
+    def pause(until: float) -> bool:
+        if clock() >= until:
+            return False
+        sleep(min(interval, max(0.1, until - clock())))
+        return True
+
     for project in context.projects:
-        out = ""
-        for _ in range(2):  # the first call loads plugins, the second reports them
-            _, out = runner(context.wrapped(["opencode", "api", "GET", "/api/plugin", "-H", "x-opencode-directory:%s" % project]), cwd=project, timeout=30)
-        loaded[project] = out.count(marker)
+        def call() -> tuple[int, str]:
+            return runner(context.wrapped(["opencode", "api", "GET", "/api/plugin", "-H", "x-opencode-directory:%s" % project]), cwd=project, timeout=30)
+        loaded[project] = 0
+        waited = False
+        while not plugin_response_ok(*call()):  # the service is not up yet
+            if not waited:
+                remaining = deadline - clock()
+                if remaining > 0:
+                    print("deploy: waiting up to %ds for /api/plugin in %s" % (max(1, round(remaining)), project), flush=True)
+                else:
+                    print("deploy: /api/plugin not answering in %s; no wait budget left" % project, flush=True)
+                waited = True
+            if not pause(deadline):
+                break
+        else:
+            # The service answered for this project: its report gets the rest of the shared budget,
+            # and never less than report_wait.
+            report_deadline = max(deadline, clock() + max(0.0, report_wait))
+            while True:  # the first good call loads plugins, the next one reports them
+                code, out = call()
+                loaded[project] = out.count(marker) if plugin_response_ok(code, out) else 0
+                if loaded[project] or not pause(report_deadline):
+                    break
     return loaded
 
 
@@ -854,7 +905,7 @@ def deploy(prefix: Path, args, probe=None, runner=default_runner, sleep=time.sle
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
-    loaded = warm_and_verify(context, release, runner)
+    loaded = warm_and_verify(context, release, runner, sleep=sleep, clock=clock)
     missing = [p for p, n in loaded.items() if n == 0]
     for project, count in sorted(loaded.items()):
         print("%s: %d plugin(s) from %s" % (project, count, release.name))

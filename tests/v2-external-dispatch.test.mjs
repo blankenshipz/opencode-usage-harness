@@ -19,15 +19,18 @@ async function setup(t) {
  const sessions=[];const globalRegistry=createRegistry(path.join(base,'global'));
  const install=async (directory,rootID) => {
   sessions.push({id:rootID,agent:'router',directory,active:false});const tools=new Map(), calls=[];
-  let nativeFailure;
+  let nativeFailure, nativeHold;
   const native={name:'subagent',description:'native',input:{type:'object',properties:{agent:{},description:{},prompt:{},sessionID:{},background:{}},required:['agent','description','prompt']},execute:async(args,context)=>{
-   calls.push(args);if(nativeFailure) throw nativeFailure;const id=args.sessionID ?? `${rootID}-child`;let child=sessions.find(s=>s.id===id);if(!child){child={id,parentID:context.sessionID,agent:args.agent,directory,active:true};sessions.push(child);} child.active=true;
+   calls.push(args);if(nativeFailure) throw nativeFailure;
+   // holdNative(): the admission (and its global lease) is complete, but the child session does not exist yet.
+   if(nativeHold){const hold=nativeHold;nativeHold=undefined;hold.enter();await hold.released;}const id=args.sessionID ?? `${rootID}-child`;let child=sessions.find(s=>s.id===id);if(!child){child={id,parentID:context.sessionID,agent:args.agent,directory,active:true};sessions.push(child);} child.active=true;
    await context.progress({sessionID:id,status:'running'});return {content:'ok',metadata:{sessionID:id,status:'running'},output:{sessionID:id,status:'running'}};
   }};tools.set('subagent',native);
   const ctx={location:{directory},agent:{list:async()=>({data:Object.entries(agents).map(([id,value])=>({id,...value}))})},tool:{transform:async fn=>fn({get:n=>tools.get(n),update:(n,fn)=>fn(tools.get(n)),add:item=>tools.set(item.name,item)})},session:{hook:async()=>{}}};
   const registry=createRegistry(path.join(base,`${rootID}-registry`));await registry(directory,async(state,save)=>{setIntent(state,{rootID,taskId:'task',intent,expectedRevision:0,actorSessionID:rootID});await save();});
   await installTaskDispatch(ctx,{registry,globalRegistry,loadSessions:async()=>sessions,loadSources:async()=>['msg_user'],loadRoutingPolicy:()=>undefined,grantPath:path.join(config,'external-write-grants.json'),configRoot:config});
-  return {directory,rootID,tools,calls,registry,failNative:error=>{nativeFailure=error;},call:args=>tools.get('task_dispatch').execute(args,{sessionID:rootID,agent:'router',progress:async()=>{}})};
+  return {directory,rootID,tools,calls,registry,failNative:error=>{nativeFailure=error;},
+   holdNative:()=>{let enter,release;const entered=new Promise(resolve=>{enter=resolve;}),released=new Promise(resolve=>{release=resolve;});nativeHold={enter,released};return {entered,release};},call:args=>tools.get('task_dispatch').execute(args,{sessionID:rootID,agent:'router',progress:async()=>{}})};
  };
  const sourceHarness=await install(source,'source-root'), destinationHarness=await install(destination,'destination-root');
  const grant=async ({childID,revoked=false})=>{const doc={version:1,grants:[{version:1,grantID:'migration-grant',workspace:await canonicalExternalPath(source),rootID:'source-root',parentID:'source-root',childID,taskId:'task',workKey:'source',intentRevision:1,checkIds:['check'],agent:'builder',operation:'implement',externalRoot:await canonicalExternalPath(destination),expiresAt:'2099-01-01T00:00:00.000Z',revoked}]};const file=path.join(config,'external-write-grants.json');await fsp.writeFile(file,JSON.stringify(doc),{mode:0o600});await fsp.chmod(file,0o600);};
@@ -85,13 +88,21 @@ test('a candidate already owned by another record rejects without reassigning th
  await assert.rejects(h.sourceHarness.call(input('source',[])),/interrupted child identity does not match/);
  await h.globalRegistry('all-writers',async state=>{const lease=state.leases.find(item=>item.token===prior.token);assert.equal(lease.childID,undefined);});
 });
+// 0.4.3: deterministic interleaving. The first call is held inside the native subagent, after its admission
+// reserved the global lease but before its child session exists, and the second call runs to completion
+// in that window. (Racing both calls let the destination child appear first in about half the runs; the
+// source was then refused by the destination-quiescence check instead of the lease this test is about.)
 for (const order of ['source-first','destination-first']) test(`global writer admission serializes destination and granted source (${order})`,async t=>{
  const h=await setup(t);const initial=await h.sourceHarness.call(input('source',['local']));const childID=initial.metadata.sessionID;await h.grant({childID});
  const sourceCall=()=>h.sourceHarness.call({...input('source',[path.join(h.destination,'shared')]),sessionID:childID,externalWriteGrantID:'migration-grant'});
  const destinationCall=()=>h.destinationHarness.call(input('destination',['shared']));
- const first=order==='source-first'?sourceCall:destinationCall, second=order==='source-first'?destinationCall:sourceCall;
- const results=await Promise.allSettled([first(),second()]);
- assert.equal(results.filter(result=>result.status==='fulfilled').length,1);const denied=results.find(result=>result.status==='rejected');assert.match(denied.reason.message,/global overlapping writer lease/);
+ const [firstHarness,first,second]=order==='source-first'?[h.sourceHarness,sourceCall,destinationCall]:[h.destinationHarness,destinationCall,sourceCall];
+ const hold=firstHarness.holdNative();const firstResult=first();
+ await Promise.race([hold.entered,firstResult]);
+ const secondCalls=(firstHarness===h.sourceHarness?h.destinationHarness:h.sourceHarness).calls.length;
+ await assert.rejects(second(),/global overlapping writer lease/);
+ assert.equal((firstHarness===h.sourceHarness?h.destinationHarness:h.sourceHarness).calls.length,secondCalls,'the denied call never reaches native');
+ hold.release();await firstResult;
  // Repeating the admitted source owner is a continuity operation, not a
  // cross-owner collision.
  if(order==='source-first') await h.sourceHarness.call({...input('source',undefined),sessionID:childID});
